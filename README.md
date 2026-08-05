@@ -1,45 +1,48 @@
 # rollcalltrack-ingest
 
 External scheduled job that pulls U.S. House and Senate financial disclosure
-filings (free/official sources), parses them, and writes into the
-rollcalltrack.com database. Runs independently of Hostinger Horizons —
-Horizons only ever reads from this database; it never scrapes anything itself.
+filings (free/official sources), parses them, and posts them into the
+rollcalltrack.com Horizons app via the ingest HTTP API. Horizons owns the
+schema/UI; this repo is the scraper that keeps disclosures current.
 
 ## Why this is a separate project
 
-Horizons builds the site (schema, API layer, UI). This repo is the thing that
-keeps that schema's `disclosure_filings`, `transactions`, and `annual_assets`
-tables full of current, accurate data. It's plain Python, runs on a schedule,
-and has no dependency on Horizons other than the database connection string.
+Horizons builds the site (schema, API layer, UI). This repo scrapes House and
+Senate disclosure feeds, parses PTRs, and writes through:
+
+- `GET /hcgi/api/members/lookup` — multi-format name / bioguide match
+- `POST /hcgi/api/ingest/disclosures` — idempotent filing upsert on `source_url`
+
+Auth is a single header: `X-Ingest-Key`. No superuser password required.
 
 ## Setup
 
-Horizons stores data in **PocketBase** (not Postgres). The ingest job
-authenticates as a PocketBase superuser and writes to the live collections
-`disclosure_filings`, `transactions`, `ingestion_log`, etc.
-
 1. `pip install -r requirements.txt`
 2. Copy `.env.example` to `.env` and set:
-   - `DATABASE_URL` — PocketBase base URL, e.g.
-     `https://<app-id>.app-preview.com/hcgi/platform`
-   - `POCKETBASE_ADMIN_EMAIL` / `POCKETBASE_ADMIN_PASSWORD` — superuser
-   - `CONGRESS_GOV_API_KEY` — https://api.congress.gov/sign-up/
-3. Test parse-only (no DB): `python -m ingest.main --source house --dry-run`
-4. Test a real write once secrets are set (members table must be populated
-   for name matching to succeed).
+   - `HORIZONS_BASE_URL` — site origin, e.g.
+     `https://<app-id>.app-preview.com`
+   - `INGEST_API_KEY` — sent as `X-Ingest-Key` (from Horizons env vars)
+3. Test parse-only (no API): `python -m ingest.main --source house --dry-run`
+4. Test a real write once secrets are set (members must already exist in
+   Horizons for name matching to succeed).
 
 ## Running on a schedule (GitHub Actions — free)
 
-`.github/workflows/ingest.yml` runs this daily. Secrets required:
+`.github/workflows/ingest.yml` runs daily at **09:00 UTC** and also supports
+manual `workflow_dispatch`. Secrets required:
 
 | Secret | Example |
 |--------|---------|
-| `DATABASE_URL` | `https://…app-preview.com/hcgi/platform` |
-| `POCKETBASE_ADMIN_EMAIL` | superuser email |
-| `POCKETBASE_ADMIN_PASSWORD` | superuser password |
-| `CONGRESS_GOV_API_KEY` | Congress.gov API key |
+| `HORIZONS_BASE_URL` | `https://…app-preview.com` |
+| `INGEST_API_KEY` | Horizons ingest key |
 
-Trigger manually from the Actions tab before relying on the daily cron.
+```bash
+# manual trigger
+gh workflow run "Disclosure Ingest"
+```
+
+Idempotency: re-POSTing the same `source_url` updates the existing filing
+(`updated: true`) instead of creating duplicates.
 
 ## Live verification status (2026-08)
 
@@ -68,12 +71,11 @@ python -m ingest.main --source house --dry-run --days-back 60 --max-filings 10
 
 ### Member matching
 
-`db.find_member_id` normalizes filer names and tries several strategies before
-giving up (exact variants → alnum-normalized → first/last columns →
-last-name + first-name prefix → state/district disambiguation). House passes
-`StateDst` (e.g. `AL04`); Senate passes the office string
-(`Capito, Shelley Moore (Senator)`). Ambiguous multi-matches return `None`
-rather than attaching a filing to the wrong member.
+Under Horizons API mode, member resolution hits
+`GET /hcgi/api/members/lookup` (bioguide first, then multi-format name match:
+raw → `Last, First` → compound last names). House passes state + district;
+Senate passes state. Client-side name variants remain for the legacy
+PocketBase path only.
 
 ```bash
 # offline unit tests for name variants
@@ -86,14 +88,15 @@ python tests/test_names.py   # run from repo root with PYTHONPATH=.
 rollcalltrack-ingest/
   ingest/
     __init__.py
-    config.py          # env var loading
-    db.py               # DB connection + upsert helpers
+    config.py            # env var loading
+    ingest_client.py     # Horizons HTTP API (lookup + filing upsert)
+    db.py                # legacy PocketBase helpers
     house.py             # House bulk feed download + PDF parsing
     senate.py            # Senate eFD scrape + parsing
-    congress_enrich.py   # Congress.gov member enrichment
+    congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
-    ingest.yml            # scheduled GitHub Actions workflow
+    ingest.yml           # daily cron + workflow_dispatch
   requirements.txt
   .env.example
 ```
