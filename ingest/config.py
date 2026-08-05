@@ -1,25 +1,58 @@
 """Environment configuration. Loads from .env locally, from real env vars
 (GitHub Actions secrets) in CI.
 
-Horizons backend is PocketBase (confirmed live):
-  base URL path: {host}/hcgi/platform
-  e.g. https://<app-id>.app-preview.com/hcgi/platform
+Primary write path: Horizons HTTP API
+  HORIZONS_BASE_URL  e.g. https://<app-id>.app-preview.com
+  INGEST_API_KEY     sent as X-Ingest-Key
+
+Legacy/optional: PocketBase superuser (direct collection writes) still
+supported if INGEST_API_KEY is not set.
 """
 import os
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Accept either name. DATABASE_URL historically meant Postgres DSN; on
-# Horizons it is the PocketBase base URL (http/https).
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POCKETBASE_URL")
-POCKETBASE_URL = DATABASE_URL
+# Horizons site origin (no path). Prefer explicit HORIZONS_BASE_URL.
+_raw_db = os.environ.get("DATABASE_URL") or os.environ.get("POCKETBASE_URL") or ""
+_raw_horizons = os.environ.get("HORIZONS_BASE_URL") or os.environ.get("HORIZONS_BASE") or ""
+
+
+def _origin_from_url(url: str) -> str:
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    # If path includes /hcgi/platform, strip to origin
+    if "://" in url:
+        p = urlparse(url)
+        return f"{p.scheme}://{p.netloc}"
+    return url
+
+
+if _raw_horizons:
+    HORIZONS_BASE_URL = _origin_from_url(_raw_horizons)
+elif _raw_db.startswith("http"):
+    HORIZONS_BASE_URL = _origin_from_url(_raw_db)
+else:
+    HORIZONS_BASE_URL = ""
+
+INGEST_API_KEY = (
+    os.environ.get("INGEST_API_KEY")
+    or os.environ.get("X_INGEST_KEY")
+    or os.environ.get("X-Ingest-Key")
+    or ""
+)
+
+# Legacy PocketBase direct access (optional)
+DATABASE_URL = _raw_db
+POCKETBASE_URL = _raw_db
 POCKETBASE_ADMIN_EMAIL = os.environ.get("POCKETBASE_ADMIN_EMAIL")
 POCKETBASE_ADMIN_PASSWORD = os.environ.get("POCKETBASE_ADMIN_PASSWORD")
 
 CONGRESS_GOV_API_KEY = os.environ.get("CONGRESS_GOV_API_KEY")
 
-# Verified 2026-08 against disclosures-clerk.house.gov/FinancialDisclosure
 HOUSE_BULK_ZIP_URL_TEMPLATE = (
     "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
 )
@@ -45,7 +78,6 @@ HOUSE_FILING_TYPE_LABELS = {
     "X": "Annual Report (amended/other)",
 }
 
-# Map Clerk codes / free text → PB disclosure_filings.filing_type select values
 HOUSE_TO_PB_FILING_TYPE = {
     "P": "ptr",
     "A": "amendment",
@@ -75,15 +107,26 @@ USER_AGENT = (
 )
 
 
+def use_horizons_api() -> bool:
+    return bool(HORIZONS_BASE_URL and INGEST_API_KEY)
+
+
 def require_config(dry_run: bool = False, source: str = "all"):
     missing = []
     if not dry_run:
-        if not POCKETBASE_URL:
-            missing.append("DATABASE_URL (PocketBase base URL, e.g. https://…/hcgi/platform)")
-        if not POCKETBASE_ADMIN_EMAIL:
-            missing.append("POCKETBASE_ADMIN_EMAIL")
-        if not POCKETBASE_ADMIN_PASSWORD:
-            missing.append("POCKETBASE_ADMIN_PASSWORD")
+        if use_horizons_api():
+            pass  # HORIZONS_BASE_URL + INGEST_API_KEY present
+        else:
+            # Fall back to PocketBase superuser path
+            if not POCKETBASE_URL:
+                missing.append(
+                    "INGEST_API_KEY (+ HORIZONS_BASE_URL or DATABASE_URL), "
+                    "or DATABASE_URL for legacy PocketBase"
+                )
+            if not POCKETBASE_ADMIN_EMAIL:
+                missing.append("POCKETBASE_ADMIN_EMAIL (or set INGEST_API_KEY)")
+            if not POCKETBASE_ADMIN_PASSWORD:
+                missing.append("POCKETBASE_ADMIN_PASSWORD (or set INGEST_API_KEY)")
     if source in ("congress_enrich", "all") and not dry_run and not CONGRESS_GOV_API_KEY:
         missing.append("CONGRESS_GOV_API_KEY")
     if source == "congress_enrich" and dry_run and not CONGRESS_GOV_API_KEY:

@@ -21,6 +21,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from . import config, db
+from .ingest_client import HorizonsIngestClient, get_client
 
 logger = logging.getLogger("rollcalltrack_ingest.senate")
 
@@ -248,7 +249,7 @@ def parse_filing_detail(session: requests.Session, url: str) -> dict:
             {
                 "asset_name": asset_name,
                 "ticker": None if ticker in ("", "--", "—") else ticker,
-                "ticker_confidence": "filed" if ticker not in ("", "--", "—") else "unconfirmed",
+                "ticker_confidence": "high" if ticker not in ("", "--", "—") else "none",
                 "transaction_type": _normalize_order_type(order_type),
                 "transaction_date": txn_date,
                 "notification_date": None,  # not present on Senate PTR HTML
@@ -264,14 +265,14 @@ def parse_filing_detail(session: requests.Session, url: str) -> dict:
 def _normalize_order_type(raw: str) -> str:
     s = (raw or "").strip().lower()
     if "partial" in s and "sale" in s:
-        return "sale_partial"
+        return "sale"  # Horizons enum: purchase|sale|exchange|other
     if s.startswith("sale") or s == "s":
         return "sale"
     if s.startswith("purchase") or s == "p":
         return "purchase"
     if s.startswith("exchange") or s == "e":
         return "exchange"
-    return s or "unknown"
+    return "other"
 
 
 def _normalize_owner(raw: str) -> str:
@@ -283,19 +284,24 @@ def _normalize_owner(raw: str) -> str:
     if "joint" in s:
         return "joint"
     if "child" in s or "dependent" in s:
-        return "dependent_child"
-    return s
+        return "dependent"  # Horizons enum
+    return "self"
 
 
 def run(
-    conn,
+    conn=None,
     days_back: int = 2,
     dry_run: bool = False,
     max_filings: int | None = None,
+    client: HorizonsIngestClient | None = None,
 ) -> dict:
     """days_back is intentionally short for the daily scheduled job."""
     found, parsed, failed = 0, 0, 0
     since = date.today() - timedelta(days=days_back)
+    hz = client if client is not None else (
+        get_client() if config.use_horizons_api() and not dry_run else None
+    )
+    use_hz = hz is not None and hz.configured and not dry_run
 
     session = _new_session()
     try:
@@ -304,7 +310,11 @@ def run(
         filings = search_recent_filings(session, since, csrf_token=csrf)
     except Exception as e:
         logger.error("Failed to search Senate eFD: %s", e)
-        if conn is not None and not dry_run:
+        if use_hz:
+            hz.submit_ingestion_log(
+                "senate_efd", 0, 0, 0, note=f"search failed: {e}"
+            )
+        elif conn is not None and not dry_run:
             db.log_ingestion_run(
                 conn, "senate", 0, 0, 0, note=f"search failed: {e}"
             )
@@ -324,43 +334,12 @@ def run(
                 failed += 1
                 continue
 
-            member_id = None
-            member_meta = {}
-            if conn is not None and not dry_run:
-                member_id = db.find_member_id(
-                    conn,
-                    rec["name"],
-                    chamber="senate",
-                    office=rec.get("office"),
-                )
-                if member_id is None:
-                    logger.warning(
-                        "No member match for filer name: %s (%s) — skipping",
-                        rec["name"],
-                        rec.get("office"),
-                    )
-                    failed += 1
-                    continue
-                member_meta = db.get_member(conn, member_id) or {}
-
             detail = parse_filing_detail(session, rec["detail_url"])
-
-            filing = {
-                "member_id": member_id,
-                "chamber": "senate",
-                "filing_type": "ptr",
-                "filing_date": rec["filing_date"],
-                "source_url": rec["detail_url"],
-                "raw_document_type": "html" if not detail.get("paper") else "pdf",
-                "parse_status": (
-                    "failed"
-                    if detail.get("paper") or not detail["transactions"]
-                    else "parsed"
-                ),
-                "member_name": member_meta.get("name") or rec["name"],
-                "member_party": member_meta.get("party") or "",
-                "member_state": member_meta.get("state") or "",
-            }
+            parse_status = (
+                "failed"
+                if detail.get("paper") or not detail["transactions"]
+                else "parsed"
+            )
 
             if dry_run:
                 logger.info(
@@ -384,6 +363,75 @@ def run(
                 parsed += 1
                 continue
 
+            if use_hz:
+                member = hz.lookup_member_by_name(
+                    rec["name"],
+                    office=rec.get("office"),
+                )
+                if not member:
+                    logger.warning(
+                        "No Horizons member match for filer name=%r office=%r — skipping",
+                        rec["name"],
+                        rec.get("office"),
+                    )
+                    failed += 1
+                    continue
+                filing = {
+                    "member_id": member.get("id"),
+                    "bioguide_id": member.get("bioguide_id") or "",
+                    "chamber": "senate",
+                    "filing_type": "ptr",
+                    "filing_date": rec["filing_date"],
+                    "source_url": rec["detail_url"],
+                    "raw_document_type": "html" if not detail.get("paper") else "pdf",
+                    "parse_status": parse_status,
+                    "member_name": member.get("name") or rec["name"],
+                    "member_party": member.get("party") or "",
+                    "member_state": member.get("state") or "",
+                }
+                result = hz.submit_filing(
+                    filing, transactions=detail["transactions"]
+                )
+                logger.info(
+                    "Senate submitted filing_id=%s txns=%s name=%r",
+                    result.get("filing_id"),
+                    result.get("transactions_written"),
+                    rec["name"],
+                )
+                parsed += 1
+                continue
+
+            member_id = None
+            member_meta = {}
+            if conn is not None:
+                member_id = db.find_member_id(
+                    conn,
+                    rec["name"],
+                    chamber="senate",
+                    office=rec.get("office"),
+                )
+                if member_id is None:
+                    logger.warning(
+                        "No member match for filer name: %s (%s) — skipping",
+                        rec["name"],
+                        rec.get("office"),
+                    )
+                    failed += 1
+                    continue
+                member_meta = db.get_member(conn, member_id) or {}
+
+            filing = {
+                "member_id": member_id,
+                "chamber": "senate",
+                "filing_type": "ptr",
+                "filing_date": rec["filing_date"],
+                "source_url": rec["detail_url"],
+                "raw_document_type": "html" if not detail.get("paper") else "pdf",
+                "parse_status": parse_status,
+                "member_name": member_meta.get("name") or rec["name"],
+                "member_party": member_meta.get("party") or "",
+                "member_state": member_meta.get("state") or "",
+            }
             filing_id = db.upsert_filing(conn, filing)
             for txn in detail["transactions"]:
                 txn.update(
@@ -397,7 +445,7 @@ def run(
                 if "ticker" not in txn:
                     txn["ticker"] = None
                 if "ticker_confidence" not in txn:
-                    txn["ticker_confidence"] = "unconfirmed"
+                    txn["ticker_confidence"] = "none"
                 if "asset_category" not in txn:
                     txn["asset_category"] = None
                 db.upsert_transaction(conn, txn)
@@ -411,7 +459,9 @@ def run(
             )
             failed += 1
 
-    if conn is not None and not dry_run:
+    if use_hz:
+        hz.submit_ingestion_log("senate_efd", found, parsed, failed)
+    elif conn is not None and not dry_run:
         db.log_ingestion_run(conn, "senate_efd", found, parsed, failed)
 
     return {"found": found, "parsed": parsed, "failed": failed}

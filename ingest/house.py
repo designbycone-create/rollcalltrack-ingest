@@ -21,6 +21,7 @@ import pdfplumber
 import requests
 
 from . import config, db
+from .ingest_client import HorizonsIngestClient, get_client
 
 logger = logging.getLogger("rollcalltrack_ingest.house")
 
@@ -386,12 +387,13 @@ def _parse_filing_date(s: str) -> date | None:
 
 
 def run(
-    conn,
+    conn=None,
     year: int | None = None,
     dry_run: bool = False,
     days_back: int | None = 14,
     max_filings: int | None = None,
     ptr_only: bool = True,
+    client: HorizonsIngestClient | None = None,
 ) -> dict:
     """Ingest House filings.
 
@@ -400,16 +402,25 @@ def run(
       so the daily job doesn't re-download every PTR of the year.
     max_filings: optional hard cap (useful for dry-run smoke tests).
     ptr_only: this pass only handles PTRs (FilingType P).
+    client: Horizons HTTP client (preferred). Falls back to PocketBase conn.
     """
     year = year or date.today().year
     found, parsed, failed = 0, 0, 0
     session = _session()
+    hz = client if client is not None else (
+        get_client() if config.use_horizons_api() and not dry_run else None
+    )
+    use_hz = hz is not None and hz.configured and not dry_run
 
     try:
         index_records = download_bulk_index(year, session=session)
     except Exception as e:
         logger.error("Failed to fetch House bulk index: %s", e)
-        if conn is not None and not dry_run:
+        if use_hz:
+            hz.submit_ingestion_log(
+                "house_clerk", 0, 0, 0, note=f"index fetch failed: {e}"
+            )
+        elif conn is not None and not dry_run:
             db.log_ingestion_run(
                 conn, "house", 0, 0, 0, note=f"index fetch failed: {e}"
             )
@@ -449,26 +460,6 @@ def run(
     for rec in index_records:
         time.sleep(config.REQUEST_DELAY_SECONDS)
         try:
-            member_id = None
-            member_meta = {}
-            if conn is not None and not dry_run:
-                member_id = db.find_member_id(
-                    conn,
-                    rec["name"],
-                    state_district=rec.get("state_district"),
-                    chamber="house",
-                )
-                if member_id is None:
-                    logger.warning(
-                        "No member match for filer name: %s (state_district=%s) — "
-                        "skipping, needs manual review",
-                        rec["name"],
-                        rec.get("state_district"),
-                    )
-                    failed += 1
-                    continue
-                member_meta = db.get_member(conn, member_id) or {}
-
             pdf_result = parse_pdf(rec["pdf_url"], session=session)
             txns = []
             if rec.get("filing_type_code") == "P" or "ptr" in (
@@ -476,27 +467,15 @@ def run(
             ).lower():
                 txns = parse_ptr_transactions(pdf_result["text"])
 
-            # PB select: ptr | annual | …  (not free-text Clerk labels)
             pb_filing_type = config.HOUSE_TO_PB_FILING_TYPE.get(
                 rec.get("filing_type_code") or "", "ptr"
             )
             state_code = (rec.get("state_district") or "")[:2] or None
-            filing = {
-                "member_id": member_id,
-                "chamber": "house",
-                "filing_type": pb_filing_type,
-                "filing_date": rec["filing_date"],
-                "source_url": rec["pdf_url"],
-                "raw_document_type": "pdf",
-                "parse_status": (
-                    "failed"
-                    if pdf_result["used_ocr"] or (not txns and pb_filing_type == "ptr")
-                    else "parsed"
-                ),
-                "member_name": member_meta.get("name") or rec["name"],
-                "member_party": member_meta.get("party") or "",
-                "member_state": member_meta.get("state") or state_code or "",
-            }
+            parse_status = (
+                "failed"
+                if pdf_result["used_ocr"] or (not txns and pb_filing_type == "ptr")
+                else "parsed"
+            )
 
             if dry_run:
                 logger.info(
@@ -517,6 +496,77 @@ def run(
                 parsed += 1
                 continue
 
+            # --- Horizons HTTP API path ---
+            if use_hz:
+                member = hz.lookup_member_by_name(
+                    rec["name"],
+                    state_district=rec.get("state_district"),
+                )
+                if not member:
+                    logger.warning(
+                        "No Horizons member match for filer name=%r "
+                        "state_district=%r — skipping (manual review)",
+                        rec["name"],
+                        rec.get("state_district"),
+                    )
+                    failed += 1
+                    continue
+                filing = {
+                    "member_id": member.get("id"),
+                    "bioguide_id": member.get("bioguide_id") or "",
+                    "chamber": "house",
+                    "filing_type": pb_filing_type,
+                    "filing_date": rec["filing_date"],
+                    "source_url": rec["pdf_url"],
+                    "raw_document_type": "pdf",
+                    "parse_status": parse_status,
+                    "member_name": member.get("name") or rec["name"],
+                    "member_party": member.get("party") or "",
+                    "member_state": member.get("state") or state_code or "",
+                }
+                result = hz.submit_filing(filing, transactions=txns)
+                logger.info(
+                    "House submitted filing_id=%s txns=%s name=%r",
+                    result.get("filing_id"),
+                    result.get("transactions_written"),
+                    rec["name"],
+                )
+                parsed += 1
+                continue
+
+            # --- Legacy PocketBase direct path ---
+            member_id = None
+            member_meta = {}
+            if conn is not None:
+                member_id = db.find_member_id(
+                    conn,
+                    rec["name"],
+                    state_district=rec.get("state_district"),
+                    chamber="house",
+                )
+                if member_id is None:
+                    logger.warning(
+                        "No member match for filer name: %s (state_district=%s) — "
+                        "skipping, needs manual review",
+                        rec["name"],
+                        rec.get("state_district"),
+                    )
+                    failed += 1
+                    continue
+                member_meta = db.get_member(conn, member_id) or {}
+
+            filing = {
+                "member_id": member_id,
+                "chamber": "house",
+                "filing_type": pb_filing_type,
+                "filing_date": rec["filing_date"],
+                "source_url": rec["pdf_url"],
+                "raw_document_type": "pdf",
+                "parse_status": parse_status,
+                "member_name": member_meta.get("name") or rec["name"],
+                "member_party": member_meta.get("party") or "",
+                "member_state": member_meta.get("state") or state_code or "",
+            }
             filing_id = db.upsert_filing(conn, filing)
             for txn in txns:
                 txn.update(
@@ -530,7 +580,6 @@ def run(
                         "asset_category": None,
                     }
                 )
-                # filer_relation already set by parse_ptr_transactions
                 db.upsert_transaction(conn, txn)
 
             parsed += 1
@@ -540,7 +589,9 @@ def run(
             )
             failed += 1
 
-    if conn is not None and not dry_run:
+    if use_hz:
+        hz.submit_ingestion_log("house_clerk", found, parsed, failed)
+    elif conn is not None and not dry_run:
         db.log_ingestion_run(conn, "house_clerk", found, parsed, failed)
 
     return {"found": found, "parsed": parsed, "failed": failed}

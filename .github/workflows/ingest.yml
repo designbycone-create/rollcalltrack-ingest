@@ -25,8 +25,9 @@ jobs:
 
       - name: Run ingest
         env:
+          HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          POCKETBASE_ADMIN_EMAIL: ${{ secrets.POCKETBASE_ADMIN_EMAIL }}
-          POCKETBASE_ADMIN_PASSWORD: ${{ secrets.POCKETBASE_ADMIN_PASSWORD }}
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          X_INGEST_KEY: ${{ secrets.X_INGEST_KEY }}
           CONGRESS_GOV_API_KEY: ${{ secrets.CONGRESS_GOV_API_KEY }}
         run: python -m ingest.main --source all
