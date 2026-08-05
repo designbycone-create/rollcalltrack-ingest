@@ -450,6 +450,7 @@ def run(
         time.sleep(config.REQUEST_DELAY_SECONDS)
         try:
             member_id = None
+            member_meta = {}
             if conn is not None and not dry_run:
                 member_id = db.find_member_id(
                     conn,
@@ -466,6 +467,7 @@ def run(
                     )
                     failed += 1
                     continue
+                member_meta = db.get_member(conn, member_id) or {}
 
             pdf_result = parse_pdf(rec["pdf_url"], session=session)
             txns = []
@@ -474,18 +476,26 @@ def run(
             ).lower():
                 txns = parse_ptr_transactions(pdf_result["text"])
 
+            # PB select: ptr | annual | …  (not free-text Clerk labels)
+            pb_filing_type = config.HOUSE_TO_PB_FILING_TYPE.get(
+                rec.get("filing_type_code") or "", "ptr"
+            )
+            state_code = (rec.get("state_district") or "")[:2] or None
             filing = {
                 "member_id": member_id,
                 "chamber": "house",
-                "filing_type": rec["filing_type"],
+                "filing_type": pb_filing_type,
                 "filing_date": rec["filing_date"],
                 "source_url": rec["pdf_url"],
                 "raw_document_type": "pdf",
                 "parse_status": (
-                    "no_text_layer"
-                    if pdf_result["used_ocr"]
-                    else ("parsed" if txns or rec.get("filing_type_code") != "P" else "empty")
+                    "failed"
+                    if pdf_result["used_ocr"] or (not txns and pb_filing_type == "ptr")
+                    else "parsed"
                 ),
+                "member_name": member_meta.get("name") or rec["name"],
+                "member_party": member_meta.get("party") or "",
+                "member_state": member_meta.get("state") or state_code or "",
             }
 
             if dry_run:
@@ -531,6 +541,6 @@ def run(
             failed += 1
 
     if conn is not None and not dry_run:
-        db.log_ingestion_run(conn, "house", found, parsed, failed)
+        db.log_ingestion_run(conn, "house_clerk", found, parsed, failed)
 
     return {"found": found, "parsed": parsed, "failed": failed}

@@ -2,11 +2,8 @@ name: Disclosure Ingest
 
 on:
   schedule:
-    # Runs daily at 09:00 UTC. Adjust as needed — twice-daily is easy to
-    # add later (just add a second cron line) if daily proves too slow
-    # once the site has traffic depending on freshness.
     - cron: "0 9 * * *"
-  workflow_dispatch: {}  # allows manual "Run workflow" trigger from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
   ingest:
@@ -29,5 +26,7 @@ jobs:
       - name: Run ingest
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          POCKETBASE_ADMIN_EMAIL: ${{ secrets.POCKETBASE_ADMIN_EMAIL }}
+          POCKETBASE_ADMIN_PASSWORD: ${{ secrets.POCKETBASE_ADMIN_PASSWORD }}
           CONGRESS_GOV_API_KEY: ${{ secrets.CONGRESS_GOV_API_KEY }}
         run: python -m ingest.main --source all

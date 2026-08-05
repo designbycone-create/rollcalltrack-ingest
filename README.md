@@ -14,27 +14,32 @@ and has no dependency on Horizons other than the database connection string.
 
 ## Setup
 
+Horizons stores data in **PocketBase** (not Postgres). The ingest job
+authenticates as a PocketBase superuser and writes to the live collections
+`disclosure_filings`, `transactions`, `ingestion_log`, etc.
+
 1. `pip install -r requirements.txt`
-2. Get your database connection string from Horizons (Settings → Database,
-   or ask it directly: "what's the connection string for the database you
-   provisioned?"). Set it as `DATABASE_URL`.
-3. Get a free Congress.gov API key: https://api.congress.gov/sign-up/
-   Set it as `CONGRESS_GOV_API_KEY`.
-4. Copy `.env.example` to `.env` and fill in both values for local testing.
-5. Test locally: `python -m ingest.main --source house --dry-run`
-   (`--dry-run` parses and logs but doesn't write to the DB — use this first)
+2. Copy `.env.example` to `.env` and set:
+   - `DATABASE_URL` — PocketBase base URL, e.g.
+     `https://<app-id>.app-preview.com/hcgi/platform`
+   - `POCKETBASE_ADMIN_EMAIL` / `POCKETBASE_ADMIN_PASSWORD` — superuser
+   - `CONGRESS_GOV_API_KEY` — https://api.congress.gov/sign-up/
+3. Test parse-only (no DB): `python -m ingest.main --source house --dry-run`
+4. Test a real write once secrets are set (members table must be populated
+   for name matching to succeed).
 
 ## Running on a schedule (GitHub Actions — free)
 
-`.github/workflows/ingest.yml` runs this daily. To activate:
+`.github/workflows/ingest.yml` runs this daily. Secrets required:
 
-1. Push this repo to GitHub (private repo is fine — Actions works on private
-   repos too, with generous free minutes for a job this small and infrequent).
-2. In the repo's Settings → Secrets and variables → Actions, add:
-   - `DATABASE_URL`
-   - `CONGRESS_GOV_API_KEY`
-3. The workflow runs automatically on the schedule defined in the yml file.
-   You can also trigger it manually from the Actions tab any time.
+| Secret | Example |
+|--------|---------|
+| `DATABASE_URL` | `https://…app-preview.com/hcgi/platform` |
+| `POCKETBASE_ADMIN_EMAIL` | superuser email |
+| `POCKETBASE_ADMIN_PASSWORD` | superuser password |
+| `CONGRESS_GOV_API_KEY` | Congress.gov API key |
+
+Trigger manually from the Actions tab before relying on the daily cron.
 
 ## Live verification status (2026-08)
 

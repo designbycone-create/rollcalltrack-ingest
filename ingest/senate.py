@@ -325,6 +325,7 @@ def run(
                 continue
 
             member_id = None
+            member_meta = {}
             if conn is not None and not dry_run:
                 member_id = db.find_member_id(
                     conn,
@@ -340,21 +341,25 @@ def run(
                     )
                     failed += 1
                     continue
+                member_meta = db.get_member(conn, member_id) or {}
 
             detail = parse_filing_detail(session, rec["detail_url"])
 
             filing = {
                 "member_id": member_id,
                 "chamber": "senate",
-                "filing_type": rec["filing_type"],
+                "filing_type": "ptr",
                 "filing_date": rec["filing_date"],
                 "source_url": rec["detail_url"],
                 "raw_document_type": "html" if not detail.get("paper") else "pdf",
                 "parse_status": (
-                    "paper_unparsed"
-                    if detail.get("paper")
-                    else ("parsed" if detail["transactions"] else "empty")
+                    "failed"
+                    if detail.get("paper") or not detail["transactions"]
+                    else "parsed"
                 ),
+                "member_name": member_meta.get("name") or rec["name"],
+                "member_party": member_meta.get("party") or "",
+                "member_state": member_meta.get("state") or "",
             }
 
             if dry_run:
@@ -407,6 +412,6 @@ def run(
             failed += 1
 
     if conn is not None and not dry_run:
-        db.log_ingestion_run(conn, "senate", found, parsed, failed)
+        db.log_ingestion_run(conn, "senate_efd", found, parsed, failed)
 
     return {"found": found, "parsed": parsed, "failed": failed}
