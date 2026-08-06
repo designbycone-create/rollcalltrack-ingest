@@ -26,10 +26,34 @@ Auth is a single header: `X-Ingest-Key`. No superuser password required.
 4. Test a real write once secrets are set (members must already exist in
    Horizons for name matching to succeed).
 
-## Running on a schedule (GitHub Actions — free)
+## Running on a schedule (free options)
 
-`.github/workflows/ingest.yml` runs daily at **09:00 UTC** and also supports
-manual `workflow_dispatch`. Secrets required:
+### A) Windows Task Scheduler (recommended when GHA runners are stuck)
+
+Runs on **this PC** — fully free, no hosted-runner minutes.
+
+1. Copy `.env.example` → `.env` and set `HORIZONS_BASE_URL` + `INGEST_API_KEY`
+2. Install the daily task (default **5:00 AM local**):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install_windows_task.ps1
+# optional:  ...\install_windows_task.ps1 -Hour 4 -Minute 30
+```
+
+3. Test once:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run_daily_ingest.ps1
+# or: schtasks /Run /TN "RollcalltrackDisclosureIngest"
+```
+
+Logs: `logs/latest.log` and `logs/ingest_*.log`  
+Uninstall: `powershell -File scripts\uninstall_windows_task.ps1`  
+Requires the PC to be **on** (or wake) at schedule time.
+
+### B) GitHub Actions (public repo — free hosted minutes)
+
+`.github/workflows/ingest.yml` runs daily at **09:00 UTC** + `workflow_dispatch`.
 
 | Secret | Example |
 |--------|---------|
@@ -37,9 +61,10 @@ manual `workflow_dispatch`. Secrets required:
 | `INGEST_API_KEY` | Horizons ingest key |
 
 ```bash
-# manual trigger
 gh workflow run "Disclosure Ingest"
 ```
+
+If jobs stay **queued** with no runner, use option A until GitHub recovers.
 
 Idempotency: re-POSTing the same `source_url` updates the existing filing
 (`updated: true`) instead of creating duplicates.

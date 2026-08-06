@@ -6,5 +6,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 tmp/
+logs/
 *.pdf
+tmp_*.html
 .DS_Store
