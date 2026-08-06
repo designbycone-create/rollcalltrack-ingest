@@ -370,25 +370,27 @@ def run(
                 )
                 if not member:
                     logger.warning(
-                        "No Horizons member match for filer name=%r office=%r — skipping",
+                        "No Horizons member match for filer name=%r office=%r — "
+                        "submitting without member_id",
                         rec["name"],
                         rec.get("office"),
                     )
-                    failed += 1
-                    continue
                 filing = {
-                    "member_id": member.get("id"),
-                    "bioguide_id": member.get("bioguide_id") or "",
                     "chamber": "senate",
                     "filing_type": "ptr",
                     "filing_date": rec["filing_date"],
                     "source_url": rec["detail_url"],
                     "raw_document_type": "html" if not detail.get("paper") else "pdf",
                     "parse_status": parse_status,
-                    "member_name": member.get("name") or rec["name"],
-                    "member_party": member.get("party") or "",
-                    "member_state": member.get("state") or "",
+                    "member_name": (member or {}).get("name") or rec["name"],
+                    "member_party": (member or {}).get("party") or "",
+                    "member_state": (member or {}).get("state") or "",
                 }
+                if member and member.get("id"):
+                    filing["member_id"] = member["id"]
+                bioguide = (member or {}).get("bioguide_id") or ""
+                if bioguide:
+                    filing["bioguide_id"] = bioguide
                 result = hz.submit_filing(
                     filing, transactions=detail["transactions"]
                 )

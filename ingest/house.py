@@ -502,28 +502,31 @@ def run(
                     rec["name"],
                     state_district=rec.get("state_district"),
                 )
+                # Live may lack a members roster while still accepting filings
+                # (member_id optional; bioguide + denormalized name still useful).
                 if not member:
                     logger.warning(
                         "No Horizons member match for filer name=%r "
-                        "state_district=%r — skipping (manual review)",
+                        "state_district=%r — submitting without member_id",
                         rec["name"],
                         rec.get("state_district"),
                     )
-                    failed += 1
-                    continue
                 filing = {
-                    "member_id": member.get("id"),
-                    "bioguide_id": member.get("bioguide_id") or "",
                     "chamber": "house",
                     "filing_type": pb_filing_type,
                     "filing_date": rec["filing_date"],
                     "source_url": rec["pdf_url"],
                     "raw_document_type": "pdf",
                     "parse_status": parse_status,
-                    "member_name": member.get("name") or rec["name"],
-                    "member_party": member.get("party") or "",
-                    "member_state": member.get("state") or state_code or "",
+                    "member_name": (member or {}).get("name") or rec["name"],
+                    "member_party": (member or {}).get("party") or "",
+                    "member_state": (member or {}).get("state") or state_code or "",
                 }
+                if member and member.get("id"):
+                    filing["member_id"] = member["id"]
+                bioguide = (member or {}).get("bioguide_id") or ""
+                if bioguide:
+                    filing["bioguide_id"] = bioguide
                 result = hz.submit_filing(filing, transactions=txns)
                 logger.info(
                     "House submitted filing_id=%s txns=%s name=%r",
