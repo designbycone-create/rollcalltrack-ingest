@@ -126,6 +126,7 @@ rollcalltrack-ingest/
     prac.py              # PRAC pandemic fraud enforcement
     prac_source_allowlist.json  # trusted source_url hosts
     fjc.py               # FJC Article III biographical directory
+    jefs.py              # AO / JEFS judicial financial disclosures
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
@@ -135,6 +136,7 @@ rollcalltrack-ingest/
     oversight-ig.yml     # Oversight.gov IG reports (schedule held)
     prac-fraud.yml       # PRAC fraud cases (schedule held, dry-run default)
     fjc-judges.yml       # FJC judges (dispatch primary, quarterly cron)
+    jefs-disclosures.yml # AO judicial disclosures (dispatch + weekly cron)
   requirements.txt
   .env.example
 ```
@@ -675,3 +677,152 @@ UTC) is a backup and also dry-runs until you dispatch with
 Samuel A. Alito Jr. (`nid=1377101`) maps to `Supreme Court of the United
 States` / `supreme_court` / `George W. Bush` / `2005-11-10` /
 `2006-01-31` — slot 2, not his earlier Third Circuit appointment.
+
+## AO judicial disclosures (`ao-judicial-disclosures-sync`)
+
+Weekly incremental job. Pulls annual financial disclosure reports and
+periodic transaction reports (PTRs) from the Administrative Office of
+the U.S. Courts’ public JEFS database, launched November 2022 under the
+Courthouse Ethics and Transparency Act.
+
+`POST /hcgi/api/ingest/judicial/disclosures` is **not deployed** (live
+404). `GET /hcgi/api/judicial/judges` is also 404. See
+`docs/HORIZONS_JUDICIAL_DISCLOSURES.md`. Until the read route exists
+the job loads the same FJC export as `fjc-judges-sync` and uses `nid`
+as `judge_id`. Do not hardcode a judge list.
+
+This is the most name-matching-fragile job in the module. Ambiguous
+JEFS name hits go to **manual_review**. We do not guess.
+
+### Access pattern (live-verified 2026-08)
+
+Official entry:
+[uscourts.gov judiciary financial disclosure reports](https://www.uscourts.gov/administration-policies/judiciary-financial-disclosure-reports)
+→ **https://pub.jefs.uscourts.gov/**
+
+This is **not** Senate eFD. Differences that matter for maintenance:
+
+| Step | What the site actually does |
+|------|-----------------------------|
+| Landing page | Registration-only. The search UI is **not** in the unauthenticated HTML. |
+| Agreement | Statutory prohibited-use text (5 U.S.C. § 13107) plus 18 U.S.C. § 1001. Not a single checkbox like Senate `prohibition_agreement=1`. |
+| Registration | Required **every visit** (“Users must register each time they access this system”). Form fields: first/last name, occupation, address, “Requesting on Behalf of”, certify. POST `/index.php` `action=register` + `_csrf`. |
+| reCAPTCHA | Google recaptcha sitekey is on the page (`grecaptcha.execute()`). The site’s own JS calls `register()` even when `verify_recaptcha` returns `success: false`. We do **not** solve captchas. |
+| Search | After login, POST `/index.php` `action=search` with `q`, `start`, `sort_by`, `sort_dir`, `facet_string` (JSON). Returns `{ count, filercount, start, rows: [...] }`. Unauthenticated search is `{"document":"You must be logged in"}`. |
+| Facets | POST `action=get_facets` works **without** login. Live values: years 2013–2026; report types `Annual`, `Annual/Final`, `Final`, `Initial`, `Periodic Transaction Report`; 201 court strings; positions including District / Circuit / Bankruptcy / Magistrate Judge. |
+| Pagination | 10 **filers** per page (`start += 10`). Load-more compares `start + usersRendered < filercount`. |
+| Documents | **PDFs only** (JEFS-generated Form AO 10 annual, Form AO 10T PTR). No HTML transaction table. |
+| Download | Session cart: POST `action=add\|remove&id={id}`, then GET `/index.php?action=download` (max 100). Unauthenticated download: `You must be registered to download files.` |
+| Permalinks | **None.** There is no public `/view/{id}` URL. `source_url` is `https://pub.jefs.uscourts.gov/?filing={id}` — an identifier-bearing locator, not an unauthenticated deep link. A human still has to register to open the file. |
+| WAF | F5 cookies. Some GET query strings return HTML `Request Rejected`. Prefer POST. |
+| Idle | Client reloads after 30 minutes idle. |
+| robots.txt | `User-agent: *` / `Allow: /`. |
+
+Reports on the site are 2022+ that have been cleared for release. 2021
+and earlier (and employee reports) are an AO-10A request, not this job.
+
+### Statutory requester identity
+
+5 U.S.C. § 13107 requires a real name, occupation, and address. The
+request is a public record. Commercial use other than news/communication
+media for dissemination to the general public is prohibited.
+
+The job **refuses to invent** an identity. Set these in `.env` / Actions
+secrets, or pass a browser `SESSID` as `JEFS_SESSION`:
+
+`JEFS_FIRST_NAME`, `JEFS_LAST_NAME`, `JEFS_OCCUPATION`, `JEFS_ADDRESS1`,
+`JEFS_CITY`, `JEFS_STATE`, `JEFS_ZIP`, optional `JEFS_EMAIL` /
+`JEFS_REPRESENTING`.
+
+Without those, a live search exits with a clear error. Offline tests do
+not need them.
+
+### Judge matching
+
+Roster, in order:
+
+1. `GET /hcgi/api/judicial/judges` if Horizons has it
+2. Else the live FJC `judges.csv` via `ingest.fjc` (`judge_id` = `nid`)
+
+`--judge-id` filters that roster to one nid and searches JEFS by that
+judge’s `full_name` (JEFS has no FJC id field).
+
+A JEFS `name_s` matches only when last name is exact and first name is
+exact or a ≥3-character prefix. Multiple hits are reduced by
+`court_type_s` vs FJC `court`. Anything still 0 or ≥2 → `manual_review`.
+
+### Field mapping
+
+| Field | Source |
+|-------|--------|
+| `judge_id` | FJC `nid` after a unique name(+court) match |
+| `filing_id` | JEFS search row `id` |
+| `filing_type` | `Periodic Transaction Report` → `periodic_transaction`; `Annual` / `Annual/Final` / `Initial` / `Final` → `annual` (same AO-10 asset form) |
+| `filing_date` | PTR: `ao_certified_dt`; annual: `published_dt` (ISO) |
+| `source_url` | `https://pub.jefs.uscourts.gov/?filing={id}` |
+
+PTR transactions (Form AO 10T): `asset_name`, `transaction_type`
+(`Buy*` → `purchase`, `Sold*` / `Redeemed` → `sale`, `Exchange` →
+`exchange`), `transaction_date`, `amount_range_low` / `_high`.
+
+Annual assets (Form AO 10 Part VII): `asset_name`, `asset_type`
+(null unless the PDF states one), `value_range_low` / `_high`.
+
+Brackets are the 5 U.S.C. § 13104(d) ranges / AO-10 letter codes
+`J`–`P4`. `P4` / “More than $50,000,000” has `high: null`. We never
+store a midpoint. A PTR/annual PDF we cannot parse still keeps the
+matched filing shell and goes to `manual_review` for the empty child
+rows — live JEFS PDF layout is not public without a registered session,
+so the parser is conservative.
+
+### CLI
+
+```bash
+# needs JEFS_* identity for a live search
+python -m ingest.jefs --dry-run --days-back 14 --max-records 3
+python -m ingest.jefs --dry-run --judge-id 1377101 --max-records 5
+python -m ingest.main --source jefs --dry-run --days-back 14
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--judge-id` | no | FJC nid. Search that judge’s name only. |
+| `--days-back` | no | Default 14. Filters published/certified date. Incremental search sorts `f.published_dt` DESC and stops when the page is older. |
+| `--max-records` | no | Cap filings. `main.py --dry-run` defaults to 3. |
+| `--dry-run` | no | Parse + log; no POST. |
+
+Workflow: `.github/workflows/jefs-disclosures.yml` — **dispatch is
+primary** (`dry_run` defaults true). Weekly Monday 12:00 UTC cron is a
+backup and also dry-runs until you dispatch `dry_run=false` after both
+the Horizons route **and** `JEFS_*` secrets exist.
+
+### Sample payload
+
+```json
+{
+  "filings": [
+    {
+      "judge_id": "1377101",
+      "filing_id": "ptr-1",
+      "filing_type": "periodic_transaction",
+      "filing_date": "2026-01-20",
+      "source_url": "https://pub.jefs.uscourts.gov/?filing=ptr-1",
+      "transactions": [
+        {
+          "filing_id": "ptr-1",
+          "asset_name": "Apple Inc. (AAPL)",
+          "transaction_type": "purchase",
+          "transaction_date": "2026-01-15",
+          "amount_range_low": 15001,
+          "amount_range_high": 50000,
+          "source_url": "https://pub.jefs.uscourts.gov/?filing=ptr-1"
+        }
+      ],
+      "annual_assets": []
+    }
+  ]
+}
+```
+
+`$15,001 - $50,000` is stored as that bracket. The midpoint `$32,500.50`
+is never written.

@@ -225,6 +225,56 @@ class HorizonsIngestClient:
         )
         return data
 
+    def submit_judicial_disclosures(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/judicial/disclosures."""
+        if not records:
+            return {"ok": True, "written": 0}
+        filing_types = ("annual", "periodic_transaction")
+        txn_types = ("purchase", "sale", "exchange")
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every filing")
+            if not rec.get("judge_id"):
+                raise ValueError("judge_id is required on every filing")
+            if not rec.get("filing_id"):
+                raise ValueError("filing_id is required on every filing")
+            if rec.get("filing_type") not in filing_types:
+                raise ValueError("invalid filing_type")
+            for txn in rec.get("transactions") or []:
+                if not txn.get("source_url"):
+                    raise ValueError("source_url is required on every transaction")
+                if txn.get("transaction_type") not in txn_types:
+                    raise ValueError("invalid transaction_type")
+            for asset in rec.get("annual_assets") or []:
+                if not asset.get("source_url"):
+                    raise ValueError("source_url is required on every annual asset")
+        body = {"filings": records}
+        logger.info("Submitting %d judicial disclosures", len(records))
+        resp = self._post_ingest(
+            body, path="/hcgi/api/ingest/judicial/disclosures"
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/judicial/disclosures is not "
+                "deployed (404). See docs/HORIZONS_JUDICIAL_DISCLOSURES.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Judicial-disclosure ingest HTTP %s: %s",
+                resp.status_code,
+                str(data)[:500],
+            )
+            resp.raise_for_status()
+        logger.info(
+            "Judicial-disclosure ingest OK written=%s",
+            data.get("written") or data.get("count"),
+        )
+        return data
+
     def submit_judicial_judges(self, records: list[dict]) -> dict:
         """POST a batch to /hcgi/api/ingest/judicial/judges."""
         if not records:
@@ -579,6 +629,7 @@ class HorizonsIngestClient:
                 "oversight",
                 "prac",
                 "fjc",
+                "jefs",
             )
             else (
                 "house_clerk"
@@ -595,6 +646,8 @@ class HorizonsIngestClient:
                 if "prac" in source or "fraud" in source
                 else "fjc"
                 if "fjc" in source or "judge" in source
+                else "jefs"
+                if "jefs" in source or "judicial" in source
                 else "congress_gov"
             ),
             "run_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

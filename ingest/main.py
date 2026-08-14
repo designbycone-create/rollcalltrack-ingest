@@ -21,6 +21,7 @@ from . import (
     oversight,
     prac,
     fjc,
+    jefs,
 )
 from .ingest_client import get_client
 
@@ -44,6 +45,7 @@ def main():
             "oversight",
             "prac",
             "fjc",
+            "jefs",
             "all",
         ],
         default="all",
@@ -57,6 +59,11 @@ def main():
         "--full-refresh",
         action="store_true",
         help="Full directory refresh (fjc; this job has no incremental mode)",
+    )
+    parser.add_argument(
+        "--judge-id",
+        default=None,
+        help="FJC nid (jefs test pull for one judge)",
     )
     parser.add_argument("--year", type=int, default=None)
     parser.add_argument("--days-back", type=int, default=None)
@@ -217,6 +224,19 @@ def main():
                 dry_run=args.dry_run,
                 full_refresh=True,
                 max_records=max_r,
+                client=client,
+            )
+
+        if args.source == "jefs":
+            logger.info("=== Running AO/JEFS judicial disclosure ingest ===")
+            max_r = args.max_records
+            if args.dry_run and max_r is None:
+                max_r = 3
+            results["jefs"] = jefs.run(
+                judge_id=getattr(args, "judge_id", None),
+                days_back=args.days_back if args.days_back is not None else 14,
+                max_records=max_r,
+                dry_run=args.dry_run,
                 client=client,
             )
 

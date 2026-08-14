@@ -1,0 +1,75 @@
+name: AO Judicial Disclosures
+
+# Primary path is workflow_dispatch. Weekly cron is a backup.
+# Horizons route is not deployed and JEFS requires a statutory requester
+# identity — scheduled runs stay dry-run (empty inputs != "false") and
+# will fail cleanly until JEFS_* secrets exist.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Parse only, do not POST (true/false). Default true."
+        required: false
+        default: "true"
+      days_back:
+        description: "Incremental window in days"
+        required: false
+        default: "14"
+      max_records:
+        description: "Cap filings (blank = window)"
+        required: false
+      judge_id:
+        description: "Optional FJC nid for a single-judge test pull"
+        required: false
+  schedule:
+    # Monday 12:00 UTC — backup only
+    - cron: "0 12 * * 1"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run AO/JEFS judicial disclosure ingest
+        env:
+          HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          INGEST_KEY: ${{ secrets.INGEST_KEY }}
+          JEFS_FIRST_NAME: ${{ secrets.JEFS_FIRST_NAME }}
+          JEFS_LAST_NAME: ${{ secrets.JEFS_LAST_NAME }}
+          JEFS_OCCUPATION: ${{ secrets.JEFS_OCCUPATION }}
+          JEFS_ADDRESS1: ${{ secrets.JEFS_ADDRESS1 }}
+          JEFS_CITY: ${{ secrets.JEFS_CITY }}
+          JEFS_STATE: ${{ secrets.JEFS_STATE }}
+          JEFS_ZIP: ${{ secrets.JEFS_ZIP }}
+          JEFS_EMAIL: ${{ secrets.JEFS_EMAIL }}
+          JEFS_REPRESENTING: ${{ secrets.JEFS_REPRESENTING }}
+          JEFS_SESSION: ${{ secrets.JEFS_SESSION }}
+        run: |
+          DRY="${{ github.event.inputs.dry_run }}"
+          DAYS="${{ github.event.inputs.days_back }}"
+          DAYS="${DAYS:-14}"
+          MAX="${{ github.event.inputs.max_records }}"
+          JID="${{ github.event.inputs.judge_id }}"
+          CMD=(python -m ingest.jefs --days-back "$DAYS")
+          if [ "${DRY}" != "false" ]; then
+            CMD+=(--dry-run)
+          fi
+          if [ -n "$MAX" ]; then
+            CMD+=(--max-records "$MAX")
+          fi
+          if [ -n "$JID" ]; then
+            CMD+=(--judge-id "$JID")
+          fi
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"
