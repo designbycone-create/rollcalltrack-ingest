@@ -225,6 +225,61 @@ class HorizonsIngestClient:
         )
         return data
 
+    def submit_judicial_judges(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/judicial/judges."""
+        if not records:
+            return {"ok": True, "written": 0}
+        court_types = (
+            "supreme_court",
+            "circuit_court",
+            "district_court",
+            "bankruptcy_court",
+            "magistrate",
+            "other",
+        )
+        statuses = (
+            "active",
+            "senior_status",
+            "retired",
+            "resigned",
+            "deceased",
+        )
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every judge")
+            if not rec.get("judge_id"):
+                raise ValueError("judge_id is required on every judge")
+            if rec.get("court_type") not in court_types:
+                raise ValueError("invalid court_type")
+            if rec.get("status") not in statuses:
+                raise ValueError("invalid status")
+        body = {"judges": records}
+        logger.info("Submitting %d judges", len(records))
+        resp = self._post_ingest(
+            body, path="/hcgi/api/ingest/judicial/judges"
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/judicial/judges is not "
+                "deployed (404). See docs/HORIZONS_JUDICIAL_JUDGES.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Judicial-judge ingest HTTP %s: %s",
+                resp.status_code,
+                str(data)[:500],
+            )
+            resp.raise_for_status()
+        logger.info(
+            "Judicial-judge ingest OK written=%s",
+            data.get("written") or data.get("count"),
+        )
+        return data
+
     def submit_fraud_cases(self, records: list[dict]) -> dict:
         """POST a batch to /hcgi/api/ingest/spending/fraud-cases."""
         if not records:
@@ -523,6 +578,7 @@ class HorizonsIngestClient:
                 "gao",
                 "oversight",
                 "prac",
+                "fjc",
             )
             else (
                 "house_clerk"
@@ -537,6 +593,8 @@ class HorizonsIngestClient:
                 if "oversight" in source or source == "ig"
                 else "prac"
                 if "prac" in source or "fraud" in source
+                else "fjc"
+                if "fjc" in source or "judge" in source
                 else "congress_gov"
             ),
             "run_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

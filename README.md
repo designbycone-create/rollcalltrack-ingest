@@ -125,6 +125,7 @@ rollcalltrack-ingest/
     oversight.py         # Oversight.gov IG reports
     prac.py              # PRAC pandemic fraud enforcement
     prac_source_allowlist.json  # trusted source_url hosts
+    fjc.py               # FJC Article III biographical directory
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
@@ -133,6 +134,7 @@ rollcalltrack-ingest/
     gao-improper-payments.yml  # GAO improper payments (dispatch + annual)
     oversight-ig.yml     # Oversight.gov IG reports (schedule held)
     prac-fraud.yml       # PRAC fraud cases (schedule held, dry-run default)
+    fjc-judges.yml       # FJC judges (dispatch primary, quarterly cron)
   requirements.txt
   .env.example
 ```
@@ -523,3 +525,153 @@ cron held). Dispatch `dry_run` defaults to true.
 `$3.9 million` is the figure in the PRAC listing and the DOJ title — not
 computed. The same listing’s “over $40,000” PUA case would have
 `amount_alleged: null`.
+
+## FJC Article III judges (`fjc-judges-sync`)
+
+Quarterly full-refresh job. **Not an incremental daily sync.** The
+directory turns over slowly (new confirmations, senior status, deaths).
+
+Source: the Federal Judicial Center’s
+[Biographical Directory of Article III Federal Judges](https://www.fjc.gov/history/judges/biographical-directory-article-iii-federal-judges-export)
+nightly flat-file export.
+
+| File | URL |
+|------|-----|
+| Export page | https://www.fjc.gov/history/judges/biographical-directory-article-iii-federal-judges-export |
+| CSV (this job) | https://www.fjc.gov/sites/default/files/history/judges.csv |
+| Excel (same data) | https://www.fjc.gov/sites/default/files/history/judges.xlsx |
+
+Checked 2026-08: ~4,074 judges, 201 columns, unique `nid` on every row.
+FJC also publishes a relational split (`demographics.csv`,
+`federal-judicial-service.csv`, …). We use the flat file so one row is
+one judge. Citation FJC asks for: *History of the Federal Judiciary.*
+http://www.fjc.gov/.
+
+`POST /hcgi/api/ingest/judicial/judges` is **not deployed** (live 404 on
+rollcalltrack.com and the preview origin). See
+`docs/HORIZONS_JUDICIAL_JUDGES.md`. Request this route from Horizons
+before enabling unattended writes.
+
+### `judge_id` scheme (join key for later judicial jobs)
+
+**`judge_id` = FJC `nid` (Node ID), stored as a string.**
+
+FJC documents `nid` as the unique identifier for each judge in the
+biographical database. The same number is the bio-page path:
+
+```
+https://www.fjc.gov/node/{nid}
+```
+
+Example: Adam Ben Abelson is `nid=13761857` →
+https://www.fjc.gov/node/13761857.
+
+**Do not use `jid`.** FJC stopped assigning Judge Identification Numbers
+in July 2016. Newer judges have no distinct `jid` (Abelson’s `jid` is
+just a copy of `nid`). Later jobs (financial disclosures, confirmation
+votes) must join on `nid`.
+
+If FJC ever shipped a row without `nid`, that row goes to
+`manual_review` — we do not invent a name+court+date slug.
+
+### Field mapping
+
+Court / president / dates / ABA come from the **highest-numbered
+non-empty Article III service slot** (1 = earliest appointment, 6 =
+most recent). A judge elevated from district to circuit to SCOTUS
+contributes slot 3, not slot 1.
+
+| Field | Source |
+|-------|--------|
+| `judge_id` | `nid` |
+| `full_name` | `First Name` + `Middle Name` + `Last Name` + `Suffix` (blank parts dropped) |
+| `court` | `Court Name (n)` on the latest slot |
+| `court_type` | mapped from `Court Type (n)` + court name (below) |
+| `appointing_president` | `Appointing President (n)` (FJC may write `None (reassignment)`) |
+| `nomination_date` | `Nomination Date (n)` → ISO `YYYY-MM-DD`, else null |
+| `confirmation_date` | `Confirmation Date (n)` → ISO `YYYY-MM-DD`, else null |
+| `aba_rating` | `ABA Rating (n)` as published (`Well Qualified`, `Qualified`, …), else null |
+| `status` | derived (below) |
+| `source_url` | `https://www.fjc.gov/node/{nid}` |
+
+Live CSV dates are already `YYYY-MM-DD`. FJC’s export notes still say
+`mm/dd/yyyy`. The parser accepts both and never invents a date.
+
+`court_type` mapping:
+
+| FJC `Court Type` / name | enum |
+|-------------------------|------|
+| Supreme Court | `supreme_court` |
+| U.S. Court of Appeals; U.S. Circuit Court (historical) | `circuit_court` |
+| U.S. District Court | `district_court` |
+| U.S. Court of International Trade; U.S. Customs Court | `district_court` |
+| U.S. Court of Customs and Patent Appeals | `circuit_court` |
+| Court of Claims | `other` |
+| anything else | `other` |
+
+`bankruptcy_court` and `magistrate` are in the contract because later
+jobs may need them. This directory is **Article III only**. Magistrate /
+bankruptcy posts show up as free-text under `Other Federal Judicial
+Service` (e.g. Abelson’s 2023–2024 magistrate seat). We do **not**
+promote that text to `court` or `court_type`. A sitting district judge
+who used to be a magistrate is `district_court`.
+
+`status` mapping, first match wins:
+
+| Condition | enum |
+|-----------|------|
+| `Death Year` set, or latest `Termination` is `Death` | `deceased` |
+| latest `Termination` is `Resignation` or `Impeachment & Conviction` | `resigned` |
+| latest `Termination` is `Retirement` | `retired` |
+| latest `Senior Status Date` set and no terminal termination | `senior_status` |
+| no termination, no senior date, no death year | `active` |
+| latest `Termination` is `Recess Appointment-Not Confirmed` or `Abolition of Court` (and no death year) | **manual_review** |
+
+Death always wins: a retired or senior judge who has a death year is
+`deceased`. `Appointment to Another Judicial Position` and
+`Reassignment` never appear on the last slot in the current export
+(they are always followed by a later court).
+
+### CLI
+
+```bash
+python -m ingest.fjc --dry-run --full-refresh --max-records 5
+python -m ingest.main --source fjc --dry-run --full-refresh --max-records 5
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--dry-run` | no | Parse + log; no POST. Prefer this until Horizons exists. |
+| `--full-refresh` | no | Accepted and is the only mode. There is no `--days-back` window. |
+| `--max-records` | no | Cap rows. `main.py --dry-run` defaults to 5. |
+
+Workflow: `.github/workflows/fjc-judges.yml` — **dispatch is primary**
+(`dry_run` defaults to true). Quarterly cron (Jan/Apr/Jul/Oct 15 12:00
+UTC) is a backup and also dry-runs until you dispatch with
+`dry_run=false` after the Horizons route exists. Same secrets:
+`HORIZONS_BASE_URL` + `INGEST_API_KEY` (`INGEST_KEY` also accepted).
+
+### Sample payload
+
+```json
+{
+  "judges": [
+    {
+      "judge_id": "13761857",
+      "full_name": "Adam Ben Abelson",
+      "court": "U.S. District Court for the District of Maryland",
+      "court_type": "district_court",
+      "appointing_president": "Joseph R. Biden",
+      "nomination_date": "2024-05-14",
+      "confirmation_date": "2024-09-10",
+      "aba_rating": "Well Qualified",
+      "status": "active",
+      "source_url": "https://www.fjc.gov/node/13761857"
+    }
+  ]
+}
+```
+
+Samuel A. Alito Jr. (`nid=1377101`) maps to `Supreme Court of the United
+States` / `supreme_court` / `George W. Bush` / `2005-11-10` /
+`2006-01-31` — slot 2, not his earlier Third Circuit appointment.

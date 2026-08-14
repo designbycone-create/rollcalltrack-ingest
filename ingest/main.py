@@ -20,6 +20,7 @@ from . import (
     gao,
     oversight,
     prac,
+    fjc,
 )
 from .ingest_client import get_client
 
@@ -42,6 +43,7 @@ def main():
             "gao",
             "oversight",
             "prac",
+            "fjc",
             "all",
         ],
         default="all",
@@ -50,6 +52,11 @@ def main():
         "--dry-run",
         action="store_true",
         help="Parse and log but don't write (no secrets required for house/senate)",
+    )
+    parser.add_argument(
+        "--full-refresh",
+        action="store_true",
+        help="Full directory refresh (fjc; this job has no incremental mode)",
     )
     parser.add_argument("--year", type=int, default=None)
     parser.add_argument("--days-back", type=int, default=None)
@@ -198,6 +205,18 @@ def main():
                 days_back=args.days_back if args.days_back is not None else 14,
                 max_records=max_r,
                 dry_run=True,
+                client=client,
+            )
+
+        if args.source == "fjc":
+            logger.info("=== Running FJC judges ingest ===")
+            max_r = args.max_records
+            if args.dry_run and max_r is None:
+                max_r = 5
+            results["fjc"] = fjc.run(
+                dry_run=args.dry_run,
+                full_refresh=True,
+                max_records=max_r,
                 client=client,
             )
 
