@@ -1,8 +1,7 @@
 name: LegiScan Legislators
 
-# Monthly roster refresh. Dispatch is primary so we can test one state
-# before --all-states. dry_run defaults true until Horizons accepts
-# jurisdiction=state on POST /hcgi/api/ingest/members.
+# Monthly roster refresh for all 50 states. Dispatch stays dry-run
+# unless dry_run=false. Schedule POSTs to /ingest/members (route exists).
 on:
   workflow_dispatch:
     inputs:
@@ -14,11 +13,11 @@ on:
         required: false
         default: "false"
       dry_run:
-        description: "Parse only, do not POST (true/false). Default true."
+        description: "Parse only, do not POST (true/false). Default true on dispatch."
         required: false
         default: "true"
   schedule:
-    # 1st of month 12:00 UTC
+    # 1st of month 12:00 UTC — live write
     - cron: "0 12 1 * *"
 
 jobs:
@@ -55,7 +54,7 @@ jobs:
             echo "Provide state=XX or all_states=true"
             exit 1
           fi
-          if [ "${DRY}" != "false" ]; then
+          if [ "${{ github.event_name }}" != "schedule" ] && [ "${DRY}" != "false" ]; then
             CMD+=(--dry-run)
           fi
           echo "Running: ${CMD[*]}"

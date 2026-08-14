@@ -1,0 +1,76 @@
+name: State Spending (50-state)
+
+# Monthly. Most states have no confirmed bulk file (see state_portals.json).
+# CA Open FI$Cal is the only live adapter today. Schedule held until
+# Horizons accepts jurisdiction=state awards without award_type.
+on:
+  # schedule:
+  #   - cron: "30 14 3 * *"
+  workflow_dispatch:
+    inputs:
+      state:
+        description: "USPS code (blank + all_states=true = all 50)"
+        required: false
+      all_states:
+        description: "All 50 states (true/false)"
+        required: false
+        default: "false"
+      fiscal_year:
+        description: "FY begin year (CA: 2025 = FY25). Blank = current CA-style FY."
+        required: false
+      days_back:
+        description: "Optional accounting_date window"
+        required: false
+      max_records:
+        description: "Cap per state"
+        required: false
+      dry_run:
+        description: "Parse only (true/false). Default true."
+        required: false
+        default: "true"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run state spending ingest
+        env:
+          HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          INGEST_KEY: ${{ secrets.INGEST_KEY }}
+        run: |
+          FY="${{ github.event.inputs.fiscal_year }}"
+          if [ -z "$FY" ]; then
+            FY=$(python -c "from datetime import date; t=date.today(); print(t.year if t.month>=7 else t.year-1)")
+          fi
+          ST="${{ github.event.inputs.state }}"
+          ALL="${{ github.event.inputs.all_states }}"
+          DAYS="${{ github.event.inputs.days_back }}"
+          MAX="${{ github.event.inputs.max_records }}"
+          DRY="${{ github.event.inputs.dry_run }}"
+          CMD=(python -m ingest.state_spending --fiscal-year "$FY")
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${ALL}" = "true" ]; then
+            CMD+=(--all-states)
+          elif [ -n "$ST" ]; then
+            CMD+=(--state "$ST")
+          else
+            echo "Provide state=XX or all_states=true"
+            exit 1
+          fi
+          if [ -n "$DAYS" ]; then
+            CMD+=(--days-back "$DAYS")
+          fi
+          if [ -n "$MAX" ]; then
+            CMD+=(--max-records "$MAX")
+          fi
+          if [ "${{ github.event_name }}" != "schedule" ] && [ "${DRY}" != "false" ]; then
+            CMD+=(--dry-run)
+          fi
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"

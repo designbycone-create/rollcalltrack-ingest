@@ -466,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = build_arg_parser().parse_args(argv)
     try:
-        config.require_config(dry_run=args.dry_run, source="legiscan")
+        config.require_config(dry_run=args.dry_run, source="legiscan_bills")
         states = resolve_states(args.state, args.all_states)
     except (RuntimeError, ValueError) as e:
         logger.error(str(e))

@@ -255,6 +255,7 @@ class HorizonsIngestClient:
                 "Horizons route /hcgi/api/ingest/bills is not deployed (404). "
                 "See docs/HORIZONS_LEGISCAN_BILLS.md"
             )
+            return {"ok": False, "error": "route_not_found", "written": 0}
         if resp.status_code not in (200, 201):
             logger.error("Bills ingest HTTP %s: %s", resp.status_code, str(data)[:500])
             resp.raise_for_status()
@@ -308,6 +309,7 @@ class HorizonsIngestClient:
                 "Horizons route /hcgi/api/ingest/state-coverage is not deployed "
                 "(404). See docs/HORIZONS_STATE_COVERAGE.md"
             )
+            return {"ok": False, "error": "route_not_found", "written": 0}
         if resp.status_code not in (200, 201):
             logger.error(
                 "Coverage ingest HTTP %s: %s", resp.status_code, str(data)[:500]

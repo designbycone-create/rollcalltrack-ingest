@@ -10,8 +10,9 @@ Live hooks (api.legiscan.com):
 Federal Congress is not pulled here. 50 states only (no DC).
 Nebraska is always chamber=unicameral.
 
-Party matches the live federal members feed: D / R / I.
-Anything else (nonpartisan, third party) goes to manual_review.
+Party matches the live federal members feed plus N:
+D / R / I / N. N is official Nonpartisan (Nebraska Unicameral),
+not Independent. Unknown letters go to manual_review.
 
 bioguide_id for state rows is ``LS{people_id}`` so it cannot collide
 with a congressional bioguide (those are letter + 6 digits).

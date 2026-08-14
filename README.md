@@ -131,12 +131,15 @@ rollcalltrack-ingest/
     legiscan.py          # LegiScan 50-state legislator roster
     legiscan_bills.py    # LegiScan state bills + roll calls + coverage
     ca_spending.py       # California Open FI$Cal vendor expenditures
+    state_spending.py    # 50-state spending orchestrator
+    state_portals.json   # official checkbook catalog + adapters
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
     ingest.yml           # daily disclosure cron + workflow_dispatch
     usaspending.yml      # USAspending (schedule held)
     ca-spending.yml      # CA Open FI$Cal (schedule held, monthly)
+    state-spending.yml   # 50-state spending (schedule held, monthly)
     gao-improper-payments.yml  # GAO improper payments (dispatch + annual)
     oversight-ig.yml     # Oversight.gov IG reports (schedule held)
     prac-fraud.yml       # PRAC fraud cases (schedule held, dry-run default)
@@ -397,6 +400,64 @@ unfit for the federal award enums.”
   ]
 }
 ```
+
+## 50-state spending (`state-spending-sync`)
+
+Same research pass as California, for every USPS state. Catalog:
+`ingest/state_portals.json`. Orchestrator: `python -m ingest.state_spending`.
+
+**These are posted expenditures / vendor payments, not federal awards.**
+No adapter sets `award_type` or `amount_type`. HTML checkbooks are not
+scraped. A state is `unsupported` until a public CSV/SODA/CKAN URL was
+confirmed on the official site.
+
+### Live adapters (probed 2026-08-14)
+
+| Code | Portal | Adapter | Grain | Cadence |
+|------|--------|---------|-------|---------|
+| CA | [Open FI$Cal](https://open.fiscal.ca.gov/) | `open_fiscal` | AP/GL vendor lines | monthly |
+| CT | [Open Checkbook](https://opencheckbook.ct.gov/) SODA `ajdm-rvz7` | `socrata` | payment lines | daily |
+| DE | [Open Checkbook](https://opencheckbook.delaware.gov/) SODA `5s6n-7hpx` | `socrata` | checks | monthly |
+| MA | [CTHRU](https://www.macomptroller.org/cthru/) SODA `pegc-naaa` | `socrata` | Mosaic payments | daily |
+| MD | [Vendor Payments](https://vendorpayments.maryland.gov/) SODA `7syw-q4cy` | `socrata` | often FY aggregates | monthly |
+| MO | [MAP](https://mapyourtaxes.mo.gov/) SODA `gndj-tfr3` | `socrata` | annual vendor totals (date = FY July 1) | annual |
+| NJ | [YourMoney](https://www.nj.gov/transparency/financial-management/expenditures/) SODA `apet-rp2i` | `socrata` | YTD by payee | quarterly |
+| OR | [Transparency](https://www.oregon.gov/transparency/pages/expenditures.aspx) SODA `y9g9-xsxs` | `socrata` | cash paid / vendor / FY | annual |
+| OK | [OMES CKAN](https://data.ok.gov/dataset/state-of-oklahoma-vendor-payments-fiscal-year-2026) | `ckan` | monthly voucher CSV | monthly |
+
+The other 41 states have an official portal URL in the catalog and are
+**skipped** until a stable anonymous file/API is pinned. Typical blockers:
+query-only Excel (AL, NY), OpenGov/Tableau SPA (AK, MT, NV), CAPTCHA
+(AR), login-gated zips (OH), budget-without-vendor (NC, TX county
+rollups, WA fiscal). See each `notes` field. Do not invent Socrata 4x4s.
+
+### CLI
+
+```bash
+python -m ingest.state_spending --state CT --fiscal-year 2026 --dry-run --max-records 5
+python -m ingest.state_spending --state CA --fiscal-year 2025 --dry-run --max-records 5
+python -m ingest.state_spending --all-states --fiscal-year 2026 --dry-run --max-records 3
+python -m ingest.main --source state_spending --state OK --fiscal-year 2026 --dry-run
+```
+
+`--all-states` walks the catalog: live adapters fetch, `unsupported`
+states log and skip. Same flags as USAspending (`--fiscal-year`,
+`--days-back`, `--max-records`, `--dry-run`). `jurisdiction=state` and
+`state_code` are set on every mapped row. Confidential / non-positive
+amounts go to review (capped at 25 flags).
+
+Workflow `.github/workflows/state-spending.yml` is **dispatch / dry-run
+default**. Monthly cron is commented until Horizons accepts state rows
+without `award_type`/`amount_type` (same hole as CA). Suggested
+`30 14 3 * *`.
+
+### Review volume
+
+SODA ledgers are millions of rows. A monthly `--all-states` without
+`--max-records` is not a first-run. Start with `--days-back 30
+--max-records 500` per live state. MO/OR/NJ/MD are aggregates — lower
+volume, but they are **not** comparable to CA voucher lines. Do not sum
+them with CA as if they were the same grain.
 
 ## GAO improper payments (`gao-improper-payments-sync`)
 
@@ -1146,8 +1207,9 @@ python -m ingest.main --source legiscan --state TX --dry-run
 | `--dry-run` | no | Parse + log; no POST. |
 
 Workflow: `.github/workflows/legiscan-legislators.yml` — dispatch
-primary (`dry_run` default true). Monthly cron (1st, 12:00 UTC) is a
-backup and also dry-runs until you dispatch `dry_run=false`.
+stays dry-run unless `dry_run=false`. **Monthly cron (1st, 12:00 UTC)
+POSTs all 50 states** to `/hcgi/api/ingest/members` (route exists).
+Needs repo secret `LEGISCAN_API_KEY`.
 
 ### Test-run notes (data quality)
 
@@ -1284,7 +1346,10 @@ python -m ingest.main --source legiscan_bills --state DE --dry-run
 | `--max-records` | no | Cap bills after the date filter. `main.py --dry-run` defaults to 5. |
 
 Workflow: `.github/workflows/legiscan-bills-votes.yml` — dispatch
-primary. Weekly Monday 14:00 UTC backup, dry-run until `dry_run=false`.
+stays dry-run unless `dry_run=false`. **Weekly Monday 14:00 UTC POSTs
+all 50 states.** `/votes` exists; `/bills` and `/state-coverage` 404
+are fail-soft so votes still land. Needs `LEGISCAN_API_KEY`. Horizons
+must extend bills uniqueness with `state_code` before bills can persist.
 
 ### Test-run notes (DE, 14-day window, 2026-08-14)
 

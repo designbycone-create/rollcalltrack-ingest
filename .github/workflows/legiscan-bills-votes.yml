@@ -1,8 +1,8 @@
 name: LegiScan Bills and Votes
 
-# Weekly incremental pull. Dispatch is primary for one-state backfills.
-# dry_run defaults true: POST /bills and /state-coverage are 404 today;
-# /votes exists (401 without a key).
+# Weekly incremental pull for all 50 states. Dispatch stays dry-run
+# unless dry_run=false. Schedule POSTs: /votes exists; /bills and
+# /state-coverage 404 are fail-soft so votes still land.
 on:
   workflow_dispatch:
     inputs:
@@ -69,7 +69,7 @@ jobs:
           if [ -n "$MAX" ]; then
             CMD+=(--max-records "$MAX")
           fi
-          if [ "${DRY}" != "false" ]; then
+          if [ "${{ github.event_name }}" != "schedule" ] && [ "${DRY}" != "false" ]; then
             CMD+=(--dry-run)
           fi
           echo "Running: ${CMD[*]}"

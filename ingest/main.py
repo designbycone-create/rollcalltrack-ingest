@@ -26,6 +26,7 @@ from . import (
     legiscan,
     legiscan_bills,
     ca_spending,
+    state_spending,
 )
 from .ingest_client import get_client
 
@@ -54,6 +55,7 @@ def main():
             "legiscan",
             "legiscan_bills",
             "ca_spending",
+            "state_spending",
             "all",
         ],
         default="all",
@@ -333,6 +335,33 @@ def main():
             if args.dry_run and max_r is None:
                 max_r = 5
             results["ca_spending"] = ca_spending.run(
+                fiscal_year=fy,
+                days_back=args.days_back,
+                max_records=max_r,
+                dry_run=args.dry_run,
+                client=client,
+            )
+
+        if args.source == "state_spending":
+            logger.info("=== Running 50-state spending ingest ===")
+            fy = args.fiscal_year
+            if fy is None:
+                logger.error("--fiscal-year is required for --source state_spending")
+                sys.exit(1)
+            if args.all_states:
+                states = list(state_spending.STATE_CODES)
+            elif args.state:
+                states = [args.state.upper()]
+            else:
+                logger.error("--state XX or --all-states is required for --source state_spending")
+                sys.exit(1)
+            max_r = args.max_records
+            if max_r is None and args.max_filings is not None:
+                max_r = args.max_filings
+            if args.dry_run and max_r is None:
+                max_r = 5
+            results["state_spending"] = state_spending.run(
+                states=states,
                 fiscal_year=fy,
                 days_back=args.days_back,
                 max_records=max_r,

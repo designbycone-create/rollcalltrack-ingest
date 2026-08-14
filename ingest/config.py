@@ -136,7 +136,7 @@ def require_config(dry_run: bool = False, source: str = "all"):
     )
     if needs_congress:
         missing.append("CONGRESS_GOV_API_KEY")
-    if source == "legiscan" and not (
+    if source in ("legiscan", "legiscan_bills") and not (
         LEGISCAN_API_KEY or os.environ.get("LEGISCAN_API_KEY")
     ):
         missing.append("LEGISCAN_API_KEY")
