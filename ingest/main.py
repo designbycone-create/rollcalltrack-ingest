@@ -10,7 +10,7 @@ import logging
 import sys
 from contextlib import nullcontext
 
-from . import config, db, house, senate, congress_enrich, usaspending
+from . import config, db, house, senate, congress_enrich, usaspending, gao
 from .ingest_client import get_client
 
 logging.basicConfig(
@@ -24,7 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description="rollcalltrack.com disclosure ingest")
     parser.add_argument(
         "--source",
-        choices=["house", "senate", "congress_enrich", "usaspending", "all"],
+        choices=["house", "senate", "congress_enrich", "usaspending", "gao", "all"],
         default="all",
     )
     parser.add_argument(
@@ -137,6 +137,22 @@ def main():
                 days_back=args.days_back,
                 max_records=max_r,
                 dry_run=args.dry_run,
+                client=client,
+            )
+
+        if args.source == "gao":
+            logger.info("=== Running GAO improper-payment ingest ===")
+            fy = args.fiscal_year
+            if fy is None:
+                logger.error("--fiscal-year is required for --source gao")
+                sys.exit(1)
+            max_r = args.max_records
+            if args.dry_run and max_r is None:
+                max_r = 3
+            results["gao"] = gao.run(
+                fiscal_year=fy,
+                dry_run=args.dry_run,
+                max_records=max_r,
                 client=client,
             )
 

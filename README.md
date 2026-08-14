@@ -120,11 +120,14 @@ rollcalltrack-ingest/
     senate.py            # Senate eFD scrape + parsing
     usaspending.py       # USAspending.gov award search
     usaspending_agencies.json  # agency allowlist (edit to expand)
+    gao.py               # GAO / PaymentAccuracy improper payments
+    gao_reports.json     # FY → GAO report id/url/date catalog
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
     ingest.yml           # daily disclosure cron + workflow_dispatch
-    usaspending.yml      # daily USAspending cron + workflow_dispatch
+    usaspending.yml      # USAspending (schedule held)
+    gao-improper-payments.yml  # GAO improper payments (dispatch + annual)
   requirements.txt
   .env.example
 ```
@@ -231,3 +234,115 @@ Requests are paced (~1.5s between pages) with retry/backoff on 429/5xx.
 
 That contract row was checked live against the API in 2026-08. `amount` is
 exactly the API’s `Award Amount` — not a ceiling, not a midpoint.
+
+## GAO improper payments (`gao-improper-payments-sync`)
+
+Annual / on-demand job. **Not a daily sync.**
+
+GAO does not ship a program-level CSV. The FY 2025 report
+([GAO-26-108694](https://www.gao.gov/products/gao-26-108694), 20-page PDF)
+only tables programs ≥ $5B, and those tables do not extract cleanly. GAO’s
+own analysis is of [PaymentAccuracy.gov](https://paymentaccuracy.gov/)
+program pages, which publish official cause-level dollar amounts in HTML.
+This job reads those published figures and attributes them to the GAO
+report listed in `ingest/gao_reports.json`.
+
+`POST /hcgi/api/ingest/spending/improper-payments` is **not deployed**
+(live 404). See `docs/HORIZONS_IMPROPER_PAYMENTS.md`. Use `--dry-run`
+until that route exists.
+
+### What it captures
+
+| Field | Source |
+|-------|--------|
+| `agency` | “Sponsoring agency” on the PaymentAccuracy program page |
+| `program_name` | Program H1 / breadcrumb |
+| `fiscal_year` | `--fiscal-year` |
+| `estimated_amount_low` / `_high` | Published cause dollars (same value when the source gives one figure) |
+| `cause_category` | Mapped from published labels (below) |
+| `source_report_title` / `source_url` / `report_date` | `ingest/gao_reports.json` for that FY |
+
+Cause mapping (label fragment → enum):
+
+| PaymentAccuracy label | `cause_category` |
+|-----------------------|------------------|
+| Amount of overpayments within/outside agency control | `overpayment` |
+| Amount of underpayments | `underpayment` |
+| Technically improper (right recipient, wrong procedure) | `documentation_error` |
+| Unknown / insufficient documentation | `other` |
+| Explicit “fraud” dollar line only | `fraud` |
+
+We **do not** set `amount = outlays × improper-payment rate`. We **do not**
+label overpayments as fraud. Zero-dollar cause lines are skipped. Within +
+outside overpayment lines are summed — those are two published parts of the
+same official overpayment total, not a midpoint.
+
+Dollars on the site are printed as `$35,029.54 M` (millions). Stored values
+are full dollars (`35029540000.0`).
+
+### CLI
+
+```bash
+python -m ingest.gao --fiscal-year 2025 --dry-run --max-records 3
+python -m ingest.main --source gao --fiscal-year 2025 --dry-run --max-records 3
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--fiscal-year` | yes | Must exist in `ingest/gao_reports.json` |
+| `--dry-run` | no | Parse + log; no POST. Prefer this until Horizons exists. |
+| `--max-records` | no | Cap program pages. `main.py --dry-run` defaults to 3. |
+
+Workflow: `.github/workflows/gao-improper-payments.yml` — **dispatch is
+primary** (`dry_run` defaults to true). Annual cron May 15 12:00 UTC is a
+backup only.
+
+Add a new year by appending to `ingest/gao_reports.json` (report id, title,
+product URL, ISO `report_date`). Do not invent a GAO URL.
+
+### Sample payload
+
+```json
+{
+  "improper_payments": [
+    {
+      "agency": "Department of Health and Human Services",
+      "program_name": "Centers for Medicare & Medicaid Services (CMS) - Medicaid",
+      "fiscal_year": 2025,
+      "estimated_amount_low": 35029540000.0,
+      "estimated_amount_high": 35029540000.0,
+      "cause_category": "overpayment",
+      "source_report_title": "Payment Integrity: Agencies' Estimated Improper Payments Increased to $186 Billion in Fiscal Year 2025",
+      "source_url": "https://www.gao.gov/products/gao-26-108694",
+      "report_date": "2026-04-27"
+    }
+  ]
+}
+```
+
+`$35,029.54 M` overpayments on the Medicaid FY 2025 PaymentAccuracy page
+matches GAO’s published ~$37.4B Medicaid headline once underpayment and
+technically-improper lines are included as separate records.
+
+### If GAO / PaymentAccuracy change format
+
+This is the most parsing-fragile job. Expect to touch:
+
+1. **`ingest/gao_reports.json`** — every new FY. If you skip this, the job
+   refuses to run rather than guessing a report URL.
+2. **`CAUSE_LABELS` in `ingest/gao.py`** — if PaymentAccuracy renames
+   “Amount of overpayments outside the agency's control” etc.
+3. **`[data-year="{fy}"]` wrappers** — if they drop `data-year` or split
+   years another way, `parse_program_page` must change.
+4. **`$35,029.54 M` money format** — `parse_money_to_dollars`. A switch to
+   full dollars or `$35.0 billion` is handled; a new unit is not.
+5. **Program index** — `/agencies-and-programs` links to `/program/...`.
+   If that index dies, fall back to the sitemap `/program/` list.
+6. **Excel download** — `downloadDataset()` on PaymentAccuracy looks for
+   `/assets/files/{data-file-name}`, but those filenames are not in the
+   sitemap and the site 200s HTML for missing paths. If they publish a
+   stable xlsx, prefer that over HTML and delete most of the page parser.
+7. **Do not fall back to the GAO PDF** without a new, deliberate parser.
+   Table extraction on GAO-26-108694 is broken (split headers, wrapped
+   agency/program names, incomplete program list). That is not worth
+   over-engineering for an annual file.
