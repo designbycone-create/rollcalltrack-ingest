@@ -130,7 +130,7 @@ def require_config(dry_run: bool = False, source: str = "all"):
                 missing.append("POCKETBASE_ADMIN_PASSWORD (or set INGEST_API_KEY)")
     # congress_enrich is skipped under Horizons API mode (roster owned by Horizons).
     needs_congress = not CONGRESS_GOV_API_KEY and (
-        source == "congress_enrich"
+        source in ("congress_enrich", "nominations")
         or (source == "all" and not dry_run and not use_horizons_api())
     )
     if needs_congress:

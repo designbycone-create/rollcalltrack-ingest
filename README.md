@@ -127,6 +127,7 @@ rollcalltrack-ingest/
     prac_source_allowlist.json  # trusted source_url hosts
     fjc.py               # FJC Article III biographical directory
     jefs.py              # AO / JEFS judicial financial disclosures
+    nominations.py       # Congress.gov PN → FJC judge + Senate vote
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
@@ -137,6 +138,7 @@ rollcalltrack-ingest/
     prac-fraud.yml       # PRAC fraud cases (schedule held, dry-run default)
     fjc-judges.yml       # FJC judges (dispatch primary, quarterly cron)
     jefs-disclosures.yml # AO judicial disclosures (dispatch + weekly cron)
+    judicial-nominations.yml  # PN → judge + vote (dispatch + weekly cron)
   requirements.txt
   .env.example
 ```
@@ -826,3 +828,112 @@ the Horizons route **and** `JEFS_*` secrets exist.
 
 `$15,001 - $50,000` is stored as that bracket. The midpoint `$32,500.50`
 is never written.
+
+## Judicial nominations (`judicial-nominations-sync`)
+
+Weekly **linker**, not a new scrape. Congress.gov already publishes
+presidential nominations (PN numbers). Horizons already stores Senate
+roll calls at `GET /hcgi/api/congress/votes`. This job connects a
+judicial PN to:
+
+1. `judge_id` from `fjc-judges-sync` (name + court, same conservative
+   matcher as JEFS)
+2. `senate_vote_id` when the confirmation was a recorded roll call
+
+Auth is the existing `CONGRESS_GOV_API_KEY` (same as `congress_enrich`).
+
+`POST /hcgi/api/ingest/judicial/nominations` is **not deployed** (live
+404). See `docs/HORIZONS_JUDICIAL_NOMINATIONS.md`.
+
+This is **not** folded into `.github/workflows/ingest.yml`. That
+workflow is House/Senate disclosures and does not read nominations.
+
+### How a confirmation vote is linked
+
+Horizons vote ids look like `s-119-2026-209` (chamber, congress,
+session year, roll). Live check: PN999-5 Antonio M. Pozos, confirmed
+2026-07-23, is `s-119-2026-209` (`On the Nomination PN999-5: …`,
+result `Nomination Confirmed`). The cloture vote on the same nominee
+is `s-119-2026-205` and is **not** used.
+
+`senate_vote_id` is set only when:
+
+- Congress.gov action text has `Record Vote Number: N`, from which we
+  build `s-{congress}-{vote_year}-{N}`, or
+- a Horizons vote title is `On the Nomination {PN}` and is not cloture
+
+Otherwise it stays **null**. `senate_vote_note` says why, so review can
+tell voice vote from a missing roll call:
+
+| `senate_vote_note` | `senate_vote_id` | Meaning |
+|--------------------|------------------|---------|
+| `linked` | set | Matched a Horizons confirmation vote or constructed id that matches the system scheme |
+| `voice_vote` | null | Action text is “Confirmed … by Voice Vote” |
+| `unanimous_consent` | null | Action text is unanimous consent |
+| `roll_call_constructed` | set | Official Record Vote Number; id built as `s-{congress}-{year}-{roll}` (may be outside Horizons’ 250-vote window) |
+| `roll_call_unmatched` | null | Yea-Nay language but no Record Vote Number |
+| `no_recorded_vote` | null | Terminal action, no vote language |
+
+Pending nominations (referred / reported, no confirm/reject/withdraw/return)
+are **skipped**, not reviewed.
+
+US Attorneys, cabinet, ambassadors are filtered out. Judicial means
+district / circuit / SCOTUS / CIT / Claims Court language in the
+description. “Judge Advocate” is excluded.
+
+### Field mapping
+
+| Field | Source |
+|-------|--------|
+| `nomination_id` | Congress.gov `citation` (`PN999-5`) |
+| `judge_id` | FJC `nid` after unique name+court match |
+| `nominating_president` | FJC `appointing_president` on the matched judge (Congress.gov list/detail has no president name). Null if unmatched. |
+| `vote_date` | Terminal action `actionDate` |
+| `vote_result` | `Confirmed by the Senate` → `confirmed`; `Rejected by the Senate` → `rejected`; withdrawn / returned to President → those enums |
+| `senate_vote_id` | Horizons vote id or constructed `s-{congress}-{year}-{roll}` |
+| `source_url` | `https://www.congress.gov/nomination/{nth}-congress/{number}` |
+
+Ambiguous name matches (two John Smiths, court does not separate them)
+go to **manual_review**.
+
+### CLI
+
+```bash
+python -m ingest.nominations --congress 119 --days-back 14 --dry-run
+python -m ingest.nominations --congress 118 --dry-run --max-records 20
+python -m ingest.main --source nominations --congress 119 --dry-run
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--congress` | no | Defaults to the current Congress (119 as of 2026-08). |
+| `--days-back` | no | Default 14. Passed as `fromDateTime` on the list endpoint. |
+| `--dry-run` | no | Parse + log; no POST. |
+| `--max-records` | no | Cap. `main.py --dry-run` defaults to 10. |
+
+Needs `CONGRESS_GOV_API_KEY` even for dry-run (live API). Workflow:
+`.github/workflows/judicial-nominations.yml` — dispatch primary
+(`dry_run` default true). Weekly Monday 13:00 UTC backup, also
+dry-run until you dispatch `dry_run=false` after Horizons exists.
+
+### Sample payload
+
+```json
+{
+  "nominations": [
+    {
+      "nomination_id": "PN999-5",
+      "judge_id": "9990001",
+      "nominating_president": "Donald J. Trump",
+      "vote_date": "2026-07-23",
+      "vote_result": "confirmed",
+      "senate_vote_id": "s-119-2026-209",
+      "senate_vote_note": "linked",
+      "source_url": "https://www.congress.gov/nomination/119th-congress/999"
+    }
+  ]
+}
+```
+
+A voice-vote confirmation of the same shape would have
+`senate_vote_id: null` and `senate_vote_note: "voice_vote"`.

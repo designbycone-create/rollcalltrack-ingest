@@ -225,6 +225,45 @@ class HorizonsIngestClient:
         )
         return data
 
+    def submit_judicial_nominations(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/judicial/nominations."""
+        if not records:
+            return {"ok": True, "written": 0}
+        results = ("confirmed", "rejected", "withdrawn", "returned")
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every nomination")
+            if not rec.get("nomination_id"):
+                raise ValueError("nomination_id is required")
+            if rec.get("vote_result") not in results:
+                raise ValueError("invalid vote_result")
+        body = {"nominations": records}
+        logger.info("Submitting %d judicial nominations", len(records))
+        resp = self._post_ingest(
+            body, path="/hcgi/api/ingest/judicial/nominations"
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/judicial/nominations is not "
+                "deployed (404). See docs/HORIZONS_JUDICIAL_NOMINATIONS.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Judicial-nomination ingest HTTP %s: %s",
+                resp.status_code,
+                str(data)[:500],
+            )
+            resp.raise_for_status()
+        logger.info(
+            "Judicial-nomination ingest OK written=%s",
+            data.get("written") or data.get("count"),
+        )
+        return data
+
     def submit_judicial_disclosures(self, records: list[dict]) -> dict:
         """POST a batch to /hcgi/api/ingest/judicial/disclosures."""
         if not records:
@@ -630,6 +669,7 @@ class HorizonsIngestClient:
                 "prac",
                 "fjc",
                 "jefs",
+                "nominations",
             )
             else (
                 "house_clerk"
@@ -647,7 +687,9 @@ class HorizonsIngestClient:
                 else "fjc"
                 if "fjc" in source or "judge" in source
                 else "jefs"
-                if "jefs" in source or "judicial" in source
+                if "jefs" in source
+                else "nominations"
+                if "nominat" in source
                 else "congress_gov"
             ),
             "run_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

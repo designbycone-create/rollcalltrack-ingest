@@ -22,6 +22,7 @@ from . import (
     prac,
     fjc,
     jefs,
+    nominations,
 )
 from .ingest_client import get_client
 
@@ -46,6 +47,7 @@ def main():
             "prac",
             "fjc",
             "jefs",
+            "nominations",
             "all",
         ],
         default="all",
@@ -70,6 +72,12 @@ def main():
     parser.add_argument("--max-filings", type=int, default=None)
     parser.add_argument("--max-records", type=int, default=None)
     parser.add_argument("--fiscal-year", type=int, default=None)
+    parser.add_argument(
+        "--congress",
+        type=int,
+        default=None,
+        help="Congress number (nominations)",
+    )
     parser.add_argument(
         "--agency",
         default=None,
@@ -234,6 +242,21 @@ def main():
                 max_r = 3
             results["jefs"] = jefs.run(
                 judge_id=getattr(args, "judge_id", None),
+                days_back=args.days_back if args.days_back is not None else 14,
+                max_records=max_r,
+                dry_run=args.dry_run,
+                client=client,
+            )
+
+        if args.source == "nominations":
+            logger.info("=== Running judicial nomination linker ===")
+            max_r = args.max_records
+            if args.dry_run and max_r is None:
+                max_r = 10
+            from .nominations import current_congress
+
+            results["nominations"] = nominations.run(
+                congress=args.congress or current_congress(),
                 days_back=args.days_back if args.days_back is not None else 14,
                 max_records=max_r,
                 dry_run=args.dry_run,
