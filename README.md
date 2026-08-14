@@ -122,12 +122,14 @@ rollcalltrack-ingest/
     usaspending_agencies.json  # agency allowlist (edit to expand)
     gao.py               # GAO / PaymentAccuracy improper payments
     gao_reports.json     # FY → GAO report id/url/date catalog
+    oversight.py         # Oversight.gov IG reports
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
     ingest.yml           # daily disclosure cron + workflow_dispatch
     usaspending.yml      # USAspending (schedule held)
     gao-improper-payments.yml  # GAO improper payments (dispatch + annual)
+    oversight-ig.yml     # Oversight.gov IG reports (weekly + dispatch)
   requirements.txt
   .env.example
 ```
@@ -346,3 +348,86 @@ This is the most parsing-fragile job. Expect to touch:
    Table extraction on GAO-26-108694 is broken (split headers, wrapped
    agency/program names, incomplete program list). That is not worth
    over-engineering for an annual file.
+
+## Oversight.gov IG reports (`oversight-ig-sync`)
+
+Weekly job. Pulls Inspector General report metadata from
+[Oversight.gov](https://www.oversight.gov/reports/federal).
+
+**No public reports API.** Checked 2026-08: `/jsonapi`, `/api/reports`,
+`?_format=json` are 404/406. Site RSS is homepage news, not reports. The
+job uses the public Drupal listing + report pages.
+
+`robots.txt`: `Crawl-delay: 5`. `/search/` is disallowed — we never hit it.
+Only `/reports/federal` (date/agency filters) and individual `/reports/...`
+pages.
+
+`POST /hcgi/api/ingest/spending/ig-reports` is **not deployed** (live 404).
+See `docs/HORIZONS_IG_REPORTS.md`. Dispatch `dry_run` defaults to true.
+
+### What it captures
+
+| Field | Source |
+|-------|--------|
+| `agency` | Agency Reviewed / Investigated |
+| `report_title` | Report title |
+| `report_type` | Mapped from Type (below) |
+| `financial_impact` | Explicit “Questioned Costs” or “Funds for Better Use” only |
+| `summary` | First 2–3 sentences of the report body (or recommendation text) |
+| `recommendations_count` | Number of Recommendations field |
+| `source_url` | Canonical Oversight.gov report URL |
+| `publish_date` | Date Issued (`YYYY-MM-DD`) |
+
+Type mapping:
+
+| Oversight.gov Type | enum |
+|--------------------|------|
+| Audit | `audit` |
+| Investigation | `investigation` |
+| Inspection / Evaluation | `evaluation` |
+| Semiannual Report | `semiannual_report` |
+| Other, Review, Peer Review, CIGIE Annual, Disaster Recovery, Top Management Challenges | **manual_review** — not guessed |
+
+`financial_impact`: populated only when the page states a dollar figure.
+If questioned costs and funds-for-better-use are both present and **differ**,
+the field is left null (we do not add them). `$0` is an explicit figure and
+is stored as `0.0`. We never parse “millions” out of prose.
+
+### CLI
+
+```bash
+python -m ingest.oversight --days-back 14 --dry-run --max-records 3
+python -m ingest.oversight --days-back 30 --agency EPA --max-records 10 --dry-run
+python -m ingest.main --source oversight --days-back 14 --dry-run --max-records 3
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--days-back` | no | Default 14. Filters Date Issued min/max. |
+| `--agency` | no | Substring or exact agency name from the listing filter. |
+| `--max-records` | no | Cap reports. `main.py --dry-run` defaults to 3. |
+| `--dry-run` | no | Parse + log; no POST. |
+
+Workflow: `.github/workflows/oversight-ig.yml` is **manual only** until
+Horizons deploys `/hcgi/api/ingest/spending/ig-reports`. Weekly cron is
+commented in the file (`0 12 * * 1`). Dispatch `dry_run` defaults to true.
+Requests are paced at 5 seconds.
+
+### Sample payload
+
+```json
+{
+  "ig_reports": [
+    {
+      "agency": "General Services Administration",
+      "report_title": "The Processes FAS Uses to Ensure It Awards and Collects Accurate Product Data Are Ineffective",
+      "report_type": "audit",
+      "financial_impact": 0.0,
+      "summary": "FAS catalog data contains inconsistent manufacturer part numbers. Identical products cannot be compared reliably across systems. The OIG issued recommendations to the FAS Commissioner.",
+      "recommendations_count": 6,
+      "source_url": "https://www.oversight.gov/reports/audit/processes-fas-uses-ensure-it-awards-and-collects-accurate-product-data-are",
+      "publish_date": "2026-08-13"
+    }
+  ]
+}
+```

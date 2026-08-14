@@ -191,6 +191,40 @@ class HorizonsIngestClient:
         )
         return data
 
+    def submit_ig_reports(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/spending/ig-reports."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every IG report")
+            if rec.get("report_type") not in (
+                "audit",
+                "investigation",
+                "evaluation",
+                "semiannual_report",
+            ):
+                raise ValueError("invalid report_type")
+        body = {"ig_reports": records}
+        logger.info("Submitting %d IG reports", len(records))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/spending/ig-reports")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/spending/ig-reports is not "
+                "deployed (404). See docs/HORIZONS_IG_REPORTS.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error("IG ingest HTTP %s: %s", resp.status_code, str(data)[:500])
+            resp.raise_for_status()
+        logger.info(
+            "IG ingest OK written=%s", data.get("written") or data.get("count")
+        )
+        return data
+
     def lookup_member_by_name(
         self,
         name: str,
@@ -436,7 +470,14 @@ class HorizonsIngestClient:
         payload = {
             "source": source
             if source
-            in ("house_clerk", "senate_efd", "congress_gov", "usaspending", "gao")
+            in (
+                "house_clerk",
+                "senate_efd",
+                "congress_gov",
+                "usaspending",
+                "gao",
+                "oversight",
+            )
             else (
                 "house_clerk"
                 if "house" in source
@@ -446,6 +487,8 @@ class HorizonsIngestClient:
                 if "spend" in source
                 else "gao"
                 if "gao" in source
+                else "oversight"
+                if "oversight" in source or "ig" in source
                 else "congress_gov"
             ),
             "run_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
