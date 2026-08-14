@@ -10,7 +10,7 @@ import logging
 import sys
 from contextlib import nullcontext
 
-from . import config, db, house, senate, congress_enrich
+from . import config, db, house, senate, congress_enrich, usaspending
 from .ingest_client import get_client
 
 logging.basicConfig(
@@ -24,7 +24,7 @@ def main():
     parser = argparse.ArgumentParser(description="rollcalltrack.com disclosure ingest")
     parser.add_argument(
         "--source",
-        choices=["house", "senate", "congress_enrich", "all"],
+        choices=["house", "senate", "congress_enrich", "usaspending", "all"],
         default="all",
     )
     parser.add_argument(
@@ -35,6 +35,13 @@ def main():
     parser.add_argument("--year", type=int, default=None)
     parser.add_argument("--days-back", type=int, default=None)
     parser.add_argument("--max-filings", type=int, default=None)
+    parser.add_argument("--max-records", type=int, default=None)
+    parser.add_argument("--fiscal-year", type=int, default=None)
+    parser.add_argument(
+        "--agency",
+        default=None,
+        help="USAspending agency abbreviation or name (usaspending only)",
+    )
     args = parser.parse_args()
 
     try:
@@ -112,6 +119,26 @@ def main():
                 )
             else:
                 logger.warning("congress_enrich skipped — no PocketBase connection")
+
+        if args.source == "usaspending":
+            logger.info("=== Running USAspending ingest ===")
+            fy = args.fiscal_year
+            if fy is None:
+                logger.error("--fiscal-year is required for --source usaspending")
+                sys.exit(1)
+            max_r = args.max_records
+            if max_r is None and args.max_filings is not None:
+                max_r = args.max_filings
+            if args.dry_run and max_r is None:
+                max_r = 5
+            results["usaspending"] = usaspending.run(
+                fiscal_year=fy,
+                agency=args.agency,
+                days_back=args.days_back,
+                max_records=max_r,
+                dry_run=args.dry_run,
+                client=client,
+            )
 
     logger.info("=== Run summary ===")
     for source, r in results.items():

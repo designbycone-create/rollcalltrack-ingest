@@ -1,0 +1,30 @@
+{
+  "default_allowlist": ["HHS", "DOL", "SBA", "EPA", "DOT"],
+  "agencies": {
+    "HHS": {
+      "abbreviation": "HHS",
+      "name": "Department of Health and Human Services",
+      "toptier_code": "075"
+    },
+    "DOL": {
+      "abbreviation": "DOL",
+      "name": "Department of Labor",
+      "toptier_code": "1601"
+    },
+    "SBA": {
+      "abbreviation": "SBA",
+      "name": "Small Business Administration",
+      "toptier_code": "073"
+    },
+    "EPA": {
+      "abbreviation": "EPA",
+      "name": "Environmental Protection Agency",
+      "toptier_code": "068"
+    },
+    "DOT": {
+      "abbreviation": "DOT",
+      "name": "Department of Transportation",
+      "toptier_code": "069"
+    }
+  }
+}

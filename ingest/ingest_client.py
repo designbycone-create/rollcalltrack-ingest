@@ -107,9 +107,9 @@ class HorizonsIngestClient:
             url = f"{url}?{urlencode(params)}"
         return self.session.get(url, timeout=self.timeout)
 
-    def _post_ingest(self, body: dict) -> requests.Response:
+    def _post_ingest(self, body: dict, path: str = "/hcgi/api/ingest/disclosures") -> requests.Response:
         return self.session.post(
-            f"{self.base}/hcgi/api/ingest/disclosures",
+            f"{self.base}{path}",
             headers={
                 "X-Ingest-Key": self.ingest_key,
                 "Content-Type": "application/json",
@@ -117,6 +117,37 @@ class HorizonsIngestClient:
             json=body,
             timeout=self.timeout,
         )
+
+    def submit_spending_awards(self, awards: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/spending/awards."""
+        if not awards:
+            return {"ok": True, "written": 0}
+        for a in awards:
+            if not a.get("source_url"):
+                raise ValueError("source_url is required on every award")
+            if a.get("amount_type") not in ("obligated", "potential"):
+                raise ValueError("amount_type must be obligated or potential")
+        body = {"awards": awards}
+        logger.info("Submitting %d spending awards", len(awards))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/spending/awards")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/spending/awards is not deployed (404). "
+                "See docs/HORIZONS_SPENDING_AWARDS.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Spending ingest HTTP %s: %s",
+                resp.status_code,
+                str(data)[:500],
+            )
+            resp.raise_for_status()
+        logger.info("Spending ingest OK written=%s", data.get("written") or data.get("count"))
+        return data
 
     def lookup_member_by_name(
         self,
@@ -362,12 +393,15 @@ class HorizonsIngestClient:
 
         payload = {
             "source": source
-            if source in ("house_clerk", "senate_efd", "congress_gov")
+            if source
+            in ("house_clerk", "senate_efd", "congress_gov", "usaspending")
             else (
                 "house_clerk"
                 if "house" in source
                 else "senate_efd"
                 if "senate" in source
+                else "usaspending"
+                if "spend" in source
                 else "congress_gov"
             ),
             "run_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

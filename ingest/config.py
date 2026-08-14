@@ -40,6 +40,7 @@ else:
 
 INGEST_API_KEY = (
     os.environ.get("INGEST_API_KEY")
+    or os.environ.get("INGEST_KEY")
     or os.environ.get("X_INGEST_KEY")
     or os.environ.get("X-Ingest-Key")
     or ""

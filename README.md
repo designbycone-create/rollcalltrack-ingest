@@ -118,10 +118,116 @@ rollcalltrack-ingest/
     db.py                # legacy PocketBase helpers
     house.py             # House bulk feed download + PDF parsing
     senate.py            # Senate eFD scrape + parsing
+    usaspending.py       # USAspending.gov award search
+    usaspending_agencies.json  # agency allowlist (edit to expand)
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
-    ingest.yml           # daily cron + workflow_dispatch
+    ingest.yml           # daily disclosure cron + workflow_dispatch
+    usaspending.yml      # daily USAspending cron + workflow_dispatch
   requirements.txt
   .env.example
 ```
+
+## USAspending awards (`usaspending-sync`)
+
+Pulls federal prime awards from the public USAspending API
+(`POST https://api.usaspending.gov/api/v2/search/spending_by_award/`)
+and POSTs them in batches to `/hcgi/api/ingest/spending/awards`.
+
+**This Horizons route is not deployed yet** (live `POST` returns 404). The
+scraper and workflow are ready; do not enable unattended writes until
+Horizons implements the endpoint. Paste `docs/HORIZONS_SPENDING_AWARDS.md`
+into Horizons first.
+
+### What it captures
+
+| Field | Source |
+|-------|--------|
+| `award_id` | `generated_internal_id` (globally unique; used in USAspending URLs) |
+| `recipient_name` | `Recipient Name` |
+| `recipient_state` | `Recipient Location.state_code` (2-letter USPS only) |
+| `awarding_agency` | `Awarding Agency` |
+| `award_type` | mapped from type codes → `contract` / `grant` / `loan` / `direct_payment` / `insurance` |
+| `amount` | `Award Amount` (official obligated figure) |
+| `amount_type` | always `obligated` |
+| `period_of_performance_start` / `_end` | `Start Date` / `End Date` (ISO `YYYY-MM-DD`) |
+| `description` | `Description` |
+| `source_url` | `https://www.usaspending.gov/award/{generated_internal_id}` |
+| `fiscal_year` | the `--fiscal-year` you passed |
+
+**Loans are not written as awards.** USAspending loans expose `Loan Value`
+(face) and `Subsidy Cost`, not obligated `Award Amount`. Relabeling either
+as `amount`/`obligated` would invent a figure. Those rows go to the
+manual-review queue with the raw loan fields in the notes. Say if you want
+a later pass that stores them as `amount_type: potential` (face) or a
+separate subsidy field.
+
+IDVs and “other” assistance (`11`) are out of the enum and are not requested.
+
+### Agency allowlist
+
+Default first-run set lives in `ingest/usaspending_agencies.json`:
+
+`HHS`, `DOL`, `SBA`, `EPA`, `DOT`
+
+Add a new agency by appending to `agencies` (abbrev + official toptier
+`name` as USAspending lists it) and, if you want it in the daily job,
+to `default_allowlist`. `--agency EPA` (or the full name) overrides the
+list for a single run. Do not hardcode names in the request builder.
+
+### CLI
+
+```bash
+# parse only, 5 records, default allowlist
+python -m ingest.usaspending --fiscal-year 2026 --dry-run --max-records 5
+
+# one agency, incremental window
+python -m ingest.usaspending --fiscal-year 2026 --agency EPA --days-back 3 --max-records 20
+
+# same via the shared orchestrator
+python -m ingest.main --source usaspending --fiscal-year 2026 --dry-run --max-records 5
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--fiscal-year` | yes | Federal FY (FY2026 = 2025-10-01 … 2026-09-30) |
+| `--agency` | no | Abbrev or full toptier name; default = allowlist |
+| `--days-back` | no | `last_modified_date` window, clipped to the FY. Omit for the full FY. |
+| `--max-records` | no | Hard cap across all agencies/types. Dry-run via `main.py` defaults to 5. |
+| `--dry-run` | no | Search + map + log; no Horizons POST |
+
+Actions workflow (`.github/workflows/usaspending.yml`) is **manual only**
+until Horizons deploys `/hcgi/api/ingest/spending/awards`. Cron is commented
+in the file; re-enable `schedule: cron: "0 9 * * *"` after that route exists.
+`workflow_dispatch` still accepts FY / agency / days-back / max-records.
+Same secrets as disclosures: `HORIZONS_BASE_URL` + `INGEST_API_KEY`
+(`INGEST_KEY` also accepted).
+
+Requests are paced (~1.5s between pages) with retry/backoff on 429/5xx.
+
+### Sample payload (one award)
+
+```json
+{
+  "awards": [
+    {
+      "award_id": "CONT_AWD_EPW17009_6800_-NONE-_-NONE-",
+      "recipient_name": "ABT GLOBAL LLC",
+      "recipient_state": "MA",
+      "awarding_agency": "Environmental Protection Agency",
+      "award_type": "contract",
+      "amount": 7655172.98,
+      "amount_type": "obligated",
+      "period_of_performance_start": "2017-02-11",
+      "period_of_performance_end": "2023-03-10",
+      "description": "NCEE mission support",
+      "source_url": "https://www.usaspending.gov/award/CONT_AWD_EPW17009_6800_-NONE-_-NONE-",
+      "fiscal_year": 2026
+    }
+  ]
+}
+```
+
+That contract row was checked live against the API in 2026-08. `amount` is
+exactly the API’s `Award Amount` — not a ceiling, not a midpoint.
