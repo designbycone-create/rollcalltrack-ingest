@@ -123,13 +123,16 @@ rollcalltrack-ingest/
     gao.py               # GAO / PaymentAccuracy improper payments
     gao_reports.json     # FY → GAO report id/url/date catalog
     oversight.py         # Oversight.gov IG reports
+    prac.py              # PRAC pandemic fraud enforcement
+    prac_source_allowlist.json  # trusted source_url hosts
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
     ingest.yml           # daily disclosure cron + workflow_dispatch
     usaspending.yml      # USAspending (schedule held)
     gao-improper-payments.yml  # GAO improper payments (dispatch + annual)
-    oversight-ig.yml     # Oversight.gov IG reports (weekly + dispatch)
+    oversight-ig.yml     # Oversight.gov IG reports (schedule held)
+    prac-fraud.yml       # PRAC fraud cases (schedule held, dry-run default)
   requirements.txt
   .env.example
 ```
@@ -431,3 +434,92 @@ Requests are paced at 5 seconds.
   ]
 }
 ```
+
+## PRAC fraud cases (`prac-fraud-sync`)
+
+Highest-sensitivity job in this repo. It names defendants. **Dry-run is
+the default.** We post only when you pass `--post`, and only records whose
+`source_url` is on a trusted-domain allowlist.
+
+**No PRAC enforcement CSV/API** (checked 2026-08). “Download the Data” is
+PPP/UI spending files, not case lists. Official source is PRAC’s
+[Investigative Results](https://www.pandemicoversight.gov/oversight/investigative-results)
+listing (`/oversight/reports?f[0]=report_type_taxonomy:85`), which links to
+DOJ press releases. `/search/` is robots-disallowed and is not used.
+
+`POST /hcgi/api/ingest/spending/fraud-cases` is **not deployed** (live 404).
+See `docs/HORIZONS_FRAUD_CASES.md`.
+
+### What it captures
+
+| Field | Source |
+|-------|--------|
+| `case_title` | Listing title |
+| `agency_program` | Mapped only if title/body names a known pandemic program |
+| `defendant_type` | `individual` / `company` / `multiple` from explicit wording |
+| `amount_alleged` | Unhedged explicit `$X` / `$X million` only |
+| `status` | `charged` / `convicted` / `settled` / `ongoing` from wording |
+| `source_url` | The listing’s outbound link (must be allowlisted) |
+| `filing_date` | Listing `<time datetime>` |
+
+**Allowlist** (`ingest/prac_source_allowlist.json`):
+`pandemicoversight.gov`, `pandemic.oversight.gov`, `oversight.gov`,
+`justice.gov`, `courtlistener.com`, `uscourts.gov` (and `www`/subdomains).
+
+Anything else — news aggregators included — goes to **manual_review**, not
+to the public table.
+
+Also reviewed (not auto-posted) when we cannot map program, status, or
+defendant type. Example: a dogfighting sentencing that appeared on the
+PRAC listing has no pandemic program → review.
+
+Hedged dollars (`over $40,000`, `more than $1 million`) are stored as
+null, not as a guessed floor.
+
+### Monitor the review rate
+
+If most records land in `manual_review`, **tune the allowlist or the
+program/status maps — do not casually loosen the domain list.** A bad
+source on this table is a defamation problem. Check logs for
+`source host … not on allowlist` vs `could not confidently map`. Only add
+a domain if it is a primary PRAC/DOJ/court record, never a recap site.
+
+### CLI
+
+```bash
+python -m ingest.prac --days-back 14 --max-records 10          # dry-run (default)
+python -m ingest.prac --days-back 14 --max-records 10 --post   # write (after Horizons exists)
+python -m ingest.main --source prac --days-back 14             # always dry-run
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--days-back` | no | Default 14. Stops when listing dates are older. |
+| `--max-records` | no | Cap rows. |
+| `--dry-run` | no | **Default on.** |
+| `--post` | no | Only way to POST from this job. |
+
+Workflow: `.github/workflows/prac-fraud.yml` is **manual only** (weekly
+cron held). Dispatch `dry_run` defaults to true.
+
+### Sample payload
+
+```json
+{
+  "fraud_cases": [
+    {
+      "case_title": "Dallas-Based Bus Companies Settle PPP Lawsuit for $3.9 Million",
+      "agency_program": "Paycheck Protection Program (PPP)",
+      "defendant_type": "company",
+      "amount_alleged": 3900000.0,
+      "status": "settled",
+      "source_url": "https://www.justice.gov/usao-ndtx/pr/dallas-based-bus-companies-settle-ppp-lawsuit-39-million",
+      "filing_date": "2026-08-12"
+    }
+  ]
+}
+```
+
+`$3.9 million` is the figure in the PRAC listing and the DOJ title — not
+computed. The same listing’s “over $40,000” PUA case would have
+`amount_alleged: null`.

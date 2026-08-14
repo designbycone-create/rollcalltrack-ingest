@@ -10,7 +10,17 @@ import logging
 import sys
 from contextlib import nullcontext
 
-from . import config, db, house, senate, congress_enrich, usaspending, gao, oversight
+from . import (
+    config,
+    db,
+    house,
+    senate,
+    congress_enrich,
+    usaspending,
+    gao,
+    oversight,
+    prac,
+)
 from .ingest_client import get_client
 
 logging.basicConfig(
@@ -31,6 +41,7 @@ def main():
             "usaspending",
             "gao",
             "oversight",
+            "prac",
             "all",
         ],
         default="all",
@@ -174,6 +185,19 @@ def main():
                 agency=args.agency,
                 max_records=max_r,
                 dry_run=args.dry_run,
+                client=client,
+            )
+
+        if args.source == "prac":
+            logger.info("=== Running PRAC fraud-case ingest ===")
+            max_r = args.max_records
+            if args.dry_run and max_r is None:
+                max_r = 5
+            # Writes only via `python -m ingest.prac --post`.
+            results["prac"] = prac.run(
+                days_back=args.days_back if args.days_back is not None else 14,
+                max_records=max_r,
+                dry_run=True,
                 client=client,
             )
 
