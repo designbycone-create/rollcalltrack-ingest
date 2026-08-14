@@ -128,17 +128,23 @@ rollcalltrack-ingest/
     fjc.py               # FJC Article III biographical directory
     jefs.py              # AO / JEFS judicial financial disclosures
     nominations.py       # Congress.gov PN → FJC judge + Senate vote
+    legiscan.py          # LegiScan 50-state legislator roster
+    legiscan_bills.py    # LegiScan state bills + roll calls + coverage
+    ca_spending.py       # California Open FI$Cal vendor expenditures
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
     ingest.yml           # daily disclosure cron + workflow_dispatch
     usaspending.yml      # USAspending (schedule held)
+    ca-spending.yml      # CA Open FI$Cal (schedule held, monthly)
     gao-improper-payments.yml  # GAO improper payments (dispatch + annual)
     oversight-ig.yml     # Oversight.gov IG reports (schedule held)
     prac-fraud.yml       # PRAC fraud cases (schedule held, dry-run default)
     fjc-judges.yml       # FJC judges (dispatch primary, quarterly cron)
     jefs-disclosures.yml # AO judicial disclosures (dispatch + weekly cron)
     judicial-nominations.yml  # PN → judge + vote (dispatch + weekly cron)
+    legiscan-legislators.yml  # state rosters (dispatch + monthly cron)
+    legiscan-bills-votes.yml  # state bills/votes (dispatch + weekly cron)
   requirements.txt
   .env.example
 ```
@@ -245,6 +251,152 @@ Requests are paced (~1.5s between pages) with retry/backoff on 429/5xx.
 
 That contract row was checked live against the API in 2026-08. `amount` is
 exactly the API’s `Award Amount` — not a ceiling, not a midpoint.
+
+## California spending (`ca-spending-sync`)
+
+Official site is **Open FI$Cal** ([open.fiscal.ca.gov](https://open.fiscal.ca.gov/)),
+run by the Department of FI$Cal under CA GOV §11862. The State Controller’s
+Office [points here](https://www.sco.ca.gov/eo_government_data_and_accountability.html)
+as the state expenditure checkbook. There is no separate comptroller
+“Open Book” for vendor payments.
+
+### Portal structure (verified 2026-08)
+
+| Question | Finding |
+|----------|---------|
+| Structured data? | **Yes — monthly CSVs on Azure Blob.** No HTML-table scrape. |
+| Public API? | **No.** About page: “work toward implementing APIs.” |
+| Auth / rate limits | Public anonymous GET. No published rate limit. Files are 100–140 MB/month; the job streams and waits 1.5s between files. Retry/backoff on 429/5xx. |
+| Update cadence | **Monthly**, transactions **≥ 60 days old**. Past months are restated. Latest pointer upload observed 2026-08-01 covering FY25 P11 (May 2026). |
+| Coverage | 151 departments / 188 business units, ~79% of state expenditures. Not ACFR, not the Governor’s Budget. |
+| Vendor vs spending files | **Vendor CSVs only** (have `VENDOR_NAME`). “Spending” CSVs omit the payee and are not ingested. |
+
+Pointer (file index, not a secret):
+
+`https://adwoutputfilesadlsstore.blob.core.windows.net/transparency/MonthlyVendorTransactionPointer/MonthlyVendorTransactionPointer.csv`
+
+Each row is a **modified-accrual AP/GL expenditure line** (cash basis for a
+few non-FI$Cal depts). The FAQ is explicit: **contracts are not displayed**;
+encumbrances live in the Governor’s Budget; a signed contract is not an
+Open FI$Cal expenditure until a payment liability exists. Amounts can be
+negative (reversals). Vendor name is `CONFIDENTIAL` for employees and
+statutorily masked payees.
+
+California FY **N** = 1 July N … 30 June N+1. `--fiscal-year 2025` means
+**FY25 / 2025-26**, matching the portal’s `Vendor_FY25P##.csv` names.
+P01 = July, P12 = June.
+
+There is **no per-voucher permalink** on the portal (dashboard + bulk CSV).
+`source_url` is a locator on the official download page plus the line’s
+natural keys (`document_id`, `account`, `accounting_date`, `program_code`).
+It is required and unique; it is not a clickable record page.
+
+### FLAG — do not map `award_type` / `amount_type`
+
+The federal `spending_awards` enums do **not** fit this portal:
+
+| Federal field | Why it does not fit |
+|---------------|---------------------|
+| `award_type` ∈ contract / grant / loan / direct_payment / insurance | These are journal lines. Account categories mix rent, travel, payroll benefits, interdepartmental consulting, and “Grants and Subventions.” Guessing `grant` from that last label would invent an award type. The portal itself says it does not publish contracts. |
+| `amount_type` ∈ obligated / potential | Amount is a **posted expenditure** (modified accrual), not an obligation and not a potential ceiling. |
+
+This job **omits** `award_type` and `amount_type`. It does not send
+`obligated`. Horizons must accept those two fields as null/absent when
+`jurisdiction=state`. Until that lands, live POSTs will 400 (or 404 —
+the awards route is still undeployed). See
+`docs/HORIZONS_SPENDING_AWARDS.md`.
+
+### Field mapping
+
+| `spending_awards` | Open FI$Cal column | Notes |
+|-------------------|--------------------|-------|
+| `award_id` | `CA-{document_id}-{account}-{program_code}-{accounting_date}` | Line-level; one voucher can have many accounts |
+| `recipient_name` | `VENDOR_NAME` | `CONFIDENTIAL` → review, not posted |
+| `recipient_state` | — | Not in the file. Always `null` |
+| `awarding_agency` | `department_name` (fallback `agency_name`) | |
+| `award_type` | — | **omitted** (see flag) |
+| `amount` | `monetary_amount` | Posted expenditure. Negatives → review |
+| `amount_type` | — | **omitted** (see flag) |
+| `period_of_performance_start` | `accounting_date` | Transaction date, not a PoP |
+| `period_of_performance_end` | — | Always `null` |
+| `description` | `program_description` + `account_description` | |
+| `source_url` | locator on `monthly_vendor_transaction.html` | Required |
+| `fiscal_year` | `fiscal_year_begin` | CA FY begin year |
+| `jurisdiction` | — | always `state` |
+| `state_code` | — | always `CA` |
+| `program` | `program_description` | Extra; Horizons should store or ignore |
+
+### CLI
+
+```bash
+# parse only, 5 most-recent FY25 lines
+python -m ingest.ca_spending --fiscal-year 2025 --dry-run --max-records 5
+
+# incremental window (accounting_date)
+python -m ingest.ca_spending --fiscal-year 2025 --days-back 90 --max-records 20 --dry-run
+
+# same via the orchestrator
+python -m ingest.main --source ca_spending --fiscal-year 2025 --dry-run --max-records 5
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--fiscal-year` | yes | CA FY **begin** year (2025 = FY25) |
+| `--days-back` | no | `accounting_date` window, clipped to the FY. Omit for every published month in that FY |
+| `--max-records` | no | Hard cap. Dry-run via `main.py` defaults to 5 |
+| `--dry-run` | no | Pointer + stream + map + log; no Horizons POST |
+
+A full FY is ~1.2–1.5 GB across 12 monthly files. Stream; do not download a
+year as one file (the portal does not offer one).
+
+### Schedule
+
+Portal cadence is **monthly**, not weekly. Workflow
+`.github/workflows/ca-spending.yml` is **manual / dry-run default**. Cron
+is commented; suggested `0 14 3 * *` (3rd of month, after the observed
+1st-of-month Azure upload). Re-enable only after Horizons accepts state
+rows without `award_type` / `amount_type`. Same secrets as USAspending.
+
+### Expected `manual_review` volume
+
+A typical vendor month is on the order of **10⁵ lines** (FY25 P11 is 127 MB).
+
+| Bucket | Disposition | Expected share |
+|--------|-------------|----------------|
+| Named vendor, amount > 0, parseable date/id | Mapped and POSTed **without** `award_type`/`amount_type` | Majority of vendor-file lines |
+| `VENDOR_NAME=CONFIDENTIAL` | Counted as review; **not** queued one-by-one | Common (all employee pay + listed mask rules) |
+| `monetary_amount` ≤ 0 | Counted as review; not queued one-by-one | Common (reversals / adjustments) |
+| Missing `document_id` / date / amount | Counted as review | Rare |
+
+Per-row `flag_manual_review` is **capped at 25** so a monthly run cannot
+flood the queue. The ingestion log records the uncapped review count.
+Until Horizons stores state expenditures as expenditures (not awards),
+treat the mapped majority as “structurally complete, semantically
+unfit for the federal award enums.”
+
+### Sample payload (one vendor line)
+
+```json
+{
+  "awards": [
+    {
+      "award_id": "CA-1115.00021375.0.00001.0002-5324450-1460010000-2026-05-29",
+      "recipient_name": "CARDINAL INV PROP GODDARD LP",
+      "recipient_state": null,
+      "awarding_agency": "Department of Cannabis Control",
+      "amount": 17152.0,
+      "period_of_performance_start": "2026-05-29",
+      "period_of_performance_end": null,
+      "description": "Cannabis Control - Support — Rent -Bldgs&Grounds(Non State)",
+      "source_url": "https://open.fiscal.ca.gov/monthly_vendor_transaction.html?document_id=1115.00021375.0.00001.0002&account=5324450&accounting_date=2026-05-29&program_code=1460010000",
+      "fiscal_year": 2025,
+      "jurisdiction": "state",
+      "state_code": "CA",
+      "program": "Cannabis Control - Support"
+    }
+  ]
+}
+```
 
 ## GAO improper payments (`gao-improper-payments-sync`)
 
@@ -937,3 +1089,216 @@ dry-run until you dispatch `dry_run=false` after Horizons exists.
 
 A voice-vote confirmation of the same shape would have
 `senate_vote_id: null` and `senate_vote_note: "voice_vote"`.
+
+## LegiScan legislators (`legiscan-legislators-sync`)
+
+Monthly roster job. Pulls current-session legislators for the 50 states
+from the LegiScan public API (`getSessionList` + `getSessionPeople`)
+and POSTs them to the **existing** `POST /hcgi/api/ingest/members`.
+
+No `state_members` table. Each row is a `members` record with
+`jurisdiction=state` and a 2-letter `state_code`.
+
+Congress is **not** pulled from LegiScan. Federal members stay on the
+existing Congress.gov / Horizons member-sync path.
+
+`POST /hcgi/api/ingest/members` is **live** (401 without a key, not
+404). It must accept `jurisdiction`, `state_code`, and
+`chamber=unicameral`. If those 400 as unexpected fields, that is a
+schema addition on `members` — not a new route. See
+`docs/HORIZONS_LEGISCAN_MEMBERS.md`.
+
+Needs `LEGISCAN_API_KEY` (free at https://legiscan.com/legiscan).
+Two queries per state (~100 for all 50). Do not call `getPerson` per
+legislator.
+
+### Field mapping
+
+| Field | Source |
+|-------|--------|
+| `bioguide_id` | `LS{people_id}` — cannot collide with a congressional bioguide |
+| `name` | LegiScan `name` |
+| `party` | `D` / `R` / `I` (same letters as federal) plus `N` = Nonpartisan. Third-party / blank → **manual_review** |
+| `state` | 2-letter USPS |
+| `state_code` | same 2-letter code |
+| `jurisdiction` | always `state` |
+| `chamber` | `Rep`/`Assembly`/`Delegate` → `house`; `Sen` → `senate`; **Nebraska always `unicameral`** |
+| `district` | integer parsed from `HD-111` / `SD-3` / `12`. Non-numeric labels → review |
+| `role` | `Representative, District N` / `Senator, District N` |
+| `source_url` | `https://legiscan.com/{ST}/people/{people_id}` (stable people_id path) |
+
+Existing `members.district` is a number. We do not invent a district
+from “A” or an at-large label.
+
+### CLI
+
+```bash
+python -m ingest.legiscan --state DE --dry-run
+python -m ingest.legiscan --state NE --dry-run
+python -m ingest.legiscan --all-states --dry-run
+python -m ingest.main --source legiscan --state TX --dry-run
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--state` | one of | Single USPS code. Use this first. |
+| `--all-states` | one of | All 50. Not DC, not Congress. |
+| `--dry-run` | no | Parse + log; no POST. |
+
+Workflow: `.github/workflows/legiscan-legislators.yml` — dispatch
+primary (`dry_run` default true). Monthly cron (1st, 12:00 UTC) is a
+backup and also dry-runs until you dispatch `dry_run=false`.
+
+### Test-run notes (data quality)
+
+Live dry-run 2026-08-14 against current sessions (DE, NE, WV, TX, CA):
+
+| State | Session | Found | Mapped | Review | Skip (committees) |
+|-------|---------|------:|-------:|-------:|------------------:|
+| DE | 2025-2026 Regular | 65 | 65 | 0 | 0 |
+| WV | 2026 Regular | 134 | 134 | 0 | 0 |
+| TX | 2025 Regular | 181 | 181 | 0 | 0 |
+| CA | 2025-2026 Regular | 160 | 121 | 0* | 39 |
+| NE | 2025-2026 Regular | 64 | 50 | 0 | 14 |
+
+\*CA’s 39 leftover rows are `committee_sponsor=1` (Budget and Fiscal
+Review, Agriculture, …). They are skipped, not posted as members.
+
+**Nebraska is not incomplete — it is nonpartisan.** The Unicameral is
+officially nonpartisan; LegiScan (and the FEC) code that as `N`. That is
+not Independent and not missing data. We store `party=N` and
+`chamber=unicameral`. Do not map `N` → `I`. Horizons must accept `N`
+on `members.party` (federal rows stay `D`/`R`/`I`).
+
+The other 14 NE rows are committees / Executive Board
+(`committee_sponsor=1`) and are skipped.
+
+DE/WV/TX matched 100%. TX 181 = 150 House + 31 Senate. WV 134 = 100 + 34.
+CA 121 people vs the usual 120 seats — one extra person in the session
+list; not guessed away.
+
+### Sample payload
+
+```json
+{
+  "members": [
+    {
+      "bioguide_id": "LS2240",
+      "name": "Wendell Gilliard",
+      "party": "D",
+      "state": "SC",
+      "chamber": "house",
+      "district": 111,
+      "role": "Representative, District 111",
+      "jurisdiction": "state",
+      "state_code": "SC",
+      "source_url": "https://legiscan.com/SC/people/2240"
+    }
+  ]
+}
+```
+
+## LegiScan bills + votes (`legiscan-bills-votes-sync`)
+
+Weekly incremental job. For each state: `getSessionList` → current (or
+`--session`) session → `getMasterList` → `getBill` only for bills whose
+`last_action_date` is inside `--days-back` → `getRollCall` for each
+vote stub on those bills.
+
+Same collections as federal. `jurisdiction=state` + `state_code`. No
+`state_bills` / `state_votes` tables.
+
+Legislator lines on a roll call join with `bioguide_id = LS{people_id}`.
+If `people_id` is missing, that line is dropped — no name matching.
+
+### Horizons routes
+
+| Route | Live 2026-08-14 |
+|-------|-----------------|
+| `POST /hcgi/api/ingest/bills` | **404** — request this (existing collection, new or enabled ingest) |
+| `POST /hcgi/api/ingest/votes` | exists (401 without key) |
+| `POST /hcgi/api/ingest/state-coverage` | **404** — new |
+
+`bills` currently uniques `(congress, bill_type, bill_number)`. State
+rows use `congress` = session `year_start`. **TX HB1 and CA HB1 will
+collide** unless the unique key includes `state_code` or upserts on
+`id=LS{bill_id}`. See `docs/HORIZONS_LEGISCAN_BILLS.md`.
+
+### Field mapping — bills
+
+| Field | Source |
+|-------|--------|
+| `id` | `LS{bill_id}` |
+| `congress` | session `year_start` (not a US Congress number) |
+| `bill_type` / `bill_number` | LegiScan `bill_type` / `HB1` |
+| `title` / `description` | as published |
+| `legislation_status` | 1–6 → Introduced / Engrossed / Enrolled / Passed / Vetoed / Failed |
+| `became_law` | true only if latest action text contains “signed” |
+| `latest_action_*` | last history row / masterlist last_action |
+| `jurisdiction` / `state_code` | `state` / USPS |
+| `source_url` | LegiScan bill page (`https://legiscan.com/DE/bill/HB1/2025`) |
+
+### Field mapping — votes
+
+| Field | Source |
+|-------|--------|
+| `id` | `{st}-{year}-{roll_call_id}` e.g. `de-2025-1574346` |
+| `rc_id` | `LSRC{roll_call_id}` |
+| `chamber` | H→house, S→senate, NE→unicameral |
+| `result` | passed=1 → Passed else Failed |
+| `tally_*` | yea / nay / nv+absent as not_voting |
+| `source_url` | `https://legiscan.com/DE/rollcall/HB1/id/1574346` |
+| `member_votes[].bioguide_id` | `LS{people_id}` |
+| `member_votes[].vote` | Yea→yea, Nay→nay, Absent/NV→not_voting |
+
+### Coverage tracker (`state_coverage`)
+
+Internal glance table, not a public page (can feed one later).
+
+| Field | Meaning |
+|-------|---------|
+| `state_code` | USPS, unique |
+| `legislators_last_synced` | last successful roster POST |
+| `bills_votes_last_synced` | last successful bills/votes POST |
+| `completeness_note` | free text (full / window-empty / no roll calls / error) |
+| `last_error` | nullable; exception text, never silent under-report |
+
+A legislators run and a bills run **merge** — they must not wipe the
+other timestamp. Completeness notes are written even on dry-run (logs
+only).
+
+### CLI
+
+```bash
+python -m ingest.legiscan_bills --state DE --days-back 14 --dry-run
+python -m ingest.legiscan_bills --state DE --session 2163 --days-back 30 --dry-run
+python -m ingest.main --source legiscan_bills --state DE --dry-run
+```
+
+| Flag | Required | Notes |
+|------|----------|--------|
+| `--state` / `--all-states` | one of | |
+| `--session` | no | LegiScan `session_id`. Default = current regular session. |
+| `--days-back` | no | Default 14. Filters `last_action_date`. |
+| `--dry-run` | no | Parse + log. |
+| `--max-records` | no | Cap bills after the date filter. `main.py --dry-run` defaults to 5. |
+
+Workflow: `.github/workflows/legiscan-bills-votes.yml` — dispatch
+primary. Weekly Monday 14:00 UTC backup, dry-run until `dry_run=false`.
+
+### Test-run notes (DE, 14-day window, 2026-08-14)
+
+DE masterlist = **1296** bills in 2025–26 Regular (`session_id` 2163).
+Last 14 days = **4 bills, 8 roll calls, 0 review**. Coverage note:
+“full session data available; incremental window has bills and roll
+calls.” Last 7 days was 0 (latest actions sat 8–10 days back).
+
+HB462 latest action is “Enact w/o Sign by Governor” — that is treated
+as `became_law` (law without a signature), not guessed from status
+alone.
+
+Do not `--all-states` until `/ingest/bills` and `/state-coverage` exist
+and the bills unique key includes `state_code`.
+
+Do not `--all-states` until `/ingest/bills` and `/state-coverage` exist
+and the bills unique key includes `state_code`.

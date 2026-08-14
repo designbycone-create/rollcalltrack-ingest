@@ -36,9 +36,12 @@ USAspending prime awards. Worker: `python -m ingest.usaspending`.
 | `recipient_name` | text | yes | |
 | `recipient_state` | text | no | 2-letter USPS or empty. Reject other lengths. |
 | `awarding_agency` | text | yes | Toptier agency name. |
-| `award_type` | select (1) | yes | `contract`, `grant`, `loan`, `direct_payment`, `insurance` |
-| `amount` | number | yes | Official obligated (or potential) figure. Never a midpoint. |
-| `amount_type` | select (1) | yes | `obligated`, `potential` |
+| `award_type` | select (1) | federal yes | `contract`, `grant`, `loan`, `direct_payment`, `insurance`. Null ok when `jurisdiction=state`. |
+| `amount` | number | yes | Federal: official obligated (or potential). State: portal posted expenditure. Never a midpoint. |
+| `amount_type` | select (1) | federal yes | `obligated`, `potential`. Null ok when `jurisdiction=state`. |
+| `jurisdiction` | select (1) | no | `federal` (default) or `state` |
+| `state_code` | text | if state | 2-letter USPS. Null for federal. |
+| `program` | text | no | State program label when the portal has one. |
 | `period_of_performance_start` | text | yes | `YYYY-MM-DD` |
 | `period_of_performance_end` | text | no | `YYYY-MM-DD` or empty |
 | `description` | text (editor ok) | no | |
@@ -54,6 +57,8 @@ CREATE INDEX idx_sa_agency ON spending_awards (awarding_agency)
 CREATE INDEX idx_sa_state ON spending_awards (recipient_state)
 CREATE INDEX idx_sa_fy ON spending_awards (fiscal_year)
 CREATE INDEX idx_sa_type ON spending_awards (award_type)
+CREATE INDEX idx_sa_jurisdiction ON spending_awards (jurisdiction)
+CREATE INDEX idx_sa_state_code ON spending_awards (state_code)
 ```
 
 ### 1.2 `improper_payments`

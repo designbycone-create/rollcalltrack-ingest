@@ -1,0 +1,65 @@
+name: California Open FI$Cal Spending
+
+# Portal publishes monthly (data ≥60 days old). Weekly would re-read the
+# same files. Schedule held until Horizons accepts jurisdiction=state on
+# POST /hcgi/api/ingest/spending/awards without inventing award_type.
+on:
+  # Re-enable after the awards route accepts state rows:
+  # schedule:
+  #   - cron: "0 14 3 * *"   # 3rd of month, after typical 1st-of-month upload
+  workflow_dispatch:
+    inputs:
+      fiscal_year:
+        description: "CA FY begin year (2025 = FY25 = 2025-26). Blank = current CA FY."
+        required: false
+      days_back:
+        description: "Only rows with accounting_date in this window (blank = full FY)"
+        required: false
+      max_records:
+        description: "Cap for a test run (blank = no cap)"
+        required: false
+      dry_run:
+        description: "Parse only, do not POST (true/false). Default true."
+        required: false
+        default: "true"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run California Open FI$Cal ingest
+        env:
+          HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          INGEST_KEY: ${{ secrets.INGEST_KEY }}
+        run: |
+          FY="${{ github.event.inputs.fiscal_year }}"
+          if [ -z "$FY" ]; then
+            FY=$(python -c "from datetime import date; t=date.today(); print(t.year if t.month>=7 else t.year-1)")
+          fi
+          DAYS="${{ github.event.inputs.days_back }}"
+          MAX="${{ github.event.inputs.max_records }}"
+          DRY="${{ github.event.inputs.dry_run }}"
+          CMD=(python -m ingest.ca_spending --fiscal-year "$FY")
+          if [ -n "$DAYS" ]; then
+            CMD+=(--days-back "$DAYS")
+          fi
+          if [ -n "$MAX" ]; then
+            CMD+=(--max-records "$MAX")
+          fi
+          if [ "${DRY}" != "false" ]; then
+            CMD+=(--dry-run)
+          fi
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"

@@ -125,6 +125,15 @@ class HorizonsIngestClient:
         for a in awards:
             if not a.get("source_url"):
                 raise ValueError("source_url is required on every award")
+            if a.get("jurisdiction") == "state":
+                if not a.get("state_code"):
+                    raise ValueError("state_code is required when jurisdiction=state")
+                # State portals rarely match the federal award_type /
+                # amount_type enums. Do not invent one here. Horizons must
+                # accept omitted award_type/amount_type on state rows.
+                if a.get("amount_type") not in (None, "obligated", "potential"):
+                    raise ValueError("amount_type must be obligated, potential, or omitted")
+                continue
             if a.get("amount_type") not in ("obligated", "potential"):
                 raise ValueError("amount_type must be obligated or potential")
         body = {"awards": awards}
@@ -222,6 +231,124 @@ class HorizonsIngestClient:
             resp.raise_for_status()
         logger.info(
             "IG ingest OK written=%s", data.get("written") or data.get("count")
+        )
+        return data
+
+    def submit_bills(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/bills."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every bill")
+            if rec.get("jurisdiction") != "state":
+                raise ValueError("this worker only posts jurisdiction=state")
+        body = {"bills": records}
+        logger.info("Submitting %d bills", len(records))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/bills")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/bills is not deployed (404). "
+                "See docs/HORIZONS_LEGISCAN_BILLS.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error("Bills ingest HTTP %s: %s", resp.status_code, str(data)[:500])
+            resp.raise_for_status()
+        return data
+
+    def submit_votes(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/votes."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every vote")
+            if rec.get("jurisdiction") != "state":
+                raise ValueError("this worker only posts jurisdiction=state")
+            for mv in rec.get("member_votes") or []:
+                if not mv.get("bioguide_id"):
+                    raise ValueError("member vote missing bioguide_id")
+        body = {"votes": records}
+        logger.info("Submitting %d votes", len(records))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/votes")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/votes is not deployed (404). "
+                "See docs/HORIZONS_LEGISCAN_BILLS.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error("Votes ingest HTTP %s: %s", resp.status_code, str(data)[:500])
+            resp.raise_for_status()
+        return data
+
+    def submit_state_coverage(self, records: list[dict]) -> dict:
+        """POST /hcgi/api/ingest/state-coverage — new Horizons route."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("state_code"):
+                raise ValueError("state_code is required on coverage rows")
+        body = {"coverage": records}
+        logger.info("Submitting %d state_coverage rows", len(records))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/state-coverage")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/state-coverage is not deployed "
+                "(404). See docs/HORIZONS_STATE_COVERAGE.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Coverage ingest HTTP %s: %s", resp.status_code, str(data)[:500]
+            )
+            resp.raise_for_status()
+        return data
+
+    def submit_members(self, records: list[dict]) -> dict:
+        """POST a batch to the existing /hcgi/api/ingest/members."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every member")
+            if rec.get("jurisdiction") != "state":
+                raise ValueError("this worker only posts jurisdiction=state")
+            if rec.get("chamber") not in ("house", "senate", "unicameral"):
+                raise ValueError("invalid chamber")
+            if rec.get("party") not in ("D", "R", "I", "N"):
+                raise ValueError("invalid party")
+            if not rec.get("bioguide_id"):
+                raise ValueError("bioguide_id is required")
+        body = {"members": records}
+        logger.info("Submitting %d members", len(records))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/members")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/members is not deployed (404). "
+                "See docs/HORIZONS_LEGISCAN_MEMBERS.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Members ingest HTTP %s: %s", resp.status_code, str(data)[:500]
+            )
+            resp.raise_for_status()
+        logger.info(
+            "Members ingest OK written=%s", data.get("written") or data.get("count")
         )
         return data
 
@@ -670,6 +797,8 @@ class HorizonsIngestClient:
                 "fjc",
                 "jefs",
                 "nominations",
+                "legiscan",
+                "ca_spending",
             )
             else (
                 "house_clerk"
@@ -690,6 +819,8 @@ class HorizonsIngestClient:
                 if "jefs" in source
                 else "nominations"
                 if "nominat" in source
+                else "legiscan"
+                if "legiscan" in source or "state" in source
                 else "congress_gov"
             ),
             "run_timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),

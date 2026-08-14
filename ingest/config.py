@@ -53,6 +53,7 @@ POCKETBASE_ADMIN_EMAIL = os.environ.get("POCKETBASE_ADMIN_EMAIL")
 POCKETBASE_ADMIN_PASSWORD = os.environ.get("POCKETBASE_ADMIN_PASSWORD")
 
 CONGRESS_GOV_API_KEY = os.environ.get("CONGRESS_GOV_API_KEY")
+LEGISCAN_API_KEY = os.environ.get("LEGISCAN_API_KEY")
 
 HOUSE_BULK_ZIP_URL_TEMPLATE = (
     "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
@@ -135,6 +136,10 @@ def require_config(dry_run: bool = False, source: str = "all"):
     )
     if needs_congress:
         missing.append("CONGRESS_GOV_API_KEY")
+    if source == "legiscan" and not (
+        LEGISCAN_API_KEY or os.environ.get("LEGISCAN_API_KEY")
+    ):
+        missing.append("LEGISCAN_API_KEY")
     if missing:
         raise RuntimeError(
             f"Missing required environment variables: {', '.join(missing)}"

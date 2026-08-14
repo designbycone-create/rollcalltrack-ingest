@@ -23,6 +23,9 @@ from . import (
     fjc,
     jefs,
     nominations,
+    legiscan,
+    legiscan_bills,
+    ca_spending,
 )
 from .ingest_client import get_client
 
@@ -48,6 +51,9 @@ def main():
             "fjc",
             "jefs",
             "nominations",
+            "legiscan",
+            "legiscan_bills",
+            "ca_spending",
             "all",
         ],
         default="all",
@@ -77,6 +83,22 @@ def main():
         type=int,
         default=None,
         help="Congress number (nominations)",
+    )
+    parser.add_argument(
+        "--state",
+        default=None,
+        help="2-letter USPS code (legiscan)",
+    )
+    parser.add_argument(
+        "--all-states",
+        action="store_true",
+        help="All 50 states (legiscan)",
+    )
+    parser.add_argument(
+        "--session",
+        type=int,
+        default=None,
+        help="LegiScan session_id (legiscan_bills)",
     )
     parser.add_argument(
         "--agency",
@@ -258,6 +280,61 @@ def main():
             results["nominations"] = nominations.run(
                 congress=args.congress or current_congress(),
                 days_back=args.days_back if args.days_back is not None else 14,
+                max_records=max_r,
+                dry_run=args.dry_run,
+                client=client,
+            )
+
+        if args.source == "legiscan":
+            logger.info("=== Running LegiScan legislator ingest ===")
+            if args.all_states:
+                states = list(legiscan.STATE_CODES)
+            elif args.state:
+                states = [args.state.upper()]
+            else:
+                logger.error("--state XX or --all-states is required for --source legiscan")
+                sys.exit(1)
+            results["legiscan"] = legiscan.run(
+                states=states,
+                dry_run=args.dry_run,
+                client=client,
+            )
+
+        if args.source == "legiscan_bills":
+            logger.info("=== Running LegiScan bills/votes ingest ===")
+            if args.all_states:
+                states = list(legiscan.STATE_CODES)
+            elif args.state:
+                states = [args.state.upper()]
+            else:
+                logger.error("--state XX or --all-states is required for --source legiscan_bills")
+                sys.exit(1)
+            max_r = args.max_records
+            if args.dry_run and max_r is None:
+                max_r = 5
+            results["legiscan_bills"] = legiscan_bills.run(
+                states=states,
+                session_id=getattr(args, "session", None),
+                days_back=args.days_back if args.days_back is not None else 14,
+                dry_run=args.dry_run,
+                max_records=max_r,
+                client=client,
+            )
+
+        if args.source == "ca_spending":
+            logger.info("=== Running California Open FI$Cal ingest ===")
+            fy = args.fiscal_year
+            if fy is None:
+                logger.error("--fiscal-year is required for --source ca_spending")
+                sys.exit(1)
+            max_r = args.max_records
+            if max_r is None and args.max_filings is not None:
+                max_r = args.max_filings
+            if args.dry_run and max_r is None:
+                max_r = 5
+            results["ca_spending"] = ca_spending.run(
+                fiscal_year=fy,
+                days_back=args.days_back,
                 max_records=max_r,
                 dry_run=args.dry_run,
                 client=client,
