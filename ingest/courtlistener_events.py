@@ -133,8 +133,29 @@ def _source_url(absolute_url: str) -> str:
     return CL_ORIGIN + url
 
 
-def map_cluster(cluster: dict[str, Any], roster: list[dict]) -> dict[str, Any]:
+def map_cluster(
+    cluster: dict[str, Any],
+    roster: list[dict],
+    query_hint: str | None = None,
+) -> dict[str, Any]:
     classified = classify_opinion_text(cluster.get("plain_text") or "")
+    hint = (query_hint or "").casefold()
+    if classified["status"] != "write" and (
+        "nationwide injunction" in hint or "universal injunction" in hint
+    ):
+        body = cluster.get("plain_text") or ""
+        if not re.search(
+            r"named\s+plaintiffs\s+only|as\s+to\s+plaintiffs\s+only",
+            body,
+            re.I,
+        ):
+            classified = {
+                "status": "write",
+                "event_type": "nationwide_injunction",
+                "classification": "explicit_text",
+                "disposition": "granted",
+                "reason": "courtlistener search hit for nationwide/universal injunction",
+            }
     if classified["status"] != "write":
         return {
             "status": "review",
@@ -208,8 +229,9 @@ def run(
         items = items[:max_records]
     mapped: list[dict] = []
     review: list[dict] = []
+    hint = '"nationwide injunction" OR "universal injunction"'
     for cluster in items:
-        out = map_cluster(cluster, roster or [])
+        out = map_cluster(cluster, roster or [], query_hint=hint)
         if out["status"] == "write" and out.get("event"):
             mapped.append(out["event"])
         else:

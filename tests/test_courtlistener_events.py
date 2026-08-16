@@ -26,6 +26,25 @@ def test_match_ambiguous_or_unknown_is_none():
     assert match_judge("John Smith", "District of Maryland", ROSTER) is None
 
 
+def test_map_uses_search_hint_when_snippet_is_caption():
+    cluster = {
+        "absolute_url": "/opinion/99/md-case/",
+        "date_filed": "2026-02-01",
+        "case_name": "Smith v. United States",
+        "court": "District of Maryland",
+        "judges": "Judge Adam Ben Abelson",
+        "plain_text": "UNITED STATES DISTRICT COURT FOR THE DISTRICT OF MARYLAND",
+    }
+    out = map_cluster(
+        cluster,
+        ROSTER,
+        query_hint='"nationwide injunction" OR "universal injunction"',
+    )
+    assert out["status"] == "write"
+    assert out["event"]["judge_id"] == "13761857"
+    assert out["event"]["event_type"] == "nationwide_injunction"
+
+
 def test_map_nationwide_writes_event():
     cluster = {
         "absolute_url": "/opinion/99/md-case/",
