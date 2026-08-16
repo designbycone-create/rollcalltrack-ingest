@@ -68,6 +68,17 @@ def test_hedged_amount_is_not_stored():
 
 def test_program_and_status_and_defendant():
     assert map_program("Paycheck Protection Program loans") == "Paycheck Protection Program (PPP)"
+    assert map_program(
+        "Guilty in $250 Million Pandemic Fraud Scheme that exploited a federally-funded child nutrition program"
+    ) == "Federal Child Nutrition Program"
+    assert map_program("78th Defendant Charged in Feeding Our Future Fraud Scheme") == (
+        "Federal Child Nutrition Program"
+    )
+    assert map_program("charges against 15 defendants for Medicaid fraud schemes") == "Medicaid"
+    assert map_program("Stealing More than $1 Million in COVID-19 Relief Funds") == (
+        "COVID-19 / pandemic relief"
+    )
+    assert map_program("A man was sentenced for dogfighting.") is None
     assert map_status("companies settle PPP lawsuit") == "settled"
     assert map_status("woman sentenced to two years") == "convicted"
     assert map_status("pleads guilty to stealing") == "convicted"

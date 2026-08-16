@@ -47,6 +47,14 @@ DEFENDANT_ENUM = ("individual", "company", "multiple")
 # Longer / more specific phrases first.
 PROGRAM_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"paycheck protection program|\bppp\b", re.I), "Paycheck Protection Program (PPP)"),
+    (
+        re.compile(
+            r"feeding our future|child nutrition|\bcacfp\b|summer food service",
+            re.I,
+        ),
+        "Federal Child Nutrition Program",
+    ),
+    (re.compile(r"\bmedicaid\b", re.I), "Medicaid"),
     (re.compile(r"economic injury disaster loan|\beidl\b", re.I), "COVID-19 Economic Injury Disaster Loan (EIDL)"),
     (re.compile(r"pandemic unemployment assistance|\bpua\b", re.I), "Federal Pandemic Unemployment Assistance"),
     (re.compile(r"federal pandemic unemployment compensation|\bfpuc\b", re.I), "Federal Pandemic Unemployment Compensation"),
@@ -57,6 +65,13 @@ PROGRAM_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"restaurant revitalization", re.I), "Restaurant Revitalization Fund"),
     (re.compile(r"provider relief", re.I), "Provider Relief Fund"),
     (re.compile(r"economic impact payment|\bstimulus\b", re.I), "Economic Impact Payments"),
+    (
+        re.compile(
+            r"covid[- ]?19 relief|pandemic[- ]relief|covid relief|cares act",
+            re.I,
+        ),
+        "COVID-19 / pandemic relief",
+    ),
 ]
 
 # Unhedged explicit amounts only. "over $40,000" / "more than $1 million" → None
