@@ -126,6 +126,11 @@ rollcalltrack-ingest/
     prac.py              # PRAC pandemic fraud enforcement
     prac_source_allowlist.json  # trusted source_url hosts
     fjc.py               # FJC Article III biographical directory
+    judicial_events.py   # opinion text → scored event or review
+    judicial_score.py    # law-over-politics + ideology formula
+    jcs_scores.py        # JCS / Martin-Quinn snapshot loader
+    courtlistener_events.py  # CourtListener opinion → events
+    scotus_stays.py      # SCOTUS stay/reversal → events
     jefs.py              # AO / JEFS judicial financial disclosures
     nominations.py       # Congress.gov PN → FJC judge + Senate vote
     legiscan.py          # LegiScan 50-state legislator roster
@@ -144,6 +149,10 @@ rollcalltrack-ingest/
     oversight-ig.yml     # Oversight.gov IG reports (schedule held)
     prac-fraud.yml       # PRAC fraud cases (schedule held, dry-run default)
     fjc-judges.yml       # FJC judges (dispatch primary, quarterly cron)
+    courtlistener-events.yml  # CourtListener events (schedule held)
+    scotus-stays.yml     # SCOTUS stays/reversals (schedule held)
+    jcs-scores.yml       # JCS snapshot (dispatch, dry-run default)
+    judicial-score.yml   # score job (schedule held)
     jefs-disclosures.yml # AO judicial disclosures (dispatch + weekly cron)
     judicial-nominations.yml  # PN → judge + vote (dispatch + weekly cron)
     legiscan-legislators.yml  # state rosters (dispatch + monthly cron)
@@ -892,6 +901,24 @@ UTC) is a backup and also dry-runs until you dispatch with
 Samuel A. Alito Jr. (`nid=1377101`) maps to `Supreme Court of the United
 States` / `supreme_court` / `George W. Bush` / `2005-11-10` /
 `2006-01-31` — slot 2, not his earlier Third Circuit appointment.
+
+## Judicial scores
+
+Roster is FJC. Events and scores are computed in this repo. Horizons must
+implement `docs/HORIZONS_JUDICIAL_SCORES.md` before any `--post`.
+
+Two independent numbers: law-over-politics (`rogue_score` 0–100) and
+ideology lean (−100…+100). Appointing party is never a score.
+
+```
+python -m ingest.courtlistener_events --dry-run --max-records 5
+python -m ingest.scotus_stays --dry-run --max-records 5
+python -m ingest.judicial_score --dry-run
+python -m ingest.jcs_scores --dry-run
+```
+
+Workflows default to dry-run. Flip only after POST
+`/hcgi/api/ingest/judicial/events` and `.../scores` stop returning 404.
 
 ## AO judicial disclosures (`ao-judicial-disclosures-sync`)
 
