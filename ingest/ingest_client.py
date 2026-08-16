@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any
 from urllib.parse import urlencode
 
@@ -107,16 +108,83 @@ class HorizonsIngestClient:
             url = f"{url}?{urlencode(params)}"
         return self.session.get(url, timeout=self.timeout)
 
+    def _should_retry(self, resp: requests.Response) -> bool:
+        if resp.status_code == 429:
+            return True
+        if resp.status_code == 403:
+            body = (resp.text or "").lower()
+            return "too many" in body or body.strip() == "forbidden"
+        return False
+
     def _post_ingest(self, body: dict, path: str = "/hcgi/api/ingest/disclosures") -> requests.Response:
-        return self.session.post(
-            f"{self.base}{path}",
-            headers={
-                "X-Ingest-Key": self.ingest_key,
-                "Content-Type": "application/json",
-            },
-            json=body,
-            timeout=self.timeout,
-        )
+        delay = 5.0
+        last = None
+        for attempt in range(6):
+            last = self.session.post(
+                f"{self.base}{path}",
+                headers={
+                    "X-Ingest-Key": self.ingest_key,
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=self.timeout,
+            )
+            if not self._should_retry(last):
+                return last
+            if attempt == 5:
+                break
+            logger.warning(
+                "ingest HTTP %s on %s, retry %s in %.0fs",
+                last.status_code,
+                path,
+                attempt + 1,
+                delay,
+            )
+            time.sleep(delay)
+            delay = min(delay * 3, 90)
+        return last
+
+    def fetch_judicial_judges(self) -> list[dict]:
+        """Page through GET /hcgi/api/judicial/judges."""
+        out: list[dict] = []
+        page = 1
+        while page <= 200:
+            resp = self._get("/hcgi/api/judicial/judges", {"page": page, "limit": 100})
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            rows = data.get("items") or data.get("judges") or []
+            if not rows:
+                break
+            out.extend(rows)
+            total = data.get("total")
+            if total is not None and len(out) >= int(total):
+                break
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
+
+    def fetch_judicial_events(self) -> list[dict]:
+        """Page through GET /hcgi/api/judicial/events."""
+        out: list[dict] = []
+        page = 1
+        while page <= 200:
+            resp = self._get("/hcgi/api/judicial/events", {"page": page, "limit": 100})
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            rows = data.get("items") or data.get("events") or []
+            if not rows:
+                break
+            out.extend(rows)
+            total = data.get("total")
+            if total is not None and len(out) >= int(total):
+                break
+            if len(rows) < 100:
+                break
+            page += 1
+        return out
 
     def submit_spending_awards(self, awards: list[dict]) -> dict:
         """POST a batch to /hcgi/api/ingest/spending/awards."""

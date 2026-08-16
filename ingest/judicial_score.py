@@ -99,7 +99,19 @@ def run(
     from .jcs_scores import lookup_ideology
 
     day = today or date.today()
-    groups = dict(events_by_judge or {})
+    if events_by_judge is None:
+        if client is None:
+            from .ingest_client import get_client
+
+            client = get_client()
+        groups = {}
+        for ev in client.fetch_judicial_events():
+            jid = ev.get("judge_id")
+            if not jid:
+                continue
+            groups.setdefault(jid, []).append(ev)
+    else:
+        groups = dict(events_by_judge)
     snap = snapshot if snapshot is not None else {"scores": {}}
     scores: list[dict[str, Any]] = []
     review = 0
@@ -167,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     result = run(
         dry_run=args.dry_run,
         today=date.today(),
-        events_by_judge={},
+        events_by_judge=None,
         snapshot=load_snapshot(),
         max_records=args.max_records,
     )

@@ -49,6 +49,33 @@ def test_submit_events_posts_batch(monkeypatch):
     assert out["written"] == 1
 
 
+def test_post_ingest_retries_429_then_succeeds(monkeypatch):
+    hz = HorizonsIngestClient("https://example.com", "k")
+    calls = {"n": 0}
+
+    def fake_post(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return FakeResp(429, {"error": "Too many requests"})
+        return FakeResp(200, {"ok": True, "written": 1})
+
+    monkeypatch.setattr(hz.session, "post", fake_post)
+    monkeypatch.setattr("ingest.ingest_client.time.sleep", lambda _s: None)
+    rec = {
+        "event_id": "abc",
+        "judge_id": "13761857",
+        "event_type": "nationwide_injunction",
+        "event_date": "2026-01-01",
+        "court": "S.D.N.Y.",
+        "source_url": "https://www.courtlistener.com/opinion/1/",
+        "classification": "explicit_text",
+        "weight": 4,
+    }
+    out = hz.submit_judicial_events([rec])
+    assert calls["n"] == 3
+    assert out["written"] == 1
+
+
 def test_submit_scores_posts_batch(monkeypatch):
     hz = HorizonsIngestClient("https://example.com", "k")
     seen = {}

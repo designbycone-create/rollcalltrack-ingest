@@ -1,4 +1,4 @@
-from ingest.scotus_stays import map_scotus_order
+from ingest.scotus_stays import disposition_from_text, map_scotus_order
 
 ROSTER = [
     {
@@ -7,6 +7,13 @@ ROSTER = [
         "court": "U.S. District Court for the Southern District of New York",
     }
 ]
+
+
+def test_disposition_from_text():
+    assert disposition_from_text("The application for stay is granted.") == "stayed"
+    assert disposition_from_text("The judgment is reversed.") == "reversed"
+    assert disposition_from_text("The judgment is vacated and remanded.") == "vacated"
+    assert disposition_from_text("Certiorari denied.") is None
 
 
 def test_stay_writes_scotus_stay():

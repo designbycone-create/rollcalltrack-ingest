@@ -1,4 +1,4 @@
-from ingest.courtlistener_events import map_cluster, match_judge
+from ingest.courtlistener_events import map_cluster, match_judge, search_hit_to_cluster
 
 ROSTER = [
     {
@@ -16,6 +16,10 @@ ROSTER = [
 
 def test_match_unique_name():
     assert match_judge("Adam Ben Abelson", "District of Maryland", ROSTER) == "13761857"
+
+
+def test_match_strips_title_and_last_name():
+    assert match_judge("Judge Adam Ben Abelson", "D. Md.", ROSTER) == "13761857"
 
 
 def test_match_ambiguous_or_unknown_is_none():
@@ -37,6 +41,22 @@ def test_map_nationwide_writes_event():
     assert out["event"]["event_type"] == "nationwide_injunction"
     assert out["event"]["source_url"].startswith("https://www.courtlistener.com/")
     assert out["event"]["weight"] == 4
+
+
+def test_search_hit_to_cluster_uses_snippet_and_judge():
+    hit = {
+        "absolute_url": "/opinion/1/foo/",
+        "dateFiled": "2026-02-25",
+        "caseName": "Desmarais v. Granholm",
+        "court": "District Court, District of Columbia",
+        "court_id": "dcd",
+        "judge": "Judge Loren L. AliKhan",
+        "opinions": [{"snippet": "The court grants a nationwide injunction."}],
+    }
+    cluster = search_hit_to_cluster(hit)
+    assert cluster["judges"] == "Judge Loren L. AliKhan"
+    assert "nationwide injunction" in cluster["plain_text"]
+    assert cluster["date_filed"] == "2026-02-25"
 
 
 def test_map_bare_injunction_is_review():

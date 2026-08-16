@@ -1,16 +1,58 @@
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any
 
-from .courtlistener_events import match_judge
+from .courtlistener_events import fetch_opinion_hits, match_judge
 from .judicial_events import event_id
 from .judicial_score import WEIGHTS
+
+logger = logging.getLogger("rollcalltrack_ingest.scotus_stays")
 
 _DISPOSITION_TO_TYPE = {
     "stayed": "scotus_stay",
     "reversed": "scotus_reversed",
     "vacated": "scotus_reversed",
 }
+
+_JUDGE_IN_TEXT = re.compile(
+    r"(?:Judge|Justice|District Judge)\s+([A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,3})",
+)
+
+
+def disposition_from_text(text: str) -> str | None:
+    t = (text or "").casefold()
+    if "application for stay" in t and "granted" in t:
+        return "stayed"
+    if re.search(r"\bstay(?:ed)?\b", t) and "granted" in t:
+        return "stayed"
+    if "reversed" in t:
+        return "reversed"
+    if "vacated" in t:
+        return "vacated"
+    return None
+
+
+def cluster_to_order(cluster: dict[str, Any]) -> dict[str, Any]:
+    text = cluster.get("plain_text") or ""
+    disp = disposition_from_text(text)
+    m = _JUDGE_IN_TEXT.search(text)
+    lower = cluster.get("judges") or ""
+    if m:
+        lower = m.group(1)
+    raw_url = cluster.get("absolute_url") or ""
+    if raw_url.startswith("/"):
+        raw_url = "https://www.courtlistener.com" + raw_url
+    return {
+        "source_url": raw_url,
+        "date_filed": cluster.get("date_filed") or "",
+        "case_name": cluster.get("case_name") or "",
+        "lower_court": cluster.get("court") or "Supreme Court of the United States",
+        "lower_judge": lower,
+        "disposition": disp or "other",
+        "plain_text": text,
+    }
 
 
 def map_scotus_order(order: dict[str, Any], roster: list[dict]) -> dict[str, Any]:
@@ -50,7 +92,24 @@ def run(
     roster: list[dict] | None = None,
     client=None,
 ) -> dict:
-    items = list(orders or [])
+    if roster is None:
+        from .ingest_client import get_client
+
+        hz = client or get_client()
+        try:
+            roster = hz.fetch_judicial_judges()
+        except Exception as exc:
+            logger.warning("could not load judicial roster: %s", exc)
+            roster = []
+    if orders is None:
+        hits = fetch_opinion_hits(
+            '"application for stay" OR "stay granted" OR reversed OR vacated',
+            days_back=days_back or 14,
+            max_records=max_records,
+            court="scotus",
+        )
+        orders = [cluster_to_order(h) for h in hits]
+    items = list(orders)
     if max_records is not None:
         items = items[:max_records]
     mapped: list[dict] = []

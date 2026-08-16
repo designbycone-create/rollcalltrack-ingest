@@ -1,30 +1,127 @@
 from __future__ import annotations
 
+import logging
+import os
+import re
+from datetime import date, timedelta
 from typing import Any
+
+import requests
 
 from .judicial_events import classify_opinion_text, event_id
 from .judicial_score import WEIGHTS
 
+logger = logging.getLogger("rollcalltrack_ingest.courtlistener_events")
+
 CL_ORIGIN = "https://www.courtlistener.com"
+CL_SEARCH = f"{CL_ORIGIN}/api/rest/v4/search/"
+
+_TITLE_RE = re.compile(
+    r"^(?:hon(?:orable)?\.?|chief\s+judge|judge|justice|j\.)\s+",
+    re.I,
+)
+
+
+def clean_judge_name(name: str) -> str:
+    s = (name or "").strip()
+    s = _TITLE_RE.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip(" ,")
+    return s
 
 
 def match_judge(name: str, court: str, roster: list[dict]) -> str | None:
-    target = (name or "").strip().casefold()
+    target = clean_judge_name(name).casefold()
     court_q = (court or "").strip().casefold()
     if not target:
         return None
-    hits = []
+
+    def last(full: str) -> str:
+        parts = [p for p in re.split(r"[\s,]+", full) if p]
+        return parts[-1] if parts else ""
+
+    exact = []
+    last_hits = []
     for row in roster:
-        full = (row.get("full_name") or "").strip().casefold()
+        full = clean_judge_name(row.get("full_name") or "").casefold()
         row_court = (row.get("court") or "").strip().casefold()
-        if full != target:
-            continue
-        if court_q and court_q not in row_court:
-            continue
-        hits.append(row.get("judge_id"))
-    if len(hits) == 1:
-        return hits[0]
+        jid = row.get("judge_id")
+        if full == target:
+            if not court_q or court_q in row_court:
+                exact.append(jid)
+        if last(full) and last(full) == last(target):
+            last_hits.append(jid)
+    if len(exact) == 1:
+        return exact[0]
+    uniq_last = list(dict.fromkeys(last_hits))
+    if len(uniq_last) == 1:
+        return uniq_last[0]
     return None
+
+
+def search_hit_to_cluster(hit: dict[str, Any]) -> dict[str, Any]:
+    opinions = hit.get("opinions") or []
+    snippet = ""
+    if opinions and isinstance(opinions[0], dict):
+        snippet = opinions[0].get("snippet") or ""
+    judge = hit.get("judge") or ""
+    if not judge:
+        names = hit.get("panel_names") or []
+        if isinstance(names, list) and names:
+            judge = names[0]
+        elif isinstance(names, str):
+            judge = names
+    return {
+        "absolute_url": hit.get("absolute_url") or "",
+        "date_filed": (hit.get("dateFiled") or "")[:10],
+        "case_name": hit.get("caseName") or "",
+        "court": hit.get("court") or hit.get("court_citation_string") or "",
+        "court_id": hit.get("court_id") or "",
+        "judges": judge,
+        "plain_text": snippet,
+    }
+
+
+def fetch_opinion_hits(
+    query: str,
+    *,
+    days_back: int = 14,
+    max_records: int | None = None,
+    court: str | None = None,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    s = session or requests.Session()
+    s.headers.setdefault(
+        "User-Agent",
+        "rollcalltrack.com research bot (contact: hello@rollcalltrack.com)",
+    )
+    token = os.environ.get("COURTLISTENER_TOKEN") or ""
+    if token:
+        s.headers["Authorization"] = f"Token {token}"
+    start = (date.today() - timedelta(days=days_back or 14)).isoformat()
+    q = f"({query}) AND dateFiled:[{start} TO *]"
+    params: dict[str, Any] = {
+        "q": q,
+        "type": "o",
+        "order_by": "dateFiled desc",
+    }
+    if court:
+        params["court"] = court
+    cap = max_records if max_records is not None else 50
+    out: list[dict[str, Any]] = []
+    url = CL_SEARCH
+    while url and len(out) < cap:
+        resp = s.get(url, params=params if url == CL_SEARCH else None, timeout=45)
+        params = None
+        if resp.status_code != 200:
+            logger.error("CourtListener search HTTP %s: %s", resp.status_code, resp.text[:200])
+            break
+        payload = resp.json()
+        for hit in payload.get("results") or []:
+            out.append(search_hit_to_cluster(hit))
+            if len(out) >= cap:
+                break
+        url = payload.get("next")
+    return out
 
 
 def _source_url(absolute_url: str) -> str:
@@ -83,7 +180,30 @@ def run(
     roster: list[dict] | None = None,
     client=None,
 ) -> dict:
-    items = list(clusters or [])
+    if roster is None:
+        from .ingest_client import get_client
+
+        hz = client or get_client()
+        try:
+            roster = hz.fetch_judicial_judges()
+        except Exception as exc:
+            logger.warning("could not load judicial roster: %s", exc)
+            roster = []
+    if clusters is None:
+        want = max_records if max_records is not None else 50
+        raw = fetch_opinion_hits(
+            '"nationwide injunction" OR "universal injunction"',
+            days_back=days_back or 14,
+            max_records=max(want * 10, 80),
+        )
+        clusters = [
+            c
+            for c in raw
+            if (c.get("court_id") or "").startswith("d")
+            or "district" in (c.get("court") or "").casefold()
+        ]
+        clusters = clusters[:want]
+    items = list(clusters)
     if max_records is not None:
         items = items[:max_records]
     mapped: list[dict] = []

@@ -24,6 +24,7 @@ import io
 import json
 import logging
 import sys
+import time
 from datetime import datetime
 from typing import Any
 
@@ -339,6 +340,8 @@ def run(
             batch = mapped[i : i + HORIZONS_BATCH_SIZE]
             hz.submit_judicial_judges(batch)
             posted += len(batch)
+            if i + HORIZONS_BATCH_SIZE < len(mapped):
+                time.sleep(0.4)
         for rec in review:
             hz.flag_manual_review(
                 filing_id=rec.get("judge_id") or rec.get("source_url") or "unknown",
