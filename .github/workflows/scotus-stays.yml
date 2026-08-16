@@ -1,0 +1,52 @@
+name: SCOTUS Stays
+
+on:
+  # Schedule held until Horizons deploys POST /hcgi/api/ingest/judicial/events.
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Parse only, do not POST (true/false). Default true."
+        required: false
+        default: "true"
+      days_back:
+        description: "Lookback window in days"
+        required: false
+        default: "14"
+      max_records:
+        description: "Cap rows (blank = no cap)"
+        required: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run SCOTUS stay ingest
+        env:
+          HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          INGEST_KEY: ${{ secrets.INGEST_KEY }}
+        run: |
+          DRY="${{ github.event.inputs.dry_run }}"
+          DAYS="${{ github.event.inputs.days_back }}"
+          DAYS="${DAYS:-14}"
+          MAX="${{ github.event.inputs.max_records }}"
+          CMD=(python -m ingest.scotus_stays --days-back "$DAYS")
+          if [ "${DRY}" != "false" ]; then
+            CMD+=(--dry-run)
+          fi
+          if [ -n "$MAX" ]; then
+            CMD+=(--max-records "$MAX")
+          fi
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"
