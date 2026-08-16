@@ -1,0 +1,14 @@
+{
+  "listings": [
+    {
+      "url": "https://www.justice.gov/criminal/criminal-fraud/health-care-fraud-unit/2026-minnesota-hcf-case-summaries",
+      "kind": "hcf_summaries",
+      "announcement_date": "2026-05-21"
+    },
+    {
+      "url": "https://www.justice.gov/opa/pr/minnesota-health-care-fraud-takedown-results-charges-against-15-defendants-over-90m-fraud",
+      "kind": "opa_pr",
+      "announcement_date": "2026-05-21"
+    }
+  ]
+}
