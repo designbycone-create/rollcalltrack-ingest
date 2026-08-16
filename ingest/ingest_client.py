@@ -498,6 +498,96 @@ class HorizonsIngestClient:
         )
         return data
 
+    def submit_judicial_events(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/judicial/events."""
+        from .judicial_events import CLASSIFICATIONS, EVENT_TYPES
+
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every event")
+            if not rec.get("judge_id"):
+                raise ValueError("judge_id is required on every event")
+            if not rec.get("event_id"):
+                raise ValueError("event_id is required on every event")
+            if rec.get("event_type") not in EVENT_TYPES:
+                raise ValueError("invalid event_type")
+            if rec.get("classification") not in CLASSIFICATIONS:
+                raise ValueError("invalid classification")
+            if not rec.get("event_date"):
+                raise ValueError("event_date is required on every event")
+            if not rec.get("court"):
+                raise ValueError("court is required on every event")
+            weight = rec.get("weight")
+            if weight is None or not (1 <= float(weight) <= 5):
+                raise ValueError("weight must be 1-5")
+        body = {"events": records}
+        logger.info("Submitting %d judicial events", len(records))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/judicial/events")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/judicial/events is not "
+                "deployed (404). See docs/HORIZONS_JUDICIAL_SCORES.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Judicial-event ingest HTTP %s: %s",
+                resp.status_code,
+                str(data)[:500],
+            )
+            resp.raise_for_status()
+        logger.info(
+            "Judicial-event ingest OK written=%s",
+            data.get("written") or data.get("count"),
+        )
+        return data
+
+    def submit_judicial_scores(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/judicial/scores."""
+        bands = ("unscored", "within_bounds", "watch", "rogue")
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("judge_id"):
+                raise ValueError("judge_id is required on every score")
+            if rec.get("rogue_score") is None:
+                raise ValueError("rogue_score is required")
+            if rec.get("rogue_band") not in bands:
+                raise ValueError("invalid rogue_band")
+            if rec.get("event_count") is None:
+                raise ValueError("event_count is required")
+            if not rec.get("scored_through"):
+                raise ValueError("scored_through is required")
+        body = {"scores": records}
+        logger.info("Submitting %d judicial scores", len(records))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/judicial/scores")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code == 404:
+            logger.error(
+                "Horizons route /hcgi/api/ingest/judicial/scores is not "
+                "deployed (404). See docs/HORIZONS_JUDICIAL_SCORES.md"
+            )
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Judicial-score ingest HTTP %s: %s",
+                resp.status_code,
+                str(data)[:500],
+            )
+            resp.raise_for_status()
+        logger.info(
+            "Judicial-score ingest OK written=%s",
+            data.get("written") or data.get("count"),
+        )
+        return data
+
     def submit_fraud_cases(self, records: list[dict]) -> dict:
         """POST a batch to /hcgi/api/ingest/spending/fraud-cases."""
         if not records:
