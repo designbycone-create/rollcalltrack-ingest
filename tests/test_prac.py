@@ -79,6 +79,18 @@ def test_program_and_status_and_defendant():
         "COVID-19 / pandemic relief"
     )
     assert map_program("A man was sentenced for dogfighting.") is None
+    assert map_program("false claims to Medicare for hospice") == "Medicare"
+    assert map_program("billed Arizona Medicaid") == "Medicaid"
+    assert map_program("SNAP benefits stolen from EBT cards") == (
+        "Supplemental Nutrition Assistance Program (SNAP)"
+    )
+    assert map_program("conspiracy to commit health care fraud") == "Health Care Fraud"
+    assert map_program(
+        "charged with wire fraud after obtaining nursing jobs at healthcare businesses"
+    ) == "Health Care Fraud"
+    assert map_program(
+        "unlawfully distributing controlled substances"
+    ) == "Health Care Fraud"
     assert map_status("companies settle PPP lawsuit") == "settled"
     assert map_status("woman sentenced to two years") == "convicted"
     assert map_status("pleads guilty to stealing") == "convicted"
@@ -86,6 +98,45 @@ def test_program_and_status_and_defendant():
     assert map_defendant_type("Tornado Bus Company, Inc. and El Expreso Group, LLC") == "company"
     assert map_defendant_type("Four Georgia Men Sentenced") == "multiple"
     assert map_defendant_type("Kapolei Woman Sentenced") == "individual"
+
+
+def test_extract_state_prefers_usao_url_then_district_then_residence():
+    from ingest.prac import extract_state_code
+
+    assert extract_state_code(
+        "Dallas-Based Bus Companies Settle PPP Lawsuit",
+        url="https://www.justice.gov/usao-ndtx/pr/dallas-based-bus-companies-settle-ppp-lawsuit-39-million",
+    ) == "TX"
+    assert extract_state_code(
+        "Cases filed in the Middle District of Alabama. Located in Phenix City, Alabama."
+    ) == "AL"
+    assert extract_state_code(
+        "Susie Kamien, 55, of West Chester, Illinois, was charged in the District of Arizona.",
+    ) == "AZ"
+    assert extract_state_code(
+        "Fahima Mahamud, 50, of Minneapolis, Minnesota, was charged by Information."
+    ) == "MN"
+    assert extract_state_code("A nationwide scheme spanning several states.") is None
+    assert extract_state_code("A national of the country of Georgia was charged.") is None
+
+
+def test_map_agency_from_program_and_text():
+    from ingest.prac import map_agency
+
+    assert map_agency("Paycheck Protection Program (PPP)", "") == (
+        "Small Business Administration"
+    )
+    assert map_agency("Medicaid", "charged with Medicaid fraud") == (
+        "Department of Health and Human Services"
+    )
+    assert map_agency(
+        "Federal Child Nutrition Program", "Feeding Our Future child nutrition"
+    ) == "Department of Agriculture"
+    assert map_agency("Unemployment Insurance", "UI benefits") == "Department of Labor"
+    assert map_agency(None, "false claims to Medicare for hospice") == (
+        "Department of Health and Human Services"
+    )
+    assert map_agency(None, "a dogfighting sentencing") is None
 
 
 def test_listing_and_to_record_allowlist():
@@ -100,6 +151,8 @@ def test_listing_and_to_record_allowlist():
     assert ok["amount_alleged"] == 3_900_000.0
     assert ok["source_url"].startswith("https://www.justice.gov/")
     assert ok["filing_date"] == "2026-08-12"
+    assert ok["state_code"] == "TX"
+    assert ok["agency"] == "Small Business Administration"
 
     blocked = to_record(rows[1], allow)
     assert blocked["_review"] is True

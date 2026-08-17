@@ -124,6 +124,8 @@ must reject untrusted `source_url` hosts (see §2.5).
 |-------|------|----------|--------|
 | `case_title` | text | yes | |
 | `agency_program` | text | yes | Named program (e.g. PPP), not a guessed agency. |
+| `agency` | text | no | Canonical **victim** federal agency. Null if unmapped. |
+| `state_code` | text | no | 2-letter USPS venue. Null if nationwide / ambiguous. |
 | `defendant_type` | select (1) | yes | `individual`, `company`, `multiple` |
 | `amount_alleged` | number | no | Unhedged explicit `$` only. |
 | `status` | select (1) | yes | `charged`, `convicted`, `settled`, `ongoing` |
@@ -135,6 +137,8 @@ Indexes:
 ```sql
 CREATE UNIQUE INDEX idx_fc_source_url ON fraud_cases (source_url)
 CREATE INDEX idx_fc_program ON fraud_cases (agency_program)
+CREATE INDEX idx_fc_agency ON fraud_cases (agency)
+CREATE INDEX idx_fc_state ON fraud_cases (state_code)
 CREATE INDEX idx_fc_status ON fraud_cases (status)
 CREATE INDEX idx_fc_filing ON fraud_cases (filing_date)
 ```
@@ -244,8 +248,8 @@ Upsert on `source_url`.
 ### 2.4 `POST /hcgi/api/ingest/spending/fraud-cases`
 
 ```json
-{ "fraud_cases": [ { "case_title", "agency_program", "defendant_type",
-  "amount_alleged", "status", "source_url", "filing_date" } ] }
+{ "fraud_cases": [ { "case_title", "agency_program", "agency", "state_code",
+  "defendant_type", "amount_alleged", "status", "source_url", "filing_date" } ] }
 ```
 
 or `{ "type": "fraud_case", "payload": { ... } }`.
@@ -337,7 +341,8 @@ There is no open/closed field. “Open” in the rollup (§4) means
 
 | Query | Matches |
 |-------|---------|
-| `agency` | see program→agency map in §4 (or `agency_program` contains) |
+| `state` | exact `state_code` (2-letter) |
+| `agency` | `agency` contains, or alias (HHS/SBA/DOL/…); fallback: program→agency map in §4 |
 | `agency_program` | exact/contains on `agency_program` |
 | `status` | exact enum |
 | `defendant_type` | exact enum |
@@ -387,9 +392,9 @@ Definitions:
 | `total_improper_payments` | `SUM(estimated_amount_low)` on `improper_payments` where `agency` matches. Use low, not a midpoint. |
 | `improper_payment_count` | Count of those rows. |
 | `ig_report_count` | Count of `ig_reports` where `agency` matches and `publish_date >= ig_since`. Not an “open ticket” count. |
-| `fraud_case_count` | Count of `fraud_cases` whose `agency_program` maps to this agency (table below) and `filing_date >= fraud_since`. |
+| `fraud_case_count` | Count of `fraud_cases` where `agency` matches an alias, or (if `agency` is null) `agency_program` maps via the table below, and `filing_date >= fraud_since`. |
 
-**Program → agency** (fraud_cases have no agency field):
+**Program → agency** (fallback when `agency` is null):
 
 | `agency_program` contains | Agency |
 |---------------------------|--------|
@@ -397,11 +402,14 @@ Definitions:
 | EIDL | Small Business Administration |
 | Shuttered Venue | Small Business Administration |
 | Restaurant Revitalization | Small Business Administration |
+| Medicaid / Medicare / Health Care Fraud / Provider Relief | Department of Health and Human Services |
+| Child Nutrition / SNAP / WIC | Department of Agriculture |
 | Pandemic Unemployment / PUA / FPUC / Unemployment Insurance | Department of Labor |
 | Employee Retention Credit / ERC | Department of the Treasury |
 | COVID Rental Assistance | Department of the Treasury / Treasury ERA (label: `Department of the Treasury`) |
-| Provider Relief | Department of Health and Human Services |
 | Economic Impact Payments | Department of the Treasury |
+| TRICARE | Department of Defense |
+| VA Health / CHAMPVA | Department of Veterans Affairs |
 
 If `:agency` matches none of the aliases, return `404`
 `{ "ok": false, "error": "unknown agency" }`.

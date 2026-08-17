@@ -1,6 +1,26 @@
 {
   "listings": [
     {
+      "url": "https://www.justice.gov/criminal/criminal-fraud/health-care-fraud-unit/2026-national-hcf-case-summaries",
+      "kind": "national_hcf",
+      "announcement_date": "2026-06-23"
+    },
+    {
+      "url": "https://www.justice.gov/criminal/criminal-fraud/health-care-fraud-unit/2025-national-hcf-case-summaries",
+      "kind": "national_hcf",
+      "announcement_date": "2025-06-30"
+    },
+    {
+      "url": "https://www.justice.gov/criminal/criminal-fraud/health-care-fraud-unit/2024-national-hcf-case-summaries",
+      "kind": "national_hcf",
+      "announcement_date": "2024-06-27"
+    },
+    {
+      "url": "https://www.justice.gov/criminal/criminal-fraud/health-care-fraud-unit/2023-national-hcf-case-summaries",
+      "kind": "national_hcf",
+      "announcement_date": "2023-06-28"
+    },
+    {
       "url": "https://www.justice.gov/criminal/criminal-fraud/health-care-fraud-unit/2026-minnesota-hcf-case-summaries",
       "kind": "hcf_summaries",
       "announcement_date": "2026-05-21"

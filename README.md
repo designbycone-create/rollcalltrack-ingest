@@ -675,15 +675,27 @@ PPP/UI spending files, not case lists. Official source is PRAC’s
 listing (`/oversight/reports?f[0]=report_type_taxonomy:85`), which links to
 DOJ press releases. `/search/` is robots-disallowed and is not used.
 
-`POST /hcgi/api/ingest/spending/fraud-cases` is **not deployed** (live 404).
-See `docs/HORIZONS_FRAUD_CASES.md`.
+`POST /hcgi/api/ingest/spending/fraud-cases` is live. See
+`docs/HORIZONS_FRAUD_CASES.md` for the 50-state / agency contract.
+
+A second job, `python -m ingest.doj_fraud`, pulls DOJ Criminal Division
+national Health Care Fraud takedown summaries (2023–2026), the Minnesota
+HCF page, and the public DOJ news RSS. USAO district listing pages are
+bot-walled and are not scraped.
+
+Each posted row is tagged with `state_code` (venue) and `agency` (victim
+federal agency: HHS, SBA, DOL, USDA, VA, DOD, Treasury, …). Some states
+will have zero tagged cases until a federal write-up names them — we do
+not invent rows.
 
 ### What it captures
 
 | Field | Source |
 |-------|--------|
 | `case_title` | Listing title |
-| `agency_program` | Mapped only if title/body names a known pandemic program |
+| `agency_program` | Mapped only if title/body names a known federal program |
+| `agency` | Victim agency from the program / text (not DOJ-as-prosecutor) |
+| `state_code` | USAO district, “District of X”, or a single residence state |
 | `defendant_type` | `individual` / `company` / `multiple` from explicit wording |
 | `amount_alleged` | Unhedged explicit `$X` / `$X million` only |
 | `status` | `charged` / `convicted` / `settled` / `ongoing` from wording |
@@ -716,7 +728,9 @@ a domain if it is a primary PRAC/DOJ/court record, never a recap site.
 
 ```bash
 python -m ingest.prac --days-back 14 --max-records 10          # dry-run (default)
-python -m ingest.prac --days-back 14 --max-records 10 --post   # write (after Horizons exists)
+python -m ingest.prac --days-back 14 --max-records 10 --post   # write
+python -m ingest.doj_fraud --days-back 400                     # dry-run national HCF + RSS
+python -m ingest.doj_fraud --days-back 400 --post              # write
 python -m ingest.main --source prac --days-back 14             # always dry-run
 ```
 
@@ -738,6 +752,8 @@ cron held). Dispatch `dry_run` defaults to true.
     {
       "case_title": "Dallas-Based Bus Companies Settle PPP Lawsuit for $3.9 Million",
       "agency_program": "Paycheck Protection Program (PPP)",
+      "agency": "Small Business Administration",
+      "state_code": "TX",
       "defendant_type": "company",
       "amount_alleged": 3900000.0,
       "status": "settled",

@@ -676,6 +676,15 @@ class HorizonsIngestClient:
                 "multiple",
             ):
                 raise ValueError("invalid defendant_type")
+            state = rec.get("state_code")
+            if state is not None and state != "":
+                if not (
+                    isinstance(state, str)
+                    and len(state) == 2
+                    and state.isalpha()
+                ):
+                    raise ValueError("state_code must be a 2-letter USPS code")
+                rec["state_code"] = state.upper()
         body = {"fraud_cases": records}
         logger.info("Submitting %d fraud cases", len(records))
         resp = self._post_ingest(

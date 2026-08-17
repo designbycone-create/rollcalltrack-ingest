@@ -27,7 +27,9 @@ from urllib3.util.retry import Retry
 from . import config
 from .ingest_client import get_client
 from .prac import (
+    extract_state_code,
     load_allowlist,
+    map_agency,
     map_program,
     map_status,
     parse_exact_amount,
@@ -40,8 +42,13 @@ SOURCES_PATH = Path(__file__).with_name("doj_fraud_sources.json")
 RSS_URL = "https://www.justice.gov/news/rss?type=press_release&m=1"
 HORIZONS_BATCH_SIZE = 25
 TITLE_FILTER = re.compile(
-    r"fraud|medicaid|feeding our future|child nutrition|"
-    r"unemployment|paycheck protection|\bppp\b|\beidl\b",
+    r"fraud|medicaid|medicare|feeding our future|child nutrition|"
+    r"unemployment|paycheck protection|\bppp\b|\beidl\b|"
+    r"\bsnap\b|\bwic\b|tricare|kickback|false claims|health care",
+    re.I,
+)
+DISTRICT_HINT = re.compile(
+    r"\bdistrict of\b|\b(?:northern|southern|eastern|western|middle|central)\s+district\b",
     re.I,
 )
 SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -89,12 +96,16 @@ def map_defendant_type(text: str) -> str | None:
     return None
 
 
+def _one_line(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
 def to_case(item: dict[str, Any], allowlist: list[str] | None = None) -> dict[str, Any]:
     allow = allowlist if allowlist is not None else load_allowlist()
     url = item.get("source_url") or ""
     title = item.get("case_title") or ""
     body = item.get("body") or ""
-    blob = f"{title}. {body}"
+    blob = _one_line(f"{title}. {body}")
     if not url or not source_allowed(url, allow):
         return {
             "_review": True,
@@ -126,6 +137,10 @@ def to_case(item: dict[str, Any], allowlist: list[str] | None = None) -> dict[st
     return {
         "case_title": title,
         "agency_program": program,
+        "agency": map_agency(program, blob),
+        "state_code": extract_state_code(
+            blob, url=url, venue_state=item.get("venue_state")
+        ),
         "defendant_type": defendant,
         "amount_alleged": parse_exact_amount(blob),
         "status": status,
@@ -161,6 +176,62 @@ def parse_hcf_summaries(
                 "filing_date": announcement_date,
             }
         )
+    return rows
+
+
+def parse_national_hcf_summaries(
+    html: str,
+    *,
+    page_url: str,
+    announcement_date: str,
+) -> list[dict[str, Any]]:
+    """District-grouped National HCF Takedown pages (not U.S. v. headings)."""
+    soup = BeautifulSoup(html, "lxml")
+    rows: list[dict[str, Any]] = []
+    seen_uls: set[int] = set()
+    for el in soup.find_all(["em", "h3", "h4", "p", "strong"]):
+        district = _one_line(el.get_text(" ", strip=True))
+        if not district or len(district) > 80 or not DISTRICT_HINT.search(district):
+            continue
+        venue = extract_state_code(district)
+        start = el.find_parent("p") if el.name == "em" else el
+        start = start or el
+        ul = None
+        for sib in start.next_siblings:
+            name = getattr(sib, "name", None)
+            if name == "ul":
+                ul = sib
+                break
+            if name in ("p", "h2", "h3", "h4"):
+                break
+        if ul is None or id(ul) in seen_uls:
+            continue
+        seen_uls.add(id(ul))
+        for li in ul.find_all("li", recursive=False):
+            body = _one_line(li.get_text(" ", strip=True))
+            if not body or len(body) < 40:
+                continue
+            strongs = [
+                s.get_text(" ", strip=True)
+                for s in li.find_all("strong")
+                if s.get_text(" ", strip=True)
+            ]
+            if strongs:
+                title = strongs[0].rstrip("., ")
+                if len(strongs) > 1 or re.search(r"\band\b", body[:180], re.I):
+                    if not title.lower().endswith("et al."):
+                        title = f"{title}, et al."
+            else:
+                title = body[:120]
+            rows.append(
+                {
+                    "case_title": title,
+                    "body": body,
+                    "source_url": f"{page_url.split('#')[0]}#{slug_id(title)}",
+                    "filing_date": announcement_date,
+                    "venue_state": venue,
+                }
+            )
     return rows
 
 
@@ -219,6 +290,12 @@ def run(
         if kind == "hcf_summaries":
             raw.extend(
                 parse_hcf_summaries(
+                    resp.text, page_url=url, announcement_date=announced
+                )
+            )
+        elif kind == "national_hcf":
+            raw.extend(
+                parse_national_hcf_summaries(
                     resp.text, page_url=url, announcement_date=announced
                 )
             )

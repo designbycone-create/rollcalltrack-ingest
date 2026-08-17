@@ -1,5 +1,6 @@
 from ingest.doj_fraud import (
     parse_hcf_summaries,
+    parse_national_hcf_summaries,
     parse_rss_items,
     slug_id,
     to_case,
@@ -49,6 +50,8 @@ def test_parse_hcf_summaries():
     first = to_case(rows[0])
     assert first.get("_review") is None
     assert first["agency_program"] == "Medicaid"
+    assert first["agency"] == "Department of Health and Human Services"
+    assert first["state_code"] == "MN"
     assert first["status"] == "charged"
     assert first["defendant_type"] == "multiple"
     assert first["filing_date"] == "2026-05-21"
@@ -56,7 +59,96 @@ def test_parse_hcf_summaries():
 
     second = to_case(rows[1])
     assert second["agency_program"] == "Federal Child Nutrition Program"
+    assert second["agency"] == "Department of Agriculture"
+    assert second["state_code"] == "MN"
     assert second["defendant_type"] == "individual"
+
+
+NATIONAL_HCF = """
+<main>
+  <p><em><strong>Middle District of Alabama</strong></em></p>
+  <ul>
+    <li><strong>New Life Center for Change, Inc</strong>.
+    <strong>d/b/a Teen University</strong>, located in Phenix City, Alabama,
+    and its owner, <strong>Alfonza Smith</strong>, reached a civil settlement
+    to pay $300,000.00 to resolve allegations that the company billed the
+    Alabama Medicaid Agency for services that never took place.</li>
+  </ul>
+  <p><em><strong>District of Arizona</strong></em></p>
+  <ul>
+    <li><strong>Susie Kamien</strong>, 55, of West Chester, Illinois, was
+    charged by information with conspiracy to commit health care fraud in
+    connection with submitting false claims to Medicare.</li>
+    <li><strong>Jimmy Muyumbu</strong>, 38, formerly of Glendale, Arizona,
+    was charged by indictment with health care fraud in connection with an
+    alleged scheme that billed Arizona Medicaid over $44 million.</li>
+  </ul>
+  <p><em><strong>District of Hawaii</strong></em></p>
+  <ul>
+    <li><strong>Henry Quan</strong>, 54, of Honolulu, Hawaii, was charged by
+    complaint with health care fraud in connection with a scheme to bill
+    Medicare for prescription drugs that were never dispensed.</li>
+  </ul>
+</main>
+"""
+
+
+def test_parse_national_hcf_covers_multiple_states():
+    rows = parse_national_hcf_summaries(
+        NATIONAL_HCF,
+        page_url="https://www.justice.gov/criminal/x-national",
+        announcement_date="2026-06-23",
+    )
+    assert len(rows) == 4
+    by_title = {r["case_title"]: r for r in rows}
+    assert by_title["New Life Center for Change, Inc, et al."]["venue_state"] == "AL"
+    assert by_title["Susie Kamien"]["venue_state"] == "AZ"
+    assert by_title["Henry Quan"]["venue_state"] == "HI"
+
+    alabama = to_case(rows[0])
+    assert alabama.get("_review") is None
+    assert alabama["state_code"] == "AL"
+    assert alabama["agency_program"] == "Medicaid"
+    assert alabama["agency"] == "Department of Health and Human Services"
+    assert alabama["status"] == "settled"
+    assert alabama["filing_date"] == "2026-06-23"
+
+    arizona = to_case(by_title["Susie Kamien"])
+    assert arizona["state_code"] == "AZ"
+    assert arizona["agency_program"] == "Medicare"
+    assert arizona["defendant_type"] == "individual"
+
+
+NATIONAL_HCF_H4 = """
+<main>
+  <h4><strong>District of Arizona</strong></h4>
+  <ul>
+    <li><strong>Farrukh Jarar Ali</strong>, 41, of Pakistan, was charged by
+    indictment with conspiracy to commit health care fraud in connection
+    with substance abuse clinics that billed Arizona Medicaid.</li>
+  </ul>
+  <h4><strong>District of Columbia</strong></h4>
+  <ul>
+    <li><strong>Jane Roe</strong>, of Washington, D.C., was charged by
+    information with health care fraud for false claims to Medicare.</li>
+  </ul>
+</main>
+"""
+
+
+def test_parse_national_hcf_h4_district_headers():
+    rows = parse_national_hcf_summaries(
+        NATIONAL_HCF_H4,
+        page_url="https://www.justice.gov/criminal/x-2025",
+        announcement_date="2025-06-30",
+    )
+    assert len(rows) == 2
+    assert rows[0]["venue_state"] == "AZ"
+    assert rows[1]["venue_state"] == "DC"
+    rec = to_case(rows[0])
+    assert rec.get("_review") is None
+    assert rec["state_code"] == "AZ"
+    assert rec["agency_program"] == "Medicaid"
 
 
 def test_rss_keeps_fraud_drops_unrelated():

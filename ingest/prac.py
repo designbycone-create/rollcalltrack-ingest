@@ -31,6 +31,7 @@ from urllib3.util.retry import Retry
 
 from . import config
 from .ingest_client import get_client
+from .names import STATE_CODES, STATE_NAME_TO_CODE, normalize_state
 
 logger = logging.getLogger("rollcalltrack_ingest.prac")
 
@@ -84,6 +85,198 @@ HEDGE_RE = re.compile(
     r"\b(over|more than|up to|nearly|approximately|about|at least|almost|upwards of)\s+\$",
     re.I,
 )
+
+# Longer / more specific phrases first. Last-resort "Health Care Fraud" is added
+# after the original pandemic list so named programs still win.
+PROGRAM_PATTERNS.extend(
+    [
+        (re.compile(r"\bmedicare\b|\bmedi-cal\b", re.I), "Medicare"),
+        (re.compile(r"\btricare\b", re.I), "TRICARE"),
+        (
+            re.compile(r"\bchampva\b|veterans community care|va health", re.I),
+            "VA Health Care",
+        ),
+        (
+            re.compile(
+                r"federal employee health|fehbp|\bfehb\b",
+                re.I,
+            ),
+            "Federal Employees Health Benefits",
+        ),
+        (
+            re.compile(
+                r"\bsnap\b|food stamps?|supplemental nutrition assistance",
+                re.I,
+            ),
+            "Supplemental Nutrition Assistance Program (SNAP)",
+        ),
+        (re.compile(r"\bwic\b", re.I), "WIC"),
+        (
+            re.compile(
+                r"social security disability|\bssdi\b|\bssi\b|social security",
+                re.I,
+            ),
+            "Social Security",
+        ),
+        (
+            re.compile(
+                r"workers.? compensation|\bowcp\b",
+                re.I,
+            ),
+            "Federal Workers' Compensation",
+        ),
+        (
+            re.compile(r"\bfema\b|disaster relief", re.I),
+            "FEMA Disaster Relief",
+        ),
+        (
+            re.compile(
+                r"pell grant|fafsa|student loan|department of education",
+                re.I,
+            ),
+            "Federal Student Aid",
+        ),
+        (
+            re.compile(r"section 8|\bhud\b|housing voucher", re.I),
+            "HUD Housing Programs",
+        ),
+        (
+            re.compile(
+                r"health[- ]care|healthcare|controlled substances?|"
+                r"false claims act",
+                re.I,
+            ),
+            "Health Care Fraud",
+        ),
+    ]
+)
+
+PROGRAM_TO_AGENCY: dict[str, str] = {
+    "Paycheck Protection Program (PPP)": "Small Business Administration",
+    "COVID-19 Economic Injury Disaster Loan (EIDL)": "Small Business Administration",
+    "Shuttered Venue Operators Grant": "Small Business Administration",
+    "Restaurant Revitalization Fund": "Small Business Administration",
+    "Medicaid": "Department of Health and Human Services",
+    "Medicare": "Department of Health and Human Services",
+    "Health Care Fraud": "Department of Health and Human Services",
+    "Provider Relief Fund": "Department of Health and Human Services",
+    "Federal Child Nutrition Program": "Department of Agriculture",
+    "Supplemental Nutrition Assistance Program (SNAP)": "Department of Agriculture",
+    "WIC": "Department of Agriculture",
+    "Unemployment Insurance": "Department of Labor",
+    "Federal Pandemic Unemployment Assistance": "Department of Labor",
+    "Federal Pandemic Unemployment Compensation": "Department of Labor",
+    "Federal Workers' Compensation": "Department of Labor",
+    "Employee Retention Credit": "Department of the Treasury",
+    "COVID Rental Assistance": "Department of the Treasury",
+    "Economic Impact Payments": "Department of the Treasury",
+    "VA Health Care": "Department of Veterans Affairs",
+    "TRICARE": "Department of Defense",
+    "Federal Employees Health Benefits": "Office of Personnel Management",
+    "Social Security": "Social Security Administration",
+    "FEMA Disaster Relief": "Department of Homeland Security",
+    "Federal Student Aid": "Department of Education",
+    "HUD Housing Programs": "Department of Housing and Urban Development",
+}
+
+AGENCY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"\bmedicare\b|\bmedicaid\b|\bmedi-cal\b|\bhhs\b", re.I),
+        "Department of Health and Human Services",
+    ),
+    (
+        re.compile(r"\bppp\b|paycheck protection|\beidl\b|\bsba\b", re.I),
+        "Small Business Administration",
+    ),
+    (
+        re.compile(
+            r"unemployment|\bdol\b|workers.? compensation|\bowcp\b",
+            re.I,
+        ),
+        "Department of Labor",
+    ),
+    (
+        re.compile(
+            r"\birs\b|employee retention|\berc\b|economic impact payment",
+            re.I,
+        ),
+        "Department of the Treasury",
+    ),
+    (
+        re.compile(
+            r"\bsnap\b|food stamps?|child nutrition|feeding our future|\bwic\b|\busda\b",
+            re.I,
+        ),
+        "Department of Agriculture",
+    ),
+    (
+        re.compile(r"\bva\b|veterans affairs|\bchampva\b", re.I),
+        "Department of Veterans Affairs",
+    ),
+    (
+        re.compile(r"\btricare\b|department of defense|\bdod\b", re.I),
+        "Department of Defense",
+    ),
+    (
+        re.compile(r"\bfema\b|\buscis\b|homeland security|\bdhs\b", re.I),
+        "Department of Homeland Security",
+    ),
+    (
+        re.compile(r"social security|\bssdi\b|\bssi\b", re.I),
+        "Social Security Administration",
+    ),
+    (
+        re.compile(r"\bhud\b|section 8|housing voucher", re.I),
+        "Department of Housing and Urban Development",
+    ),
+    (
+        re.compile(r"pell grant|fafsa|student loan|department of education", re.I),
+        "Department of Education",
+    ),
+    (
+        re.compile(r"federal employee health|\bfehbp\b|\bfehb\b|\bopm\b", re.I),
+        "Office of Personnel Management",
+    ),
+]
+
+USAO_RE = re.compile(r"/usao-([a-z]{2,6})(?:/|$)", re.I)
+USAO_PREFIXES = frozenset({"nd", "sd", "ed", "wd", "md", "cd"})
+USAO_SPECIAL = {"edt": "TN", "mdt": "TN", "wdt": "TN", "nmi": "MP", "mp": "MP"}
+DISTRICT_DIR_RE = re.compile(
+    r"\b(?:northern|southern|eastern|western|middle|central)\s+"
+    r"district\s+of\s+(?:the\s+)?([A-Za-z.]+(?:\s+[A-Za-z.]+){0,3})",
+    re.I,
+)
+DISTRICT_BARE_RE = re.compile(
+    r"\bdistrict\s+of\s+(?:the\s+)?([A-Za-z.]+(?:\s+[A-Za-z.]+){0,3})",
+    re.I,
+)
+# Longer names first so "New York" wins over "York", "West Virginia" over "Virginia".
+_STATE_NAME_HITS = sorted(STATE_NAME_TO_CODE.keys(), key=len, reverse=True)
+STATE_NAME_RE = re.compile(
+    r"\b(" + "|".join(re.escape(n) for n in _STATE_NAME_HITS) + r")\b",
+    re.I,
+)
+RESIDENCE_RE = re.compile(
+    r"\b(?:of|in)\s+[A-Z][A-Za-z.'\-\s]{0,40},\s+"
+    r"(" + "|".join(re.escape(n) for n in _STATE_NAME_HITS) + r")\b",
+    re.I,
+)
+COUNTRY_OF_GEORGIA_RE = re.compile(r"country of georgia", re.I)
+WASHINGTON_DC_RE = re.compile(
+    r"washington,\s*d\.?\s*c\.?|district of columbia",
+    re.I,
+)
+DISTRICT_NAME_ALIASES = {
+    "columbia": "DC",
+    "the virgin islands": "VI",
+    "virgin islands": "VI",
+    "puerto rico": "PR",
+    "guam": "GU",
+    "northern mariana islands": "MP",
+    "the northern mariana islands": "MP",
+    "american samoa": "AS",
+}
 
 STATUS_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(sentenced|convicted|pleads guilty|pleaded guilty|pled guilty|guilty plea)\b", re.I), "convicted"),
@@ -205,6 +398,92 @@ def map_defendant_type(text: str) -> str | None:
     return None
 
 
+def state_from_usao_slug(slug: str) -> str | None:
+    s = (slug or "").strip().lower()
+    if not s:
+        return None
+    if s in USAO_SPECIAL:
+        return USAO_SPECIAL[s]
+    if len(s) == 2:
+        return s.upper() if s.upper() in STATE_CODES else None
+    if len(s) == 4 and s[:2] in USAO_PREFIXES:
+        code = s[2:].upper()
+        return code if code in STATE_CODES else None
+    return None
+
+
+def _state_from_district_name(name: str) -> str | None:
+    key = re.sub(r"\s+", " ", (name or "").strip().lower()).rstrip(".")
+    if key in DISTRICT_NAME_ALIASES:
+        return DISTRICT_NAME_ALIASES[key]
+    return normalize_state(key)
+
+
+def extract_state_code(
+    text: str,
+    url: str | None = None,
+    venue_state: str | None = None,
+) -> str | None:
+    """Venue first (USAO / district), then a single residence state.
+
+    Returns None when the case is nationwide or the state is ambiguous.
+    """
+    pinned = normalize_state(venue_state)
+    if pinned:
+        return pinned
+    if url:
+        m = USAO_RE.search(url)
+        if m:
+            code = state_from_usao_slug(m.group(1))
+            if code:
+                return code
+    blob = text or ""
+    for pat in (DISTRICT_DIR_RE, DISTRICT_BARE_RE):
+        m = pat.search(blob)
+        if m:
+            code = _state_from_district_name(m.group(1))
+            if code:
+                return code
+    residences = [
+        normalize_state(m.group(1))
+        for m in RESIDENCE_RE.finditer(blob)
+        if normalize_state(m.group(1))
+    ]
+    unique_res = {c for c in residences if c}
+    if len(unique_res) == 1:
+        return next(iter(unique_res))
+    if COUNTRY_OF_GEORGIA_RE.search(blob):
+        blob = COUNTRY_OF_GEORGIA_RE.sub(" ", blob)
+    if WASHINGTON_DC_RE.search(blob):
+        hits = {"DC"}
+    else:
+        hits = set()
+    for m in STATE_NAME_RE.finditer(blob):
+        name = m.group(1).casefold()
+        if name == "washington":
+            continue
+        if name == "georgia" and COUNTRY_OF_GEORGIA_RE.search(text or ""):
+            continue
+        code = STATE_NAME_TO_CODE.get(name)
+        if code:
+            hits.add(code)
+    if WASHINGTON_DC_RE.search(text or ""):
+        hits.add("DC")
+    if len(hits) == 1:
+        return next(iter(hits))
+    return None
+
+
+def map_agency(program: str | None, text: str) -> str | None:
+    if program and program in PROGRAM_TO_AGENCY:
+        return PROGRAM_TO_AGENCY[program]
+    blob = text or ""
+    for pat, agency in AGENCY_PATTERNS:
+        if pat.search(blob):
+            return agency
+    return None
+
+
 def parse_listing(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     rows = []
@@ -245,7 +524,7 @@ def to_record(item: dict, allowlist: list[str]) -> dict:
     url = item.get("source_url") or ""
     title = item.get("case_title") or ""
     body = item.get("body") or ""
-    blob = f"{title}. {body}"
+    blob = re.sub(r"\s+", " ", f"{title}. {body}").strip()
 
     if not url:
         return {
@@ -291,6 +570,10 @@ def to_record(item: dict, allowlist: list[str]) -> dict:
     return {
         "case_title": title,
         "agency_program": program,
+        "agency": map_agency(program, blob),
+        "state_code": extract_state_code(
+            blob, url=url, venue_state=item.get("venue_state")
+        ),
         "defendant_type": defendant,
         "amount_alleged": parse_exact_amount(blob),
         "status": status,
