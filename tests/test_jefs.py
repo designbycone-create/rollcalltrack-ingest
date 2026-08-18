@@ -8,6 +8,7 @@ from ingest.jefs import (
     parse_amount_range,
     parse_annual_assets,
     parse_ptr_text,
+    register_form_payload,
     run,
     source_url_for,
 )
@@ -198,6 +199,28 @@ def test_build_payload_ptr():
     assert payload["_parse_ok"] is True
     assert len(payload["transactions"]) == 3
     assert payload["annual_assets"] == []
+
+
+def test_register_form_payload_matches_live_jefs_form():
+    ident = {
+        "first_name": "Ada",
+        "last_name": "Lovelace",
+        "occupation": "Analyst",
+        "email": "ada@example.com",
+        "address-line-1": "10 Test Street",
+        "address-city": "Mobile",
+        "address-state": "Alabama",
+        "address-postalcode": "36602",
+        "representing": "self",
+        "address-country": "United States",
+    }
+    payload = register_form_payload("csrf-token", ident)
+    assert payload["action"] == "register"
+    assert payload["certified"] == "on"
+    assert payload["_csrf"] == "csrf-token"
+    assert payload["first_name"] == "Ada"
+    assert payload["address-state"] == "Alabama"
+    assert "address-country" not in payload
 
 
 if __name__ == "__main__":

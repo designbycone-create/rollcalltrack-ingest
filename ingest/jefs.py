@@ -47,7 +47,7 @@ from .fjc import download_csv as download_fjc_csv
 from .fjc import map_row as map_fjc_row
 from .fjc import parse_csv as parse_fjc_csv
 from .ingest_client import get_client
-from .names import parse_filer_name
+from .names import STATE_CODES, normalize_state, parse_filer_name
 
 logger = logging.getLogger("rollcalltrack_ingest.jefs")
 
@@ -211,6 +211,8 @@ def jefs_identity_from_env() -> dict[str, str] | None:
     representing = os.environ.get("JEFS_REPRESENTING", "").strip() or "self"
     if not all([first, last, occupation, addr1, city, state, postal]):
         return None
+    code = normalize_state(state)
+    state_out = STATE_CODES[code].title() if code and code in STATE_CODES else state
     return {
         "first_name": first,
         "last_name": last,
@@ -220,13 +222,41 @@ def jefs_identity_from_env() -> dict[str, str] | None:
         "address-line-1": addr1,
         "address-line-2": os.environ.get("JEFS_ADDRESS2", "").strip(),
         "address-city": city,
-        "address-state": state,
+        "address-state": state_out,
         "address-postalcode": postal,
-        "address-country": os.environ.get("JEFS_COUNTRY", "").strip()
-        or "United States",
         "representing": representing,
         "representing-address": os.environ.get("JEFS_REPRESENTING_ADDRESS", "").strip(),
     }
+
+
+# Live JEFS #registration-form names only. Extra keys (e.g. address-country)
+# make the server return {status: 0, message: "Issues in registration"}.
+REGISTER_FIELD_NAMES = (
+    "first_name",
+    "last_name",
+    "occupation",
+    "email",
+    "phone",
+    "address-line-1",
+    "address-line-2",
+    "address-city",
+    "address-state",
+    "address-postalcode",
+    "representing",
+    "representing-address",
+)
+
+
+def register_form_payload(csrf: str, identity: dict[str, str]) -> dict[str, str]:
+    payload = {
+        "action": "register",
+        "_csrf": csrf,
+        "phone_validated": "0",
+        "certified": "on",
+    }
+    for key in REGISTER_FIELD_NAMES:
+        payload[key] = identity.get(key, "") or ""
+    return payload
 
 
 def register(session: requests.Session, identity: dict[str, str]) -> None:
@@ -235,13 +265,7 @@ def register(session: requests.Session, identity: dict[str, str]) -> None:
     csrf_m = re.search(r'name="_csrf"\s+value="([^"]+)"', home.text)
     if not csrf_m:
         raise RuntimeError("JEFS registration page missing _csrf — form may have changed")
-    payload = {
-        "action": "register",
-        "_csrf": csrf_m.group(1),
-        "phone_validated": "0",
-        "certified": "1",
-        **identity,
-    }
+    payload = register_form_payload(csrf_m.group(1), identity)
     resp = session.post(
         JEFS_INDEX,
         data=payload,
