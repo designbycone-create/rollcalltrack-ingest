@@ -4,6 +4,7 @@ from ingest.jefs import (
     build_payload,
     court_compatible,
     iso_date,
+    load_judges,
     map_filing_type,
     map_txn_type,
     match_judge,
@@ -222,6 +223,18 @@ def test_build_payload_ptr():
     assert payload["_parse_ok"] is True
     assert len(payload["transactions"]) == 3
     assert payload["annual_assets"] == []
+
+
+def test_load_judges_pages_horizons_roster():
+    class _Client:
+        configured = True
+
+        def fetch_judicial_judges(self):
+            return ROSTER
+
+    loaded = load_judges(client=_Client())
+    assert len(loaded) == len(ROSTER)
+    assert loaded[0]["judge_id"] == "1377101"
 
 
 def test_register_form_payload_matches_live_jefs_form():

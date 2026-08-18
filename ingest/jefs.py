@@ -296,7 +296,7 @@ def search_page(
     q: str = "",
     facets: dict | None = None,
     start: int = 0,
-    sort_by: str = "f.published_dt",
+    sort_by: str = "f.ao_certified_dt",
     sort_dir: str = "DESC",
 ) -> dict:
     payload = {
@@ -462,16 +462,13 @@ def load_judges(
             hz = None
     if hz is not None and getattr(hz, "configured", False):
         try:
-            resp = hz._get("/hcgi/api/judicial/judges")
-            if resp.status_code == 200:
-                body = resp.json()
-                roster = body.get("judges") or body.get("items") or []
+            roster = hz.fetch_judicial_judges()
+            if roster:
                 logger.info("Loaded %d judges from Horizons", len(roster))
             else:
                 logger.info(
-                    "Horizons GET /hcgi/api/judicial/judges HTTP %s — "
-                    "falling back to FJC CSV",
-                    resp.status_code,
+                    "Horizons GET /hcgi/api/judicial/judges returned 0 — "
+                    "falling back to FJC CSV"
                 )
         except Exception as e:
             logger.info("Horizons judges read failed (%s) — falling back to FJC CSV", e)
