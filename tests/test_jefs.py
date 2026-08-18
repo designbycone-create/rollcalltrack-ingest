@@ -1,7 +1,9 @@
 """Offline tests for AO / JEFS judicial disclosure mapping."""
 from ingest.jefs import (
+    _normalize_search_row,
     build_payload,
     court_compatible,
+    iso_date,
     map_filing_type,
     map_txn_type,
     match_judge,
@@ -65,6 +67,27 @@ Apple Inc. common stock A K $15,001 - $50,000
 Brokerage cash account J
 Part VIII. Additional Information
 """
+
+
+def test_iso_date_parses_jefs_space_comma():
+    assert iso_date("07 30, 2026") == "2026-07-30"
+    assert iso_date("2026-07-30T12:00:00") == "2026-07-30"
+    assert iso_date("07/30/2026") == "2026-07-30"
+
+
+def test_normalize_search_row_uses_ao_certified_dt():
+    rec = _normalize_search_row(
+        {
+            "id": "abc-1",
+            "name_s": "Doe, Jane",
+            "court_type_s": "U.S. District Court - Alaska",
+            "report_type_s": "Periodic Transaction Report",
+            "ao_certified_dt": "07 30, 2026",
+            "operating_year_s": "2026",
+        }
+    )
+    assert rec["filing_date"] == "2026-07-30"
+    assert rec["filing_type"] == "periodic_transaction"
 
 
 def test_source_url_carries_jefs_id():

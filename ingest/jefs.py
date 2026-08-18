@@ -139,7 +139,16 @@ def iso_date(value: Any) -> str | None:
         return None
     if "T" in s:
         s = s.split("T", 1)[0]
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%Y/%m/%d"):
+    for fmt in (
+        "%Y-%m-%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%m/%d/%y",
+        "%Y/%m/%d",
+        "%m %d, %Y",
+        "%b %d, %Y",
+        "%B %d, %Y",
+    ):
         try:
             return datetime.strptime(s, fmt).date().isoformat()
         except ValueError:
