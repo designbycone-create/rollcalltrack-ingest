@@ -54,6 +54,7 @@ jobs:
           JEFS_ZIP: ${{ secrets.JEFS_ZIP }}
           JEFS_EMAIL: ${{ secrets.JEFS_EMAIL }}
           JEFS_REPRESENTING: ${{ secrets.JEFS_REPRESENTING }}
+          JEFS_REPRESENTING_ADDRESS: ${{ secrets.JEFS_REPRESENTING_ADDRESS }}
           JEFS_SESSION: ${{ secrets.JEFS_SESSION }}
         run: |
           DRY="${{ github.event.inputs.dry_run }}"
