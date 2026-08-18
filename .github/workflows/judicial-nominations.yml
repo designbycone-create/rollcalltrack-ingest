@@ -54,7 +54,7 @@ jobs:
           if [ -n "$CG" ]; then
             CMD+=(--congress "$CG")
           fi
-          if [ "${DRY}" != "false" ]; then
+          if [ "${{ github.event_name }}" != "schedule" ] && [ "${DRY}" != "false" ]; then
             CMD+=(--dry-run)
           fi
           if [ -n "$MAX" ]; then

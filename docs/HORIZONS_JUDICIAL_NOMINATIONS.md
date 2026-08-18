@@ -1,7 +1,8 @@
 # Horizons: `/hcgi/api/ingest/judicial/nominations`
 
 Live `POST https://rollcalltrack.com/hcgi/api/ingest/judicial/nominations`
-returns `404 {"error":"Route not found"}` as of 2026-08-14.
+returns 200 as of 2026-08-18. Public `GET /hcgi/api/judicial/nominations`
+exists (was empty until the first POST).
 
 This job links a Congress.gov PN to an FJC `judge_id` and, when the
 confirmation was a recorded roll call, to an existing Senate vote id

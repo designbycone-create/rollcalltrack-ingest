@@ -113,8 +113,27 @@ def test_current_congress_jan3_boundary():
 
 def test_judicial_filter_excludes_doj():
     assert is_judicial(POZOS["description"])
+    assert is_judicial("The Judiciary")
+    assert is_judicial("to be United States Magistrate Judge for the District of Alaska")
     assert not is_judicial(US_ATTORNEY["description"])
     assert not is_judicial("to be Judge Advocate General of the Navy")
+
+
+def test_organization_judiciary_is_not_skipped():
+    item = {
+        "congress": 119,
+        "number": 50,
+        "citation": "PN50",
+        "description": "",
+        "organization": "The Judiciary",
+        "latestAction": {
+            "actionDate": "2026-07-01",
+            "text": "Confirmed by the Senate by Voice Vote.",
+        },
+    }
+    rec = map_nomination(item, [item["latestAction"]], ROSTER, {})
+    assert rec.get("_skip") is not True
+    assert rec.get("reason") != "not_judicial"
 
 
 def test_parse_nominee_district_and_scotus():

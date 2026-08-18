@@ -50,7 +50,7 @@ JUDICIAL_RE = re.compile(
     r"(?:to be|be an?)\s+"
     r"(?:an?\s+)?"
     r"(?:associate\s+justice|chief\s+justice|"
-    r"united\s+states\s+(?:district|circuit)\s+judge|"
+    r"united\s+states\s+(?:district|circuit|magistrate|bankruptcy)\s+judge|"
     r"judge\s+of\s+the\s+united\s+states\s+court\s+of|"
     r"united\s+states\s+circuit\s+judge|"
     r"united\s+states\s+district\s+judge)",
@@ -58,13 +58,14 @@ JUDICIAL_RE = re.compile(
 )
 # Fallback for "United States District Judge for the …" without "to be"
 JUDICIAL_TITLE_RE = re.compile(
-    r"united\s+states\s+(?:district|circuit)\s+judge|"
+    r"united\s+states\s+(?:district|circuit|magistrate|bankruptcy)\s+judge|"
     r"associate\s+justice\s+of\s+the\s+supreme\s+court|"
     r"chief\s+justice\s+of\s+the\s+united\s+states|"
     r"judge\s+of\s+the\s+united\s+states\s+court\s+of\s+"
     r"(?:international\s+trade|federal\s+claims|appeals)",
     re.I,
 )
+JUDICIARY_ORG_RE = re.compile(r"^the\s+judiciary$", re.I)
 JUDGE_ADVOCATE_RE = re.compile(r"judge\s+advocate", re.I)
 
 NAME_RE = re.compile(
@@ -120,6 +121,8 @@ def is_judicial(text: str | None) -> bool:
     blob = text or ""
     if JUDGE_ADVOCATE_RE.search(blob):
         return False
+    if JUDICIARY_ORG_RE.search(blob.strip()):
+        return True
     return bool(JUDICIAL_RE.search(blob) or JUDICIAL_TITLE_RE.search(blob))
 
 
@@ -215,7 +218,9 @@ def list_nominations(
     max_records: int | None = None,
 ) -> list[dict]:
     extra: dict[str, Any] = {"limit": LIST_LIMIT, "sort": "updateDate+desc"}
-    if since:
+    # A long window means "this congress", not "updated in the last N days".
+    # Congress.gov fromDateTime filters updateDate and drops older confirmations.
+    if since and (date.today() - since).days < 360:
         extra["fromDateTime"] = f"{since.isoformat()}T00:00:00Z"
     out: list[dict] = []
     offset = 0
@@ -451,9 +456,23 @@ def run(
         else:
             actions = []
 
+        if session is not None and number is not None and not (item.get("description") or "").strip():
+            try:
+                detail = fetch_detail(session, congress, number)
+                if detail.get("description"):
+                    item = {**item, "description": detail["description"]}
+                if detail.get("organization") and not item.get("organization"):
+                    item = {**item, "organization": detail["organization"]}
+                time.sleep(PAGE_DELAY_SECONDS)
+            except Exception as e:
+                logger.warning("detail fetch failed congress=%s number=%s: %s", congress, number, e)
+
         rec = map_nomination(item, actions, loaded, votes_by_pn)
         if rec.get("_skip"):
             skipped += 1
+            notes[f"skip_{rec.get('reason') or 'other'}"] = (
+                notes.get(f"skip_{rec.get('reason') or 'other'}", 0) + 1
+            )
             continue
         if rec.get("_review"):
             review.append(rec)
