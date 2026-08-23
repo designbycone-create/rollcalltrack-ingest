@@ -326,6 +326,26 @@ class HorizonsIngestClient:
             return {"ok": False, "error": "route_not_found", "written": 0}
         if resp.status_code not in (200, 201):
             logger.error("Bills ingest HTTP %s: %s", resp.status_code, str(data)[:500])
+            if resp.status_code >= 500 and len(records) > 1:
+                written = 0
+                skipped = 0
+                for rec in records:
+                    try:
+                        self.submit_bills([rec])
+                        written += 1
+                    except Exception as e:
+                        skipped += 1
+                        logger.error(
+                            "bill %s skipped after batch 500: %s",
+                            rec.get("id"),
+                            e,
+                        )
+                return {
+                    "ok": skipped == 0,
+                    "written": written,
+                    "skipped": skipped,
+                    "partial": skipped > 0,
+                }
             resp.raise_for_status()
         return data
 

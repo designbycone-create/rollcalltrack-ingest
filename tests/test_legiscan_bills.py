@@ -79,6 +79,15 @@ def test_map_bill_uses_legiscan_url_and_state_fields():
     assert rec["congress"] == 2025
 
 
+def test_map_bill_clips_description_to_horizons_text_max():
+    # Live PocketBase 500s at 2048 chars ("Failed to create record").
+    long_desc = "x" * 3473
+    rec = map_bill(dict(BILL, description=long_desc), "IL")
+    assert len(rec["description"]) == 2000
+    assert rec["description"] == long_desc[:2000]
+    assert rec["id"] == "LS1898133"
+
+
 def test_map_vote_joins_on_people_id_not_name():
     rec = map_vote(ROLL, BILL["votes"][0], BILL, "DE")
     assert rec["source_url"].endswith("/1574346")

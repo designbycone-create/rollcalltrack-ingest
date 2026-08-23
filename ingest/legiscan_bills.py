@@ -38,6 +38,13 @@ from .legiscan import (
 logger = logging.getLogger("rollcalltrack_ingest.legiscan_bills")
 
 HORIZONS_BATCH_SIZE = 25
+# PocketBase bills.description (and other text fields) 500 at 2048 chars.
+HORIZONS_TEXT_MAX = 2000
+
+
+def clip_text(value: Any, max_len: int = HORIZONS_TEXT_MAX) -> str:
+    s = "" if value is None else str(value)
+    return s if len(s) <= max_len else s[:max_len]
 
 BILL_STATUS = {
     1: "Introduced",
@@ -144,13 +151,13 @@ def map_bill(bill: dict, state: str) -> dict:
         "congress": year,
         "bill_type": (bill.get("bill_type") or parse_bill_type(number)).strip() or parse_bill_type(number),
         "bill_number": number,
-        "title": (bill.get("title") or "").strip(),
+        "title": clip_text((bill.get("title") or "").strip()),
         "short_title": "",
         "legislation_status": BILL_STATUS.get(status) or "",
         "became_law": became,
-        "latest_action_text": last,
+        "latest_action_text": clip_text(last),
         "latest_action_date": last_date,
-        "description": (bill.get("description") or "").strip(),
+        "description": clip_text((bill.get("description") or "").strip()),
         "jurisdiction": "state",
         "state_code": state.upper(),
         "source_url": url,
@@ -202,10 +209,10 @@ def map_vote(roll: dict, stub: dict, bill: dict, state: str) -> dict:
         "session": str(year),
         "roll_number": str(rid),
         "bill_label": number,
-        "title": (roll.get("desc") or stub.get("desc") or "").strip(),
-        "description": (bill.get("title") or "").strip(),
+        "title": clip_text((roll.get("desc") or stub.get("desc") or "").strip()),
+        "description": clip_text((bill.get("title") or "").strip()),
         "result": "Passed" if passed else "Failed",
-        "vote_type": (roll.get("desc") or stub.get("desc") or "").strip(),
+        "vote_type": clip_text((roll.get("desc") or stub.get("desc") or "").strip()),
         "date": iso_date(roll.get("date") or stub.get("date")),
         "tally_yea": int((roll or stub).get("yea") or 0),
         "tally_nay": int((roll or stub).get("nay") or 0),
