@@ -519,6 +519,176 @@ class HorizonsIngestClient:
             resp.raise_for_status()
         return data
 
+    def submit_elections_jurisdictions(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/elections/jurisdictions."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url") or not rec.get("sos_portal_url"):
+                raise ValueError("source_url and sos_portal_url are required")
+            if rec.get("jurisdiction") not in ("federal", "state"):
+                raise ValueError("invalid jurisdiction")
+            if rec.get("jurisdiction") == "state" and not rec.get("state_code"):
+                raise ValueError("state_code required when jurisdiction=state")
+        body = {"jurisdictions": records}
+        logger.info("Submitting %d elections jurisdictions", len(records))
+        resp = self._post_ingest(
+            body, path="/hcgi/api/ingest/elections/jurisdictions"
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Elections jurisdictions HTTP %s: %s",
+                resp.status_code,
+                str(data)[:500],
+            )
+            if resp.status_code in (400, 500) and len(records) > 1:
+                written = 0
+                skipped = 0
+                for rec in records:
+                    try:
+                        self.submit_elections_jurisdictions([rec])
+                        written += 1
+                    except Exception as e:
+                        skipped += 1
+                        logger.error(
+                            "elections jurisdiction %s skipped: %s",
+                            rec.get("state_code") or rec.get("name"),
+                            e,
+                        )
+                return {
+                    "ok": skipped == 0,
+                    "written": written,
+                    "skipped": skipped,
+                    "partial": True,
+                }
+            resp.raise_for_status()
+        return data
+
+    def submit_elections_races(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/elections/races."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every race")
+            if not rec.get("slug") or not rec.get("office_name"):
+                raise ValueError("slug and office_name are required")
+            if rec.get("jurisdiction") not in ("federal", "state"):
+                raise ValueError("invalid jurisdiction")
+            if rec.get("jurisdiction") == "state" and not rec.get("state_code"):
+                raise ValueError("state_code required when jurisdiction=state")
+        body = {"races": records}
+        logger.info("Submitting %d elections races", len(records))
+        resp = self._post_ingest(body, path="/hcgi/api/ingest/elections/races")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Elections races HTTP %s: %s", resp.status_code, str(data)[:500]
+            )
+            if resp.status_code in (400, 500) and len(records) > 1:
+                written = 0
+                skipped = 0
+                for rec in records:
+                    try:
+                        self.submit_elections_races([rec])
+                        written += 1
+                    except Exception as e:
+                        skipped += 1
+                        logger.error("race %s skipped: %s", rec.get("slug"), e)
+                return {
+                    "ok": skipped == 0,
+                    "written": written,
+                    "skipped": skipped,
+                    "partial": True,
+                }
+            resp.raise_for_status()
+        return data
+
+    def submit_elections_candidates(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/elections/candidates."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every candidate")
+            if not rec.get("race_slug") or not rec.get("fec_candidate_id"):
+                raise ValueError("race_slug and fec_candidate_id are required")
+            if rec.get("party") not in ("D", "R", "I", "N", "O"):
+                raise ValueError("invalid party")
+        body = {"candidates": records}
+        logger.info("Submitting %d elections candidates", len(records))
+        resp = self._post_ingest(
+            body, path="/hcgi/api/ingest/elections/candidates"
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Elections candidates HTTP %s: %s",
+                resp.status_code,
+                str(data)[:500],
+            )
+            if resp.status_code in (400, 500) and len(records) > 1:
+                written = 0
+                skipped = 0
+                for rec in records:
+                    try:
+                        self.submit_elections_candidates([rec])
+                        written += 1
+                    except Exception as e:
+                        skipped += 1
+                        logger.error(
+                            "candidate %s skipped: %s",
+                            rec.get("fec_candidate_id"),
+                            e,
+                        )
+                return {
+                    "ok": skipped == 0,
+                    "written": written,
+                    "skipped": skipped,
+                    "partial": True,
+                }
+            resp.raise_for_status()
+        return data
+
+    def fetch_members(
+        self,
+        *,
+        jurisdiction: str | None = None,
+        page_size: int = 100,
+    ) -> list[dict]:
+        """Page through GET /hcgi/api/members."""
+        out: list[dict] = []
+        page = 1
+        while page <= 200:
+            params: dict[str, Any] = {"page": page, "limit": page_size}
+            if jurisdiction:
+                params["jurisdiction"] = jurisdiction
+            resp = self._get("/hcgi/api/members", params)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            rows = data.get("items") or data.get("members") or []
+            if not rows:
+                break
+            out.extend(rows)
+            total = data.get("total")
+            if total is not None and len(out) >= int(total):
+                break
+            if len(rows) < page_size:
+                break
+            page += 1
+        return out
+
     def submit_judicial_nominations(self, records: list[dict]) -> dict:
         """POST a batch to /hcgi/api/ingest/judicial/nominations."""
         if not records:
