@@ -442,6 +442,83 @@ class HorizonsIngestClient:
         )
         return data
 
+    def submit_public_records_offices(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/public-records/offices."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url"):
+                raise ValueError("source_url is required on every office")
+            if rec.get("jurisdiction") not in ("federal", "state"):
+                raise ValueError("invalid jurisdiction")
+            if rec.get("jurisdiction") == "state" and not rec.get("state_code"):
+                raise ValueError("state_code required when jurisdiction=state")
+            if not rec.get("slug") or not rec.get("office_name"):
+                raise ValueError("slug and office_name are required")
+        body = {"offices": records}
+        logger.info("Submitting %d public-records offices", len(records))
+        resp = self._post_ingest(
+            body, path="/hcgi/api/ingest/public-records/offices"
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Offices ingest HTTP %s: %s", resp.status_code, str(data)[:500]
+            )
+            if resp.status_code in (400, 500) and len(records) > 1:
+                written = 0
+                skipped = 0
+                for rec in records:
+                    try:
+                        self.submit_public_records_offices([rec])
+                        written += 1
+                    except Exception as e:
+                        skipped += 1
+                        logger.error(
+                            "office %s skipped: %s", rec.get("slug"), e
+                        )
+                return {
+                    "ok": skipped == 0,
+                    "written": written,
+                    "skipped": skipped,
+                    "partial": True,
+                }
+            resp.raise_for_status()
+        logger.info(
+            "Offices ingest OK written=%s", data.get("written") or data.get("count")
+        )
+        return data
+
+    def submit_public_records_jurisdictions(self, records: list[dict]) -> dict:
+        """POST a batch to /hcgi/api/ingest/public-records/jurisdictions."""
+        if not records:
+            return {"ok": True, "written": 0}
+        for rec in records:
+            if not rec.get("source_url") or not rec.get("portal_url"):
+                raise ValueError("source_url and portal_url are required")
+            if rec.get("jurisdiction") not in ("federal", "state"):
+                raise ValueError("invalid jurisdiction")
+            if rec.get("jurisdiction") == "state" and not rec.get("state_code"):
+                raise ValueError("state_code required when jurisdiction=state")
+        body = {"jurisdictions": records}
+        logger.info("Submitting %d public-records jurisdictions", len(records))
+        resp = self._post_ingest(
+            body, path="/hcgi/api/ingest/public-records/jurisdictions"
+        )
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text[:500]}
+        if resp.status_code not in (200, 201):
+            logger.error(
+                "Jurisdictions ingest HTTP %s: %s", resp.status_code, str(data)[:500]
+            )
+            resp.raise_for_status()
+        return data
+
     def submit_judicial_nominations(self, records: list[dict]) -> dict:
         """POST a batch to /hcgi/api/ingest/judicial/nominations."""
         if not records:

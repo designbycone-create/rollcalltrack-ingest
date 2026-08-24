@@ -54,6 +54,7 @@ POCKETBASE_ADMIN_PASSWORD = os.environ.get("POCKETBASE_ADMIN_PASSWORD")
 
 CONGRESS_GOV_API_KEY = os.environ.get("CONGRESS_GOV_API_KEY")
 LEGISCAN_API_KEY = os.environ.get("LEGISCAN_API_KEY")
+FOIA_GOV_API_KEY = os.environ.get("FOIA_GOV_API_KEY") or os.environ.get("FOIA_API_KEY") or ""
 
 HOUSE_BULK_ZIP_URL_TEMPLATE = (
     "https://disclosures-clerk.house.gov/public_disc/financial-pdfs/{year}FD.zip"
