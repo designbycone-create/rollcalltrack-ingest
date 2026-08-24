@@ -225,3 +225,47 @@ Nav already has Elections from prompt 2.
 
 SUCCESS: /elections/2026/tx is a real page (not the federal hub title), shows Texas voter-rule fields from the API when present, lists race links, a state senate slug shows incumbent + official SOS link and does not invent challengers.
 ```
+
+---
+
+## Prompt 5 — interactive US map (before ingest is fine)
+
+```
+Add an interactive United States map to the Elections product. Do not add new collections. Do not call Google Maps, Mapbox, MapTiler, Leaflet tile servers, or any geocoding API. No API keys.
+
+WHERE
+- /elections and /elections/2026: map is the primary way to pick a state, above or beside the existing Federal | State toggle content.
+- /elections/{cycle}/{state}: a smaller locator map that highlights the current state; other states remain clickable.
+Do not put a map on individual race pages in this prompt.
+
+SHAPE
+- 50 states only (no DC, territories, or county/CD fill). Alaska and Hawaii as insets, not to true scale.
+- Bundle a public-domain US states SVG or GeoJSON in the app. Each path/feature id = 2-letter USPS lowercase (tx, ca, …). Do not fetch the geometry from a third-party URL at runtime.
+- No congressional-district boundaries in this prompt (those wait for an official TIGER ingest).
+
+BEHAVIOR
+- Hover/focus: state name. After ingest, if GET /hcgi/api/elections/jurisdictions has that state, you may add general_date or a short sourced note. If the GET is empty, still show the name. Never invent deadlines, winners, or dollar amounts on the tooltip.
+- Click or keyboard activate: go to /elections/{cycle}/{st} where cycle is the cycle on the current page (default 2026). Same target in Federal and State toggle — the state hub already lists U.S. Senate, U.S. House, and state races.
+- Federal toggle: optional emphasis only — if GET /hcgi/api/elections/races?cycle={cycle}&jurisdiction=federal&office=us_senate returns rows, you may visually mark states with a Senate race this cycle (is_term_up true). If the GET is empty, all 50 states look equal. Do not color by party, poll, or unofficial result.
+- State toggle: optional mark states that have a jurisdiction row. Empty API → equal fill.
+- Keep the 50-state text index from prompt 2. The map is extra, not a replacement. Screen readers use the list; map paths have accessible names.
+
+STYLE
+- Match existing Roll Call Track chrome (type, borders, focus ring). One fill, one hover fill, one “current state” fill, one optional “has data / Senate up” fill. No rainbow choropleth.
+- Responsive: full width on mobile, tap targets large enough. Must work without mouse.
+- Do not block first paint on the elections GET; draw the map immediately, hydrate marks when the API returns.
+
+OUT OF SCOPE
+- Live results coloring
+- Address / ZIP lookup
+- “Find my district”
+- District-level shapes
+- Third-party map tiles
+
+SUCCESS
+1) /elections shows a 50-state map. Click Texas → /elections/2026/tx (or current cycle). Works when elections GET is empty.
+2) Keyboard: tab to Texas (via list or map) and activate; same navigation.
+3) No network calls to maps.googleapis.com, mapbox.com, or similar.
+4) /elections/2026/tx locator highlights Texas; clicking Oklahoma goes to /elections/2026/ok.
+5) Federal vs State toggle does not break the map. No party or winner colors.
+```

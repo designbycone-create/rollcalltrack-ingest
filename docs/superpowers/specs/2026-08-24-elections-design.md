@@ -228,5 +228,6 @@ Empty results copy: “Certified results appear here after the official source p
 2. Hub `/elections` + `/elections/2026` + nav  
 3. Federal race pages + candidate/money table  
 4. State hubs + district pages + voter-rule block + sitemap / canonicals / prerender  
+5. Interactive 50-state SVG/GeoJSON map on the hub and state hubs (no tile API; click → `/elections/{cycle}/{st}`). Congressional-district shapes are out of scope until an official TIGER ingest.
 
 Paste from `docs/HORIZONS_ELECTIONS.md`.
