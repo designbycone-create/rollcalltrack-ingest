@@ -74,12 +74,13 @@ def clean_transaction(txn: dict) -> dict:
         "transaction_type": _map_txn_type(txn.get("transaction_type")),
         "transaction_date": txn.get("transaction_date") or "",
         "amount_range_raw": txn.get("amount_range_raw") or "",
+        "ticker": (txn.get("ticker") or "").strip(),
         "ticker_confidence": _map_ticker_conf(txn.get("ticker_confidence")),
     }
+    if txn.get("line_index") is not None:
+        out["line_index"] = int(txn["line_index"])
     if txn.get("notification_date"):
         out["notification_date"] = txn["notification_date"]
-    if txn.get("ticker"):
-        out["ticker"] = txn["ticker"]
     if txn.get("asset_category"):
         out["asset_category"] = txn["asset_category"]
     if txn.get("amount_range_low") is not None:
@@ -1271,7 +1272,15 @@ class HorizonsIngestClient:
         if not filing.get("source_url"):
             raise ValueError("source_url is required on every filing")
 
-        txns = [clean_transaction(t) for t in (transactions or [])]
+        prepared: list[dict] = []
+        for i, txn in enumerate(transactions or []):
+            row = dict(txn)
+            # Keep parser-assigned positions. Fill any gap so the writer
+            # can tell identical trades apart.
+            if row.get("line_index") is None:
+                row["line_index"] = i
+            prepared.append(row)
+        txns = [clean_transaction(t) for t in prepared]
         filing_out = dict(filing)
         body = {
             "type": "filing",

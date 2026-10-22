@@ -97,6 +97,24 @@ python -m ingest.main --source senate --dry-run
 python -m ingest.main --source house --dry-run --days-back 60 --max-filings 10
 ```
 
+### Re-ingest one House filing
+
+Each parsed transaction has a `line_index`: its 0-based position in that
+filing. Identical trades (same asset, date, and amount) stay separate rows.
+Stored rows that were collapsed before this, or that have a null ticker, can
+be re-posted by House DocID. `--filing-id` ignores `--days-back` and
+`--max-filings`. Pass `--year` when the DocID is not in the current year.
+The flag is only valid with `--source house`.
+
+```bash
+python -m ingest.main --source house --filing-id 20035588
+python -m ingest.main --source house --filing-id 20035588 --year 2026
+```
+
+Kevin Hern's PTR `20035588` is the case this fixes: 24 transaction lines,
+including two identical Lockheed Martin partial sales (source lines 47 and
+51), of which only 23 were stored.
+
 ### Member matching
 
 Under Horizons API mode, member resolution hits

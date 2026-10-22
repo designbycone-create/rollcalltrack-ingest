@@ -256,6 +256,7 @@ def parse_filing_detail(session: requests.Session, url: str) -> dict:
                 "amount_range_raw": amount,
                 "filer_relation": _normalize_owner(owner),
                 "asset_category": asset_type or None,
+                "line_index": len(transactions),
             }
         )
 

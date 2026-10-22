@@ -220,19 +220,30 @@ def upsert_filing(conn: PocketBase, filing: dict) -> str:
 
 
 def upsert_transaction(conn: PocketBase, txn: dict) -> None:
-    """Insert transaction if not already present (natural key)."""
+    """Insert a transaction once per filing line.
+
+    The same asset, date, and amount can occur twice in one PTR. Those are
+    different trades. Identity is filing_id plus line_index (the transaction's
+    0-based position in the filing), not the trade description.
+    """
     filing_id = txn.get("filing_id")
     if not filing_id:
         raise ValueError("filing_id required")
+    if txn.get("line_index") is None:
+        raise ValueError("line_index required")
+    try:
+        line_index = int(txn["line_index"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("line_index must be an integer") from exc
+
     asset = txn.get("asset_name") or ""
     tdate = txn.get("transaction_date") or ""
     amount = txn.get("amount_range_raw") or ""
+    ticker = (txn.get("ticker") or "").strip()
 
     filt = (
         f'filing_id = "{_escape_filter(str(filing_id))}"'
-        f' && asset_name = "{_escape_filter(asset)}"'
-        f' && transaction_date = "{_escape_filter(tdate)}"'
-        f' && amount_range_raw = "{_escape_filter(amount)}"'
+        f" && line_index = {line_index}"
     )
     existing = conn.find_one("transactions", filt)
     if existing:
@@ -243,7 +254,7 @@ def upsert_transaction(conn: PocketBase, txn: dict) -> None:
         "member_id": txn.get("member_id") or "",
         "filer_relation": _map_filer_relation(txn.get("filer_relation")),
         "asset_name": asset,
-        "ticker": txn.get("ticker") or "",
+        "ticker": ticker,
         "ticker_confidence": _map_ticker_conf(txn.get("ticker_confidence")),
         "transaction_type": _map_txn_type(txn.get("transaction_type")),
         "transaction_date": tdate,
@@ -252,10 +263,15 @@ def upsert_transaction(conn: PocketBase, txn: dict) -> None:
         "amount_range_low": txn.get("amount_range_low"),
         "amount_range_high": txn.get("amount_range_high"),
         "asset_category": txn.get("asset_category") or "",
+        "line_index": line_index,
     }
     body = {k: v for k, v in body.items() if v is not None and v != ""}
-    # required filing_id always kept
+    # required keys always kept, including line 0
     body["filing_id"] = str(filing_id)
+    body["line_index"] = line_index
+    body["ticker_confidence"] = _map_ticker_conf(txn.get("ticker_confidence"))
+    if ticker:
+        body["ticker"] = ticker
     conn.create("transactions", body)
 
 

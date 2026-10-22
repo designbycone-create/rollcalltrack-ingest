@@ -423,6 +423,8 @@ def parse_ptr_transactions(pdf_text: str) -> list[dict]:
                 ).strip(),
                 "ticker": ticker,
                 "ticker_confidence": ticker_confidence,
+                # Position in this filing. Two identical trades stay distinct.
+                "line_index": len(transactions),
             }
         )
     return transactions
@@ -472,6 +474,7 @@ def run(
     max_filings: int | None = None,
     ptr_only: bool = True,
     client: HorizonsIngestClient | None = None,
+    filing_id: str | None = None,
 ) -> dict:
     """Ingest House filings.
 
@@ -482,6 +485,8 @@ def run(
     ptr_only: this pass only handles PTRs (FilingType P).
     client: Horizons HTTP client. Live runs require INGEST_API_KEY.
     conn: ignored. Direct PocketBase writes have been removed.
+    filing_id: House DocID to re-ingest by itself (for example 20035588).
+      Skips the date window, the PTR-only filter, and max_filings.
     """
     year = year or date.today().year
     found, parsed, failed = 0, 0, 0
@@ -509,33 +514,50 @@ def run(
             )
         return {"found": 0, "parsed": 0, "failed": 1, "error": "index fetch failed"}
 
-    if ptr_only:
-        index_records = [r for r in index_records if r.get("filing_type_code") == "P"]
+    if filing_id:
+        wanted = str(filing_id).strip()
+        index_records = [
+            r for r in index_records if str(r.get("doc_id") or "").strip() == wanted
+        ]
+        if not index_records:
+            logger.error(
+                "House filing id %s not found in the %s bulk index", wanted, year
+            )
+            return {
+                "found": 0,
+                "parsed": 0,
+                "failed": 1,
+                "error": "filing id not in index",
+            }
+        logger.info("Re-ingesting House filing id %s", wanted)
+    else:
+        if ptr_only:
+            index_records = [r for r in index_records if r.get("filing_type_code") == "P"]
 
-    if days_back is not None:
-        cutoff = date.today() - timedelta(days=days_back)
-        filtered = []
-        for r in index_records:
-            fd = _parse_filing_date(r.get("filing_date") or "")
-            if fd is None or fd >= cutoff:
-                filtered.append(r)
-        logger.info(
-            "House date filter days_back=%s: %d -> %d records",
-            days_back,
-            len(index_records),
-            len(filtered),
-        )
-        index_records = filtered
+        if days_back is not None:
+            cutoff = date.today() - timedelta(days=days_back)
+            filtered = []
+            for r in index_records:
+                fd = _parse_filing_date(r.get("filing_date") or "")
+                if fd is None or fd >= cutoff:
+                    filtered.append(r)
+            logger.info(
+                "House date filter days_back=%s: %d -> %d records",
+                days_back,
+                len(index_records),
+                len(filtered),
+            )
+            index_records = filtered
 
-    # Newest first so dry-run / capped runs hit recent filings
-    def _sort_key(r):
-        d = _parse_filing_date(r.get("filing_date") or "")
-        return d or date.min
+        # Newest first so dry-run / capped runs hit recent filings
+        def _sort_key(r):
+            d = _parse_filing_date(r.get("filing_date") or "")
+            return d or date.min
 
-    index_records.sort(key=_sort_key, reverse=True)
+        index_records.sort(key=_sort_key, reverse=True)
 
-    if max_filings is not None:
-        index_records = index_records[:max_filings]
+        if max_filings is not None:
+            index_records = index_records[:max_filings]
 
     found = len(index_records)
     logger.info("House filings to process: %d", found)
