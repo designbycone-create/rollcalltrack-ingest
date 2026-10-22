@@ -16,6 +16,8 @@ not Independent. Unknown letters go to manual_review.
 
 bioguide_id for state rows is ``LS{people_id}`` so it cannot collide
 with a congressional bioguide (those are letter + 6 digits).
+``submit_members`` refuses any other id. Same-name overlaps with Congress
+are reported by ``python -m ingest.member_audit`` and are not auto-deleted.
 """
 from __future__ import annotations
 
