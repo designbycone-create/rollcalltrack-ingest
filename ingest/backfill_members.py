@@ -4,6 +4,13 @@ Lists filings and transactions that are missing a member id or a party,
 resolves them (full name + full state, then last name + state, then
 bioguide), and writes through the existing disclosures ingest endpoint.
 
+The disclosures write replaces a filing's transactions. A live update
+therefore sends back every transaction listed for that filing, including
+``line_index``, ``ticker``, and ``ticker_confidence``. It does not POST
+when that list is empty. A bioguide is never sent as ``member_id`` (that
+value makes the writer return HTTP 500, and the retry stores the filing
+with no member link).
+
 Dry run is the default. It prints every planned change and does not POST.
 Pass ``--live`` to apply. Existing non-empty fields are left as they are.
 
@@ -15,6 +22,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 from collections import defaultdict
 
 from .ingest_client import get_client
@@ -22,6 +30,20 @@ from .ingest_client import get_client
 logger = logging.getLogger("rollcalltrack_ingest.backfill_members")
 
 _MEMBER_KEYS = ("member_id", "member_party", "bioguide_id")
+_BIOGUIDE_ID = re.compile(r"^[A-Z]\d{6}$")
+_FILL_IF_BLANK = (
+    "ticker",
+    "ticker_confidence",
+    "asset_name",
+    "transaction_type",
+    "transaction_date",
+    "amount_range_raw",
+    "notification_date",
+    "asset_category",
+    "filer_relation",
+    "member_id",
+    "member_party",
+)
 
 
 def _blank(value) -> bool:
@@ -40,8 +62,37 @@ def _bioguide(row: dict) -> str:
     return str(row.get("bioguide_id") or "").strip()
 
 
+def _is_bioguide_id(value, bioguide: str = "") -> bool:
+    """True when this string is a congressional bioguide, not a Horizons id."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if _BIOGUIDE_ID.fullmatch(text.upper()):
+        return True
+    known = str(bioguide or "").strip()
+    return bool(known) and text.upper() == known.upper()
+
+
+def _horizons_member_id(member: dict | None, bioguide: str = "") -> str:
+    """PocketBase id from a lookup row. A bioguide is not accepted."""
+    member = member or {}
+    known = str(bioguide or member.get("bioguide_id") or member.get("bioguide") or "").strip()
+    for key in ("id", "member_id"):
+        value = str(member.get(key) or "").strip()
+        if value and not _is_bioguide_id(value, known):
+            return value
+    return ""
+
+
+def _usable_member_id(row: dict, bioguide: str = "") -> str:
+    value = _member_id(row)
+    if _is_bioguide_id(value, bioguide):
+        return ""
+    return value
+
+
 def _needs_member(row: dict) -> bool:
-    return _blank(_member_id(row)) or _blank(_party(row))
+    return _blank(_usable_member_id(row)) or _blank(_party(row))
 
 
 def _filing_key(filing: dict) -> str:
@@ -53,20 +104,35 @@ def _emit(line: str) -> None:
     print(line)
 
 
+def _fill_missing(dest: dict, src: dict) -> None:
+    """Keep the first copy of a trade, and fill identity fields it lacks."""
+    for field in _FILL_IF_BLANK:
+        if _blank(dest.get(field)) and not _blank(src.get(field)):
+            dest[field] = src[field]
+    if dest.get("line_index") is None and src.get("line_index") is not None:
+        dest["line_index"] = src["line_index"]
+    for field in ("amount_range_low", "amount_range_high"):
+        if dest.get(field) is None and src.get(field) is not None:
+            dest[field] = src[field]
+
+
 def _group_transactions(filings: list[dict], transactions: list[dict]) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = defaultdict(list)
-    seen: set[tuple[str, str, str]] = set()
+    index: dict[tuple[str, str, str], dict] = {}
 
     def add(filing_id: str, txn: dict) -> None:
+        row = dict(txn)
         key = (
             filing_id,
-            str(txn.get("id") or ""),
-            str(txn.get("line_index")),
+            str(row.get("id") or ""),
+            str(row.get("line_index")),
         )
-        if key in seen:
+        existing = index.get(key)
+        if existing is not None:
+            _fill_missing(existing, row)
             return
-        seen.add(key)
-        grouped[filing_id].append(txn)
+        index[key] = row
+        grouped[filing_id].append(row)
 
     for txn in transactions:
         add(str(txn.get("filing_id") or "").strip(), txn)
@@ -81,9 +147,11 @@ def _group_transactions(filings: list[dict], transactions: list[dict]) -> dict[s
 
 def _resolved_values(filing: dict, resolved: dict | None) -> tuple[str, str, str]:
     member = resolved or {}
-    member_id = _member_id(filing) or str(member.get("id") or member.get("member_id") or "").strip()
+    bioguide = _bioguide(filing) or str(
+        member.get("bioguide_id") or member.get("bioguide") or ""
+    ).strip()
+    member_id = _usable_member_id(filing, bioguide) or _horizons_member_id(member, bioguide)
     party = _party(filing) or str(member.get("party") or member.get("member_party") or "").strip()
-    bioguide = _bioguide(filing) or str(member.get("bioguide_id") or "").strip()
     return member_id, party, bioguide
 
 
@@ -95,7 +163,10 @@ def _filing_updates(
     resolved: dict | None,
 ) -> dict:
     updates = {}
-    if _blank(_member_id(filing)) and member_id:
+    stored_id = _member_id(filing)
+    if member_id and stored_id != member_id and (
+        _blank(stored_id) or _is_bioguide_id(stored_id, bioguide)
+    ):
         updates["member_id"] = member_id
     if _blank(_party(filing)) and party:
         updates["member_party"] = party
@@ -108,6 +179,13 @@ def _filing_updates(
     if _blank(filing.get("member_state")) and str(member.get("state") or "").strip():
         updates["member_state"] = str(member["state"]).strip()
     return updates
+
+
+def _drop_bioguide_member_id(row: dict, bioguide: str) -> dict:
+    cleaned = dict(row)
+    if _is_bioguide_id(_member_id(cleaned), bioguide):
+        cleaned.pop("member_id", None)
+    return cleaned
 
 
 def _without_blanks(row: dict, keys: tuple[str, ...]) -> dict:
@@ -153,7 +231,7 @@ def run(client, live: bool = False) -> dict:
             continue
 
         resolved = None
-        if _blank(_member_id(filing)) or _blank(_party(filing)):
+        if _blank(_usable_member_id(filing)) or _blank(_party(filing)):
             resolved = client.lookup_member_by_name(
                 filing.get("member_name") or filing.get("name") or "",
                 state=filing.get("member_state") or filing.get("state"),
@@ -167,7 +245,10 @@ def run(client, live: bool = False) -> dict:
         txn_updates = []
         for txn in rows:
             updates = {}
-            if _blank(_member_id(txn)) and member_id:
+            stored_id = _member_id(txn)
+            if member_id and stored_id != member_id and (
+                _blank(stored_id) or _is_bioguide_id(stored_id, bioguide)
+            ):
                 updates["member_id"] = member_id
             if _blank(_party(txn)) and party:
                 updates["member_party"] = party
@@ -201,17 +282,35 @@ def run(client, live: bool = False) -> dict:
                     f"backfill transaction {identity} {field}: {txn.get(field)!r} -> {new!r}"
                 )
 
-        payload = _without_blanks({**filing, **filing_updates}, _MEMBER_KEYS)
+        if _is_bioguide_id(_member_id(filing), bioguide) and "member_id" not in filing_updates:
+            _emit(
+                f"backfill filing {filing_id} member_id: {_member_id(filing)!r} -> omitted"
+                " bioguide is not a member_id"
+            )
+        payload = _drop_bioguide_member_id(
+            _without_blanks({**filing, **filing_updates}, _MEMBER_KEYS),
+            bioguide,
+        )
         payload_txns = []
         for txn, updates in zip(rows, txn_updates):
+            if _is_bioguide_id(_member_id(txn), bioguide) and "member_id" not in updates:
+                _emit(
+                    f"backfill transaction filing={filing_id} line={txn.get('line_index')} "
+                    f"member_id: {_member_id(txn)!r} -> omitted bioguide is not a member_id"
+                )
             payload_txns.append(
-                _without_blanks({**txn, **updates}, ("member_id", "member_party"))
+                _drop_bioguide_member_id(
+                    _without_blanks({**txn, **updates}, ("member_id", "member_party")),
+                    bioguide,
+                )
             )
         if not payload_txns:
+            unresolved += 1
             _emit(
-                f"backfill filing {filing_id} lists no transactions; "
-                "the write replaces child rows with this list"
+                f"backfill filing {filing_id} not posted: no transactions listed; "
+                "the write replaces child rows and would drop trades"
             )
+            continue
         if not live:
             continue
         client.submit_filing(

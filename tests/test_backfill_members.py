@@ -1,5 +1,20 @@
 """Backfill member_id and party on filings already stored in Horizons."""
 from ingest.backfill_members import run
+from ingest.ingest_client import HorizonsIngestClient
+
+
+class _Resp:
+    def __init__(self, status, data):
+        self.status_code = status
+        self._data = data
+        self.text = str(data)
+
+    def json(self):
+        return self._data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(self.status_code)
 
 
 def _filing(**overrides):
@@ -136,6 +151,217 @@ def test_unresolved_rows_are_not_posted_or_blanked(capsys):
     assert original["member_id"] == ""
     assert original["member_party"] == ""
     assert "unresolved" in capsys.readouterr().out.lower()
+
+
+def test_live_post_resends_every_trade_with_identity_fields(monkeypatch):
+    """The disclosures write replaces transactions, so every stored trade goes back."""
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    listed = [
+        _txn(
+            id="t0",
+            line_index=0,
+            ticker="",
+            ticker_confidence="",
+            member_id="",
+            member_party="",
+        ),
+        _txn(
+            id="t1",
+            line_index=1,
+            ticker="MSFT",
+            ticker_confidence="high",
+            asset_name="Microsoft Corp. (MSFT)",
+            member_id="61kvydvhn8votlk",
+            member_party="R",
+        ),
+    ]
+    filing = _filing(
+        transactions=[
+            _txn(id="t0", line_index=0, ticker="AAPL", ticker_confidence="medium"),
+            _txn(
+                id="t2",
+                line_index=2,
+                ticker="",
+                ticker_confidence="none",
+                asset_name="U.S. Treasury Bill",
+            ),
+        ]
+    )
+    posted = {}
+
+    def fake_post(body, path="/hcgi/api/ingest/disclosures"):
+        posted["body"] = body
+        return _Resp(200, {"filing_id": "f1", "transactions_written": 3, "updated": True})
+
+    monkeypatch.setattr(hz, "_post_ingest", fake_post)
+    monkeypatch.setattr(hz, "list_disclosure_filings", lambda: [filing])
+    monkeypatch.setattr(hz, "list_disclosure_transactions", lambda: listed)
+    monkeypatch.setattr(
+        hz,
+        "lookup_member_by_name",
+        lambda *a, **k: {
+            "id": "61kvydvhn8votlk",
+            "bioguide_id": "T000490",
+            "name": "David Taylor",
+            "party": "R",
+            "state": "Ohio",
+        },
+    )
+
+    result = run(client=hz, live=True)
+    assert result["dry_run"] is False
+    payload = posted["body"]["payload"]
+    assert payload["filing"]["member_id"] == "61kvydvhn8votlk"
+    rows = payload["transactions"]
+    assert [row["line_index"] for row in rows] == [0, 1, 2]
+    by_line = {row["line_index"]: row for row in rows}
+    assert by_line[0]["ticker"] == "AAPL"
+    assert by_line[0]["ticker_confidence"] == "medium"
+    assert by_line[0]["member_id"] == "61kvydvhn8votlk"
+    assert by_line[1]["ticker"] == "MSFT"
+    assert by_line[1]["ticker_confidence"] == "high"
+    assert by_line[1]["member_id"] == "61kvydvhn8votlk"
+    assert by_line[2]["ticker"] == ""
+    assert by_line[2]["ticker_confidence"] == "none"
+    assert by_line[2]["asset_name"] == "U.S. Treasury Bill"
+    assert by_line[2]["member_id"] == "61kvydvhn8votlk"
+
+
+def test_live_post_never_sends_a_bioguide_as_member_id(monkeypatch):
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    trades = [
+        _txn(
+            id="t0",
+            line_index=0,
+            ticker="AAPL",
+            ticker_confidence="medium",
+            member_id="T000490",
+        ),
+        _txn(
+            id="t1",
+            line_index=1,
+            ticker="MSFT",
+            ticker_confidence="high",
+            asset_name="Microsoft Corp. (MSFT)",
+            member_id="61kvydvhn8votlk",
+            member_party="R",
+        ),
+        _txn(
+            id="t2",
+            line_index=2,
+            ticker="GOOGL",
+            ticker_confidence="low",
+            asset_name="Alphabet Inc. (GOOGL)",
+            member_id="",
+        ),
+    ]
+    posted = {}
+
+    def fake_post(body, path="/hcgi/api/ingest/disclosures"):
+        posted["body"] = body
+        return _Resp(200, {"filing_id": "f1", "transactions_written": 3, "updated": True})
+
+    monkeypatch.setattr(hz, "_post_ingest", fake_post)
+    monkeypatch.setattr(
+        hz,
+        "list_disclosure_filings",
+        lambda: [_filing(member_id="T000490", transactions=trades)],
+    )
+    monkeypatch.setattr(hz, "list_disclosure_transactions", lambda: trades)
+    monkeypatch.setattr(
+        hz,
+        "lookup_member_by_name",
+        lambda *a, **k: {
+            "id": "T000490",
+            "member_id": "T000490",
+            "bioguide_id": "T000490",
+            "name": "David Taylor",
+            "party": "R",
+            "state": "Ohio",
+        },
+    )
+
+    run(client=hz, live=True)
+    payload = posted["body"]["payload"]
+    filing = payload["filing"]
+    assert "member_id" not in filing
+    assert filing["bioguide_id"] == "T000490"
+    assert filing["member_party"] == "R"
+    rows = payload["transactions"]
+    assert [row["line_index"] for row in rows] == [0, 1, 2]
+    by_line = {row["line_index"]: row for row in rows}
+    assert "member_id" not in by_line[0]
+    assert by_line[0]["ticker"] == "AAPL"
+    assert by_line[0]["ticker_confidence"] == "medium"
+    assert by_line[1]["member_id"] == "61kvydvhn8votlk"
+    assert by_line[1]["ticker"] == "MSFT"
+    assert by_line[1]["ticker_confidence"] == "high"
+    assert "member_id" not in by_line[2]
+    assert by_line[2]["ticker"] == "GOOGL"
+    assert by_line[2]["ticker_confidence"] == "low"
+    assert all(row.get("member_id") != "T000490" for row in rows)
+
+
+def test_live_post_prefers_horizons_id_when_lookup_id_is_bioguide(monkeypatch):
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    posted = {}
+
+    def fake_post(body, path="/hcgi/api/ingest/disclosures"):
+        posted["body"] = body
+        return _Resp(200, {"filing_id": "f1", "transactions_written": 1, "updated": True})
+
+    monkeypatch.setattr(hz, "_post_ingest", fake_post)
+    monkeypatch.setattr(hz, "list_disclosure_filings", lambda: [_filing(member_id="T000490")])
+    monkeypatch.setattr(hz, "list_disclosure_transactions", lambda: [_txn(member_id="T000490")])
+    monkeypatch.setattr(
+        hz,
+        "lookup_member_by_name",
+        lambda *a, **k: {
+            "id": "T000490",
+            "member_id": "61kvydvhn8votlk",
+            "bioguide_id": "T000490",
+            "name": "David Taylor",
+            "party": "R",
+            "state": "Ohio",
+        },
+    )
+
+    run(client=hz, live=True)
+    payload = posted["body"]["payload"]
+    assert payload["filing"]["member_id"] == "61kvydvhn8votlk"
+    assert payload["filing"]["bioguide_id"] == "T000490"
+    row = payload["transactions"][0]
+    assert row["member_id"] == "61kvydvhn8votlk"
+    assert row["line_index"] == 0
+    assert row["ticker"] == "AAPL"
+    assert row["ticker_confidence"] == "medium"
+
+
+def test_live_does_not_replace_trades_when_none_were_listed(monkeypatch):
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    posted = []
+
+    def fake_post(body, path="/hcgi/api/ingest/disclosures"):
+        posted.append(body)
+        return _Resp(200, {"filing_id": "f1", "transactions_written": 0})
+
+    monkeypatch.setattr(hz, "_post_ingest", fake_post)
+    monkeypatch.setattr(hz, "list_disclosure_filings", lambda: [_filing()])
+    monkeypatch.setattr(hz, "list_disclosure_transactions", lambda: [])
+    monkeypatch.setattr(
+        hz,
+        "lookup_member_by_name",
+        lambda *a, **k: {
+            "id": "61kvydvhn8votlk",
+            "bioguide_id": "T000490",
+            "party": "R",
+            "name": "David Taylor",
+        },
+    )
+
+    result = run(client=hz, live=True)
+    assert posted == []
+    assert result["unresolved"] == 1
 
 
 def test_cli_defaults_to_dry_run(monkeypatch):

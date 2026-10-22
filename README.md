@@ -131,7 +131,13 @@ the lookup was given a 2-letter state or a Clerk name like
 `Richard Dean Dr McCormick`. The backfill lists those filings and their
 transactions, resolves them, and prints every change. It does not POST
 unless `--live` is set, and it never writes a blank over a value that is
-already stored.
+already stored. The disclosures write replaces a filing's transactions, so
+a live run sends that filing's full transaction list back with `line_index`,
+`ticker`, and `ticker_confidence` unchanged and the filled member id. A
+bioguide is not sent as `member_id` (that value returns HTTP 500, and the
+writer then stores the filing with no member link). When no transactions
+were listed, the live run does not POST, because an empty list would drop
+trades.
 
 ```bash
 python -m ingest.backfill_members
