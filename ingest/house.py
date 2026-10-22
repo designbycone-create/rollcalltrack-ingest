@@ -583,6 +583,7 @@ def run(
     """
     year = year or date.today().year
     found, parsed, failed = 0, 0, 0
+    failures: list[dict] = []
     session = _session()
     hz = client if client is not None else (
         get_client() if config.use_horizons_api() and not dry_run else None
@@ -605,7 +606,18 @@ def run(
             hz.submit_ingestion_log(
                 "house_clerk", 0, 0, 1, note=f"index fetch failed: {e}"
             )
-        return {"found": 0, "parsed": 0, "failed": 1, "error": "index fetch failed"}
+        return {
+            "found": 0,
+            "parsed": 0,
+            "failed": 1,
+            "error": "index fetch failed",
+            "failures": [
+                {
+                    "source_url": config.HOUSE_BULK_ZIP_URL_TEMPLATE.format(year=year),
+                    "reason": str(e),
+                }
+            ],
+        }
 
     if filing_id:
         wanted = str(filing_id).strip()
@@ -621,6 +633,12 @@ def run(
                 "parsed": 0,
                 "failed": 1,
                 "error": "filing id not in index",
+                "failures": [
+                    {
+                        "source_url": config.HOUSE_BULK_ZIP_URL_TEMPLATE.format(year=year),
+                        "reason": f"House filing id {wanted} not found in the {year} bulk index",
+                    }
+                ],
             }
         logger.info("Re-ingesting House filing id %s", wanted)
     else:
@@ -778,13 +796,22 @@ def run(
                 rec.get("pdf_url"),
             )
             failed += 1
+            failures.append(
+                {
+                    "source_url": rec.get("pdf_url") or "",
+                    "reason": "INGEST_API_KEY is required",
+                }
+            )
         except Exception as e:
             logger.error(
                 "Failed to process House filing %s: %s", rec.get("pdf_url"), e
             )
             failed += 1
+            failures.append(
+                {"source_url": rec.get("pdf_url") or "", "reason": str(e)}
+            )
 
     if use_hz:
         hz.submit_ingestion_log("house_clerk", found, parsed, failed)
 
-    return {"found": found, "parsed": parsed, "failed": failed}
+    return {"found": found, "parsed": parsed, "failed": failed, "failures": failures}

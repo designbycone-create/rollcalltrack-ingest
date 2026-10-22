@@ -14,7 +14,8 @@ import re
 from dataclasses import dataclass
 
 _TITLES = re.compile(
-    r"^(?:hon\.?|the\s+hon(?:orable)?\.?|rep\.?|sen\.?|mr\.?|mrs\.?|ms\.?|dr\.?)\s+",
+    r"^(?:hon\.?|the\s+hon(?:orable)?\.?|rep\.?|sen\.?|senator|representative|"
+    r"congress(?:man|woman)|mr\.?|mrs\.?|ms\.?|dr\.?)\s+",
     re.I,
 )
 # House index sometimes embeds "Dr" / "Mr" between given names ("Richard Dean Dr").
@@ -30,6 +31,13 @@ _ROLE_PAREN = re.compile(
     r"\s*\((?:senator|candidate|former\s+senator|representative|rep\.?|sen\.?)\)\s*$",
     re.I,
 )
+# An eFD office cell is sometimes only the chamber title ("Senator").
+# That is not a person's name.
+_BARE_OFFICE_WORDS = frozenset({
+    "senator", "senators", "representative", "representatives",
+    "congressman", "congresswoman", "rep", "sen", "hon", "honorable",
+    "member", "candidate",
+})
 _NON_ALNUM = re.compile(r"[^a-z0-9\s]")
 _WS = re.compile(r"\s+")
 _MIDDLE_INITIAL = re.compile(r"\b([a-z])\b\.?")
@@ -116,7 +124,44 @@ def _clean_base(name: str) -> str:
         previous = s
         s = _SUFFIXES.sub("", s).strip()
         s = _TITLES.sub("", s).strip()
-    return s
+    return _normalize_case(s)
+
+
+def _normalize_case(name: str) -> str:
+    """Title-case shouted tokens. Leave McConnell-style mixed case alone."""
+    parts = []
+    for token in name.split():
+        letters = re.sub(r"[^A-Za-z]", "", token)
+        if len(letters) > 1 and letters.isupper():
+            parts.append(token.title())
+        else:
+            parts.append(token)
+    return " ".join(parts)
+
+
+def is_bare_office_title(text: str | None) -> bool:
+    """True when ``text`` is only a chamber title, not a filer name."""
+    raw = _ROLE_PAREN.sub("", text or "")
+    raw = raw.replace(".", " ")
+    tokens = [t.strip(".").lower() for t in _WS.sub(" ", raw).split() if t.strip(".")]
+    if not tokens:
+        return True
+    return all(t in _BARE_OFFICE_WORDS for t in tokens)
+
+
+def preferred_given_name(parsed: ParsedName) -> str:
+    """Given name to match and to send to /members/lookup.
+
+    ``A. Mitchell McConnell`` parses the initial as the first name. The
+    following token is the name he uses (Mitchell → Mitch).
+    """
+    first = (parsed.first or "").strip(".")
+    if len(first) == 1:
+        for mid in parsed.middle_tokens:
+            token = mid.strip(".")
+            if len(token) > 1:
+                return mid
+    return parsed.first
 
 
 def state_for_member_lookup(state: str | None) -> str | None:
@@ -138,7 +183,10 @@ def normalized_lookup_names(name: str, office: str | None = None) -> tuple[str, 
     that matches is ``Richard McCormick``, then ``McCormick``.
     """
     parsed = parse_filer_name(name, office=office)
-    full = " ".join(part for part in (parsed.first, parsed.last) if part)
+    given = preferred_given_name(parsed)
+    if is_bare_office_title(given) or is_bare_office_title(parsed.last):
+        return "", ""
+    full = " ".join(part for part in (given, parsed.last) if part)
     return full, parsed.last
 
 
@@ -149,21 +197,28 @@ def parse_filer_name(name: str, office: str | None = None) -> ParsedName:
     has a more complete form than the short first/last fields.
     """
     raw = (name or "").strip()
-    candidates_src = [raw]
-    if office:
-        candidates_src.append(office)
 
-    # Prefer "Last, First ..." when present (Senate office field)
-    full = raw
-    for src in candidates_src:
-        cleaned = _clean_base(src)
-        if "," in cleaned:
-            last, rest = [p.strip() for p in cleaned.split(",", 1)]
-            if last and rest:
-                full = f"{rest} {last}"
-                break
-        elif cleaned:
-            full = cleaned
+    def from_comma(cleaned: str) -> str | None:
+        if "," not in cleaned:
+            return None
+        last, rest = [part.strip() for part in cleaned.split(",", 1)]
+        if not last or not rest:
+            return None
+        if is_bare_office_title(last) or is_bare_office_title(rest):
+            return None
+        return _clean_base(f"{rest} {last}")
+
+    # The filer name wins unless the office cell is "Last, First (Senator)",
+    # which is often more complete. A bare "Senator" is not a name.
+    full = ""
+    if raw and not is_bare_office_title(raw):
+        cleaned = _clean_base(raw)
+        full = from_comma(cleaned) or cleaned
+    if office and not is_bare_office_title(office):
+        office_cleaned = _clean_base(office)
+        office_full = from_comma(office_cleaned)
+        if office_full:
+            full = office_full
 
     full = _clean_base(full)
     tokens = [t for t in full.split() if t]
@@ -268,7 +323,7 @@ _NICKNAME_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"sue", "susan", "suzan", "suzanne", "suzy"}),
     frozenset({"abby", "abigail"}),
     frozenset({"al", "alan", "albert"}),
-    frozenset({"bernie", "bernard"}),
+    frozenset({"bernie", "bernard", "bernardo"}),
     frozenset({"brad", "bradley"}),
     frozenset({"cindy", "cynthia"}),
     frozenset({"doug", "douglas"}),
@@ -377,7 +432,7 @@ def member_record_compatible(
     given name, and must not be a LegiScan id.
     """
     parsed = parse_filer_name(filer_name, office=office)
-    if not parsed.last:
+    if not parsed.last or is_bare_office_title(parsed.last):
         return False
     bioguide = str(member.get("bioguide_id") or "")
     member_id = str(member.get("id") or "")
@@ -391,7 +446,11 @@ def member_record_compatible(
     stored_full = (stored.full or "").lower()
     if filer_last != stored_last and filer_last not in stored_full.split():
         return False
-    if parsed.first and stored.first and not first_names_compatible(parsed.first, stored.first):
+    filer_given = preferred_given_name(parsed)
+    stored_givens = [stored.first, *stored.middle_tokens]
+    if filer_given and stored.first and not any(
+        first_names_compatible(filer_given, other) for other in stored_givens if other
+    ):
         return False
     if state:
         want = normalize_state(state)

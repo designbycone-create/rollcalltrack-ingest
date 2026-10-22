@@ -21,9 +21,54 @@ import requests
 from bs4 import BeautifulSoup
 
 from . import config
+from .http_retry import backoff_seconds, is_connection_error
 from .ingest_client import HorizonsIngestClient, get_client
 
 logger = logging.getLogger("rollcalltrack_ingest.senate")
+
+SENATE_ATTEMPTS = 5
+SENATE_BACKOFF_BASE = 2.0
+SENATE_BACKOFF_CAP = 30.0
+
+
+def _request(session: requests.Session, method: str, url: str, **kwargs):
+    """GET or POST with backoff on connection aborts and 5xx."""
+    send = getattr(session, method.lower())
+    resp = None
+    for attempt in range(SENATE_ATTEMPTS):
+        try:
+            resp = send(url, **kwargs)
+        except requests.RequestException as exc:
+            if not is_connection_error(exc) or attempt == SENATE_ATTEMPTS - 1:
+                raise
+            delay = backoff_seconds(
+                attempt, base=SENATE_BACKOFF_BASE, cap=SENATE_BACKOFF_CAP
+            )
+            logger.warning(
+                "Senate %s %s connection error, retry in %.1fs: %s",
+                method.upper(),
+                url,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+            continue
+        if resp.status_code < 500:
+            return resp
+        if attempt == SENATE_ATTEMPTS - 1:
+            return resp
+        delay = backoff_seconds(
+            attempt, resp, base=SENATE_BACKOFF_BASE, cap=SENATE_BACKOFF_CAP
+        )
+        logger.warning(
+            "Senate %s %s HTTP %s, retry in %.1fs",
+            method.upper(),
+            url,
+            resp.status_code,
+            delay,
+        )
+        time.sleep(delay)
+    return resp
 
 
 def _new_session() -> requests.Session:
@@ -34,7 +79,9 @@ def _new_session() -> requests.Session:
 
 def _accept_agreement(session: requests.Session) -> str:
     """Accept the eFD prohibited-use agreement. Returns CSRF token for later POSTs."""
-    resp = session.get(
+    resp = _request(
+        session,
+        "get",
         config.SENATE_EFD_SEARCH_HOME_URL,
         timeout=config.REQUEST_TIMEOUT_SECONDS,
     )
@@ -53,7 +100,9 @@ def _accept_agreement(session: requests.Session) -> str:
         "csrfmiddlewaretoken": csrf_token,
         "prohibition_agreement": "1",
     }
-    resp = session.post(
+    resp = _request(
+        session,
+        "post",
         config.SENATE_EFD_SEARCH_HOME_URL,
         data=payload,
         timeout=config.REQUEST_TIMEOUT_SECONDS,
@@ -113,7 +162,9 @@ def search_recent_filings(
         # Ensure JSON-array encoding even if report_types already looks right
         payload["report_types"] = "[" + ",".join(str(x) for x in report_types) + "]"
 
-        resp = session.post(
+        resp = _request(
+            session,
+            "post",
             config.SENATE_EFD_REPORT_DATA_URL,
             data=payload,
             timeout=config.REQUEST_TIMEOUT_SECONDS,
@@ -123,19 +174,6 @@ def search_recent_filings(
                 "X-Requested-With": "XMLHttpRequest",
             },
         )
-        if resp.status_code == 503:
-            logger.warning("Senate report data returned 503; backing off 10s and retrying once")
-            time.sleep(10)
-            resp = session.post(
-                config.SENATE_EFD_REPORT_DATA_URL,
-                data=payload,
-                timeout=config.REQUEST_TIMEOUT_SECONDS,
-                headers={
-                    "Referer": config.SENATE_EFD_SEARCH_URL,
-                    "X-CSRFToken": csrf_token,
-                    "X-Requested-With": "XMLHttpRequest",
-                },
-            )
         resp.raise_for_status()
         try:
             data = resp.json()
@@ -208,7 +246,7 @@ def parse_filing_detail(session: requests.Session, url: str) -> dict:
       # | Transaction Date | Owner | Ticker | Asset Name | Asset Type | Type | Amount | Comment
     Paper filings under /search/view/paper/ have no HTML table — returned empty.
     """
-    resp = session.get(url, timeout=config.REQUEST_TIMEOUT_SECONDS)
+    resp = _request(session, "get", url, timeout=config.REQUEST_TIMEOUT_SECONDS)
     resp.raise_for_status()
 
     # Session expiry redirects back to agreement page
@@ -301,6 +339,7 @@ def run(
     conn is ignored. Direct PocketBase writes have been removed.
     """
     found, parsed, failed = 0, 0, 0
+    failures: list[dict] = []
     since = date.today() - timedelta(days=days_back)
     hz = client if client is not None else (
         get_client() if config.use_horizons_api() and not dry_run else None
@@ -313,6 +352,12 @@ def run(
             "parsed": 0,
             "failed": 1,
             "error": "INGEST_API_KEY required",
+            "failures": [
+                {
+                    "source_url": config.SENATE_EFD_SEARCH_HOME_URL,
+                    "reason": "INGEST_API_KEY required",
+                }
+            ],
         }
 
     session = _new_session()
@@ -326,7 +371,18 @@ def run(
             hz.submit_ingestion_log(
                 "senate_efd", 0, 0, 1, note=f"search failed: {e}"
             )
-        return {"found": 0, "parsed": 0, "failed": 1, "error": "search failed"}
+        return {
+            "found": 0,
+            "parsed": 0,
+            "failed": 1,
+            "error": "search failed",
+            "failures": [
+                {
+                    "source_url": config.SENATE_EFD_SEARCH_HOME_URL,
+                    "reason": str(e),
+                }
+            ],
+        }
 
     if max_filings is not None:
         filings = filings[:max_filings]
@@ -340,6 +396,12 @@ def run(
             if not rec.get("detail_url"):
                 logger.warning("No detail URL for %s — skipping", rec.get("name"))
                 failed += 1
+                failures.append(
+                    {
+                        "source_url": "",
+                        "reason": f"No detail URL for {rec.get('name')}",
+                    }
+                )
                 continue
 
             detail = parse_filing_detail(session, rec["detail_url"])
@@ -419,6 +481,12 @@ def run(
                 rec.get("detail_url"),
             )
             failed += 1
+            failures.append(
+                {
+                    "source_url": rec.get("detail_url") or "",
+                    "reason": "INGEST_API_KEY is required",
+                }
+            )
         except Exception as e:
             logger.error(
                 "Failed to process Senate filing %s: %s",
@@ -426,8 +494,14 @@ def run(
                 e,
             )
             failed += 1
+            failures.append(
+                {
+                    "source_url": rec.get("detail_url") or "",
+                    "reason": str(e),
+                }
+            )
 
     if use_hz:
         hz.submit_ingestion_log("senate_efd", found, parsed, failed)
 
-    return {"found": found, "parsed": parsed, "failed": failed}
+    return {"found": found, "parsed": parsed, "failed": failed, "failures": failures}

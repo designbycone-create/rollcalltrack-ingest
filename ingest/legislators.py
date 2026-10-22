@@ -20,6 +20,7 @@ from .names import (
     normalize_state,
     parse_filer_name,
     parse_state_district,
+    preferred_given_name,
 )
 
 logger = logging.getLogger("rollcalltrack_ingest.legislators")
@@ -142,13 +143,24 @@ def _last_compatible(parsed, member: dict) -> bool:
     )
 
 
+def _member_given_names(member: dict) -> list[str]:
+    """First name, nickname, and the given tokens of official_full."""
+    names = [member.get("first") or "", member.get("nickname") or ""]
+    official = parse_filer_name(member.get("official_full") or "")
+    if official.first:
+        names.append(official.first)
+        names.append(preferred_given_name(official))
+    names.extend(official.middle_tokens)
+    return [name for name in names if name]
+
+
 def _first_compatible(parsed, member: dict) -> bool:
-    if not parsed.first:
+    given = preferred_given_name(parsed)
+    if not given:
         return False
-    options = [member.get("first") or ""]
-    if member.get("nickname"):
-        options.append(member["nickname"])
-    return any(first_names_compatible(parsed.first, opt) for opt in options if opt)
+    return any(
+        first_names_compatible(given, opt) for opt in _member_given_names(member)
+    )
 
 
 def _given_middle_tokens(parsed, member: dict) -> tuple[str, ...]:
@@ -171,6 +183,15 @@ def _middle_compatible(parsed, member: dict) -> bool:
     """Reject when both sides have a middle name and the initials differ."""
     middle = (member.get("middle") or "").strip(".")
     middles = _given_middle_tokens(parsed, member)
+    # "A. Mitchell" uses Mitchell as the given name, not as a middle name
+    # that should disagree with the roster's middle initial.
+    given = preferred_given_name(parsed)
+    if parsed.first and len(parsed.first.strip(".")) == 1 and given:
+        middles = tuple(
+            token
+            for token in middles
+            if token.strip(".").lower() != given.strip(".").lower()
+        )
     if not middle or not middles:
         return True
     filer_mid = middles[0].strip(".")

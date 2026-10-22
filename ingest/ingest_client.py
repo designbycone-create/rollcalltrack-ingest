@@ -19,13 +19,25 @@ import requests
 
 from . import config
 from .guards import assert_remote_post_allowed, skip_reason
+from .http_retry import backoff_seconds, is_connection_error
 from .legislators import match_legislator
 from .names import (
+    is_bare_office_title,
     member_record_compatible,
     normalized_lookup_names,
     parse_state_district,
     state_for_member_lookup,
 )
+
+# Gap between member lookups. The disclosure run was tripping Horizons 429s
+# by calling /members/lookup on every filing with no pause.
+LOOKUP_MIN_INTERVAL = 0.4
+LOOKUP_ATTEMPTS = 5
+LOOKUP_BACKOFF_BASE = 2.0
+LOOKUP_BACKOFF_CAP = 30.0
+INGEST_ATTEMPTS = 6
+INGEST_BACKOFF_BASE = 5.0
+INGEST_BACKOFF_CAP = 90.0
 
 logger = logging.getLogger("rollcalltrack_ingest.ingest_client")
 
@@ -107,6 +119,36 @@ def clean_transaction(txn: dict) -> dict:
     return out
 
 
+def _lookup_name_candidates(full_name: str, local: dict | None) -> list[str]:
+    """Names to try, roster official/nickname first, then the filing form.
+
+    congress-legislators ``official_full`` is what Horizons usually stores
+    (``Mitch McConnell``, ``Bernie Moreno``). The filing may say
+    ``A. Mitchell`` or ``Bernardo``.
+    """
+    names: list[str] = []
+
+    def add(value: str | None) -> None:
+        text = " ".join((value or "").split())
+        if not text or is_bare_office_title(text):
+            return
+        if any(text.lower() == existing.lower() for existing in names):
+            return
+        names.append(text)
+
+    if local:
+        add(local.get("official_full"))
+        nickname = str(local.get("nickname") or "").strip()
+        first = str(local.get("first") or "").strip()
+        last = str(local.get("last") or "").strip()
+        if nickname and last:
+            add(f"{nickname} {last}")
+        if first and last:
+            add(f"{first} {last}")
+    add(full_name)
+    return names
+
+
 class HorizonsIngestClient:
     """HTTP client for Horizons members lookup + ingest/disclosures."""
 
@@ -142,31 +184,48 @@ class HorizonsIngestClient:
 
     def _post_ingest(self, body: dict, path: str = "/hcgi/api/ingest/disclosures") -> requests.Response:
         assert_remote_post_allowed(self.base)
-        delay = 5.0
         last = None
-        for attempt in range(6):
-            last = self.session.post(
-                f"{self.base}{path}",
-                headers={
-                    "X-Ingest-Key": self.ingest_key,
-                    "Content-Type": "application/json",
-                },
-                json=body,
-                timeout=self.timeout,
-            )
+        for attempt in range(INGEST_ATTEMPTS):
+            try:
+                last = self.session.post(
+                    f"{self.base}{path}",
+                    headers={
+                        "X-Ingest-Key": self.ingest_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                if not is_connection_error(exc) or attempt == INGEST_ATTEMPTS - 1:
+                    raise
+                delay = backoff_seconds(
+                    attempt, base=INGEST_BACKOFF_BASE, cap=INGEST_BACKOFF_CAP
+                )
+                logger.warning(
+                    "ingest connection error on %s, retry %s in %.1fs: %s",
+                    path,
+                    attempt + 1,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+                continue
             if not self._should_retry(last):
                 return last
-            if attempt == 5:
+            if attempt == INGEST_ATTEMPTS - 1:
                 break
+            delay = backoff_seconds(
+                attempt, last, base=INGEST_BACKOFF_BASE, cap=INGEST_BACKOFF_CAP
+            )
             logger.warning(
-                "ingest HTTP %s on %s, retry %s in %.0fs",
+                "ingest HTTP %s on %s, retry %s in %.1fs",
                 last.status_code,
                 path,
                 attempt + 1,
                 delay,
             )
             time.sleep(delay)
-            delay = min(delay * 3, 90)
         return last
 
     def fetch_judicial_judges(self) -> list[dict]:
@@ -1118,6 +1177,7 @@ class HorizonsIngestClient:
             state_label = state_for_member_lookup(local.get("state"))
         full_name, last_name = normalized_lookup_names(name, office=office)
         known_bioguide = (bioguide_id or "").strip() or str((local or {}).get("bioguide") or "").strip()
+        lookup_names = _lookup_name_candidates(full_name, local)
 
         def accept_name_hit(candidate: str, member: dict | None) -> dict | None:
             if not member:
@@ -1141,18 +1201,18 @@ class HorizonsIngestClient:
             )
             return _with_roster_party(member, local)
 
-        if full_name:
+        for candidate in lookup_names:
             logger.info(
-                "Member lookup attempt name=%r state=%r", full_name, state_label
+                "Member lookup attempt name=%r state=%r", candidate, state_label
             )
             hit = accept_name_hit(
-                full_name,
-                self._lookup_http(name=full_name, state=state_label),
+                candidate,
+                self._lookup_http(name=candidate, state=state_label),
             )
             if hit:
                 return hit
 
-        if last_name and last_name.lower() != (full_name or "").lower():
+        if last_name and last_name.lower() not in {n.lower() for n in lookup_names}:
             logger.info(
                 "Member lookup attempt name=%r state=%r", last_name, state_label
             )
@@ -1190,22 +1250,46 @@ class HorizonsIngestClient:
         )
         return None
 
+    def _throttle_lookup(self) -> None:
+        now = time.monotonic()
+        last = getattr(self, "_last_lookup_at", 0.0)
+        wait = LOOKUP_MIN_INTERVAL - (now - last)
+        if last and wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        self._last_lookup_at = now
+
     def _lookup_http(self, **params) -> dict | None:
         # drop Nones
         params = {k: v for k, v in params.items() if v is not None and v != ""}
         if not params:
             return None
+        self._throttle_lookup()
         resp = None
-        for attempt in range(4):
+        for attempt in range(LOOKUP_ATTEMPTS):
             try:
                 resp = self._get("/hcgi/api/members/lookup", params)
-            except requests.RequestException as e:
-                logger.error("lookup request failed: %s", e)
-                return None
+            except requests.RequestException as exc:
+                if not is_connection_error(exc) or attempt == LOOKUP_ATTEMPTS - 1:
+                    logger.error("lookup request failed: %s", exc)
+                    return None
+                delay = backoff_seconds(
+                    attempt, base=LOOKUP_BACKOFF_BASE, cap=LOOKUP_BACKOFF_CAP
+                )
+                logger.warning(
+                    "lookup connection error, retry in %.1fs: %s", delay, exc
+                )
+                time.sleep(delay)
+                continue
             if resp.status_code != 429:
                 break
-            delay = 2 * (attempt + 1)
-            logger.warning("lookup HTTP 429, retry in %ss", delay)
+            if attempt == LOOKUP_ATTEMPTS - 1:
+                logger.warning("lookup HTTP 429: %s", (resp.text or "")[:200])
+                break
+            delay = backoff_seconds(
+                attempt, resp, base=LOOKUP_BACKOFF_BASE, cap=LOOKUP_BACKOFF_CAP
+            )
+            logger.warning("lookup HTTP 429, retry in %.1fs", delay)
             time.sleep(delay)
         if resp is None:
             return None

@@ -3,7 +3,18 @@ from ingest.ingest_client import HorizonsIngestClient
 from ingest.legislators import match_legislator, roster_from_records
 
 
-def _person(bioguide, first, last, state, chamber, district=None, nickname="", middle="", party="Democrat"):
+def _person(
+    bioguide,
+    first,
+    last,
+    state,
+    chamber,
+    district=None,
+    nickname="",
+    middle="",
+    party="Democrat",
+    official_full=None,
+):
     term = {"type": "rep" if chamber == "house" else "sen", "state": state, "party": party}
     if district is not None:
         term["district"] = district
@@ -14,7 +25,7 @@ def _person(bioguide, first, last, state, chamber, district=None, nickname="", m
             "last": last,
             "middle": middle,
             "nickname": nickname,
-            "official_full": f"{first} {last}",
+            "official_full": official_full or f"{first} {last}",
         },
         "terms": [term],
     }
@@ -94,6 +105,110 @@ def test_unique_name_survives_stale_district():
         "Richard Dean Dr McCormick", roster, state="GA", district=6, chamber="house"
     )
     assert hit["bioguide"] == "M001218"
+
+
+def test_senate_failures_match_congress_legislators():
+    """Names from disclosure ingest run 39795750445.
+
+    congress-legislators stores Mitch / Bernie / Richard / John, plus
+    official_full. The filing forms are the legal name, a nickname, or an
+    all-caps paper row whose office is only the title Senator.
+    """
+    roster = roster_from_records(
+        [
+            _person(
+                "M000355",
+                "Mitch",
+                "McConnell",
+                "KY",
+                "senate",
+                party="Republican",
+                official_full="Mitch McConnell",
+            ),
+            _person(
+                "B001277",
+                "Richard",
+                "Blumenthal",
+                "CT",
+                "senate",
+                official_full="Richard Blumenthal",
+            ),
+            _person(
+                "M001242",
+                "Bernie",
+                "Moreno",
+                "OH",
+                "senate",
+                party="Republican",
+                official_full="Bernie Moreno",
+            ),
+            _person(
+                "B001236",
+                "John",
+                "Boozman",
+                "AR",
+                "senate",
+                party="Republican",
+                official_full="John Boozman",
+            ),
+            _person(
+                "A000001",
+                "Mitch",
+                "McConnell",
+                "KY",
+                "senate",
+                official_full="Addison Mitchell McConnell",
+            ),
+        ]
+    )
+    # Two McConnells would be ambiguous. Use the live shape: one person,
+    # official_full "Mitch McConnell", filing "A. Mitchell McConnell, Jr."
+    live = [row for row in roster if row["bioguide"] != "A000001"]
+    hit = match_legislator(
+        "A. Mitchell McConnell, Jr.",
+        live,
+        office="McConnell, A. Mitchell Jr. (Senator)",
+        chamber="senate",
+    )
+    assert hit["bioguide"] == "M000355"
+
+    # official_full carries the legal name when the roster first name is the nickname.
+    legal = [row for row in roster if row["bioguide"] == "A000001"]
+    by_official = match_legislator(
+        "Addison McConnell",
+        legal,
+        chamber="senate",
+    )
+    assert by_official["bioguide"] == "A000001"
+
+    blumenthal = match_legislator(
+        "RICHARD  BLUMENTHAL",
+        live,
+        office="Senator",
+        chamber="senate",
+    )
+    assert blumenthal["bioguide"] == "B001277"
+
+    moreno = match_legislator(
+        "Bernie Moreno",
+        live,
+        office="Moreno, Bernardo (Senator)",
+        chamber="senate",
+    )
+    assert moreno["bioguide"] == "M001242"
+
+    # Run 39795750445 looked Boozman up with state Arkansas and had already
+    # hit earlier in the same job. The later miss was HTTP 429 plus
+    # RemoteDisconnected, not a full-name versus USPS-code mismatch.
+    boozman = match_legislator(
+        "John Boozman",
+        live,
+        state="Arkansas",
+        office="Boozman, John (Senator)",
+        chamber="senate",
+    )
+    assert boozman["bioguide"] == "B001236"
+    assert boozman["state"] == "AR"
 
 
 def test_ambiguous_same_name_returns_none():
