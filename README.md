@@ -82,7 +82,7 @@ House and Senate paths were verified against the live government sites:
 |--------|--------|-------|
 | House bulk ZIP | Verified | `public_disc/financial-pdfs/{year}FD.zip` — index is XML (`{year}FD.xml`) |
 | House PTR PDFs | Verified | URL is `public_disc/ptr-pdfs/{year}/{DocID}.pdf` (not financial-pdfs) |
-| House PTR text parse | Verified | Recent e-filed PTRs have a text layer; OCR left as TODO |
+| House PTR text parse | Verified | Text layer first. If that yields no transactions, OCR with tesseract + poppler (`parse_status` stays `failed` and records a reason when OCR also finds nothing) |
 | Senate agreement | Verified | `prohibition_agreement=1` + `csrfmiddlewaretoken` |
 | Senate search API | Verified | POST `/search/report/data/` with `report_types='[11]'` (PTR) |
 | Senate detail HTML | Verified | `table.table-striped` columns: date, owner, ticker, asset, type, amount |
@@ -109,20 +109,48 @@ be re-posted by House DocID. `--filing-id` ignores `--days-back` and
 The flag is only valid with `--source house`.
 
 ```bash
+python -m ingest.main --source house --dry-run --filing-id 20035588 --year 2026
 python -m ingest.main --source house --live --filing-id 20035588
 python -m ingest.main --source house --live --filing-id 20035588 --year 2026
 ```
+
+`--filing-id` also re-parses a scanned PTR. The text layer is tried first.
+When it contains no transactions, the PDF is OCR'd (tesseract + poppler).
+If OCR still finds no rows, the filing is stored with `parse_status=failed`
+and `parse_failure_reason` (`ocr_failed: no text extracted` or
+`ocr_failed: no transactions recognized`).
 
 Kevin Hern's PTR `20035588` is the case this fixes: 24 transaction lines,
 including two identical Lockheed Martin partial sales (source lines 47 and
 51), of which only 23 were stored.
 
+### Backfill member links
+
+Filings already in Horizons can lack `member_id` or `member_party` because
+the lookup was given a 2-letter state or a Clerk name like
+`Richard Dean Dr McCormick`. The backfill lists those filings and their
+transactions, resolves them, and prints every change. It does not POST
+unless `--live` is set, and it never writes a blank over a value that is
+already stored.
+
+```bash
+python -m ingest.backfill_members
+python -m ingest.backfill_members --live
+```
+
+Both commands need `HORIZONS_BASE_URL` and `INGEST_API_KEY`. The dry run
+only reads. `--live` also sets the write opt-in for that process.
+
 ### Member matching
 
 Under Horizons API mode, member resolution hits
-`GET /hcgi/api/members/lookup` (bioguide first, then multi-format name match:
-raw → `Last, First` → compound last names). House passes state + district;
-Senate passes state.
+`GET /hcgi/api/members/lookup`. USPS codes, including DC and the
+territories, are sent as full state names (`OH` → `Ohio`, `CA` →
+`California`). Names are normalized first: titles and suffixes
+(`Dr`, `Hon`, `Jr`, `III`) and middle names are removed. The attempts
+are the full name plus state, then the last name plus state, then the
+bioguide id when the filing or the congress-legislators roster has one.
+A roster row is not submitted as a member id.
 
 ```bash
 # offline unit tests for name variants

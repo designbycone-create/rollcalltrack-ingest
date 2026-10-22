@@ -1,11 +1,14 @@
 """Offline unit tests for name normalization / member-match keys."""
 from ingest.names import (
+    STATE_CODES,
     first_names_compatible,
     member_record_compatible,
+    normalized_lookup_names,
     parse_filer_name,
     parse_state_district,
     normalize_state,
     state_display_name,
+    state_for_member_lookup,
 )
 
 
@@ -48,6 +51,43 @@ def test_state_district():
     assert normalize_state("al") == "AL"
     assert state_display_name("NJ") == "New Jersey"
     assert state_display_name("DC") == "District of Columbia"
+
+
+def test_usps_codes_map_to_full_names_including_dc_and_territories():
+    # Horizons /members/lookup compares state to the stored full name.
+    expected = {
+        "OH": "Ohio",
+        "MI": "Michigan",
+        "CA": "California",
+        "DC": "District of Columbia",
+        "AS": "American Samoa",
+        "GU": "Guam",
+        "MP": "Northern Mariana Islands",
+        "PR": "Puerto Rico",
+        "VI": "Virgin Islands",
+    }
+    assert set(STATE_CODES) >= set(expected)
+    assert len(STATE_CODES) == 56  # 50 states + DC + 5 territories
+    for code, full in expected.items():
+        assert state_for_member_lookup(code) == full
+        assert state_for_member_lookup(code.lower()) == full
+        assert state_for_member_lookup(full) == full
+        assert state_display_name(code) == full
+    assert state_for_member_lookup("not-a-state") is None
+
+
+def test_lookup_names_drop_titles_suffixes_and_middle_names():
+    # House Clerk: "Richard Dean Dr McCormick". Full name is first + last.
+    assert normalized_lookup_names("Richard Dean Dr McCormick") == (
+        "Richard McCormick",
+        "McCormick",
+    )
+    assert normalized_lookup_names("Hon. David J. Taylor, Jr.") == (
+        "David Taylor",
+        "Taylor",
+    )
+    assert normalized_lookup_names("Jane Public III") == ("Jane Public", "Public")
+    assert normalized_lookup_names("Dr. Hon. Laurel M. Lee") == ("Laurel Lee", "Lee")
 
 
 def test_embedded_title_and_nickname_quotes():
