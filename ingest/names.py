@@ -99,14 +99,47 @@ def _clean_base(name: str) -> str:
     s = (name or "").strip()
     s = s.replace("“", " ").replace("”", " ").replace('"', " ")
     s = _ROLE_PAREN.sub("", s)
-    s = _TITLES.sub("", s)
-    s = _SUFFIXES.sub("", s)
-    s = _INNER_TITLES.sub(" ", s)
+    # "Dr. Hon. Jane Public III" carries more than one title or suffix.
+    previous = None
+    while previous != s:
+        previous = s
+        s = _TITLES.sub("", s)
+        s = _SUFFIXES.sub("", s)
+        s = _INNER_TITLES.sub(" ", s)
+        s = _WS.sub(" ", s).strip()
     s = s.replace(".", " ")
     s = s.replace("-", " ")
     s = s.replace("'", "")
     s = _WS.sub(" ", s).strip()
+    previous = None
+    while previous != s:
+        previous = s
+        s = _SUFFIXES.sub("", s).strip()
+        s = _TITLES.sub("", s).strip()
     return s
+
+
+def state_for_member_lookup(state: str | None) -> str | None:
+    """Full state name for ``/members/lookup``.
+
+    The live roster stores ``California`` and ``Ohio``. A filing's 2-letter
+    code (``CA``, ``OH``, ``DC``, ``PR``) does not match that field.
+    """
+    code = normalize_state(state)
+    if not code:
+        return None
+    return state_display_name(code) or None
+
+
+def normalized_lookup_names(name: str, office: str | None = None) -> tuple[str, str]:
+    """``(First Last, Last)`` with titles, suffixes, and middle names removed.
+
+    House Clerk rows look like ``Richard Dean Dr McCormick``. The lookup
+    that matches is ``Richard McCormick``, then ``McCormick``.
+    """
+    parsed = parse_filer_name(name, office=office)
+    full = " ".join(part for part in (parsed.first, parsed.last) if part)
+    return full, parsed.last
 
 
 def parse_filer_name(name: str, office: str | None = None) -> ParsedName:

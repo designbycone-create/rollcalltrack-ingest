@@ -314,3 +314,129 @@ def test_ocr_failure_is_empty_text():
             raise RuntimeError("no rasterizer")
 
     assert _ocr_page(BrokenPage()) == ""
+
+
+_PTR_LINE = (
+    "JT Apple Inc. (AAPL) P 09/01/2026 09/02/2026 $1,001 - $15,000\n"
+)
+
+
+def test_text_with_transactions_does_not_ocr():
+    from ingest.house import resolve_ptr_transactions
+
+    def explode():
+        raise AssertionError("OCR ran even though the text layer had a transaction")
+
+    result = resolve_ptr_transactions(_PTR_LINE, ocr=explode)
+    assert result["used_ocr"] is False
+    assert result["parse_status"] == "parsed"
+    assert result["parse_failure_reason"] == ""
+    assert result["transactions"][0]["ticker"] == "AAPL"
+
+
+def test_no_transactions_falls_back_to_ocr():
+    from ingest.house import resolve_ptr_transactions
+
+    seen = {"n": 0}
+
+    def ocr():
+        seen["n"] += 1
+        return _PTR_LINE
+
+    result = resolve_ptr_transactions("scanned page with no trade rows", ocr=ocr)
+    assert seen["n"] == 1
+    assert result["used_ocr"] is True
+    assert result["parse_status"] == "parsed"
+    assert result["parse_failure_reason"] == ""
+    assert result["transactions"][0]["ticker"] == "AAPL"
+
+
+def test_ocr_failure_keeps_parse_status_failed_with_reason():
+    from ingest.house import resolve_ptr_transactions
+
+    empty = resolve_ptr_transactions("no rows", ocr=lambda: "   ")
+    assert empty["parse_status"] == "failed"
+    assert empty["transactions"] == []
+    assert empty["used_ocr"] is True
+    assert "ocr" in empty["parse_failure_reason"].lower()
+
+    garbage = resolve_ptr_transactions("no rows", ocr=lambda: "not a transaction table")
+    assert garbage["parse_status"] == "failed"
+    assert "transaction" in garbage["parse_failure_reason"].lower()
+
+
+def test_filing_id_reparse_records_ocr_failure(monkeypatch, caplog):
+    import logging
+
+    from ingest import house
+
+    records = [
+        {
+            "name": "David J. Taylor",
+            "state_district": "OH02",
+            "filing_type_code": "P",
+            "filing_type": "Periodic Transaction Report",
+            "filing_date": "10/01/2026",
+            "year": "2026",
+            "doc_id": "9116378",
+            "pdf_url": "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/9116378.pdf",
+        }
+    ]
+    monkeypatch.setattr(house, "download_bulk_index", lambda year, session=None: records)
+    monkeypatch.setattr(house.config, "REQUEST_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        house,
+        "parse_pdf",
+        lambda url, session=None: {
+            "text": "image only filing",
+            "used_ocr": False,
+            "page_count": 2,
+            "empty_pages": 2,
+            "content": b"%PDF-1.4",
+        },
+    )
+    monkeypatch.setattr(house, "ocr_pdf_bytes", lambda content: "")
+
+    class FakeHz:
+        configured = True
+
+        def __init__(self):
+            self.filing = None
+            self.flagged = None
+
+        def lookup_member_by_name(self, *args, **kwargs):
+            return {
+                "id": "pb-taylor",
+                "bioguide_id": "T000490",
+                "name": "David Taylor",
+                "party": "R",
+                "state": "Ohio",
+            }
+
+        def submit_filing(self, filing, transactions=None, **kwargs):
+            self.filing = filing
+            self.transactions = transactions
+            return {"filing_id": "f-scan", "transactions_written": 0, "updated": True}
+
+        def submit_ingestion_log(self, *args, **kwargs):
+            return None
+
+        def flag_manual_review(self, filing_id, reason="", notes=""):
+            self.flagged = {"filing_id": filing_id, "reason": reason, "notes": notes}
+            return {}
+
+    hz = FakeHz()
+    with caplog.at_level(logging.INFO):
+        result = house.run(
+            year=2026,
+            dry_run=False,
+            filing_id="9116378",
+            client=hz,
+        )
+    assert result["parsed"] == 1
+    assert hz.filing["parse_status"] == "failed"
+    assert "ocr" in hz.filing["parse_failure_reason"].lower()
+    assert hz.transactions == []
+    assert hz.filing["member_id"] == "pb-taylor"
+    assert hz.flagged["reason"] == "low_ocr_confidence"
+    assert "ocr" in caplog.text.lower()

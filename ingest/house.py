@@ -214,40 +214,123 @@ def _parse_index_file(raw_text: str) -> list[dict]:
 
 
 def parse_pdf(pdf_url: str, session: requests.Session | None = None) -> dict:
-    """Download a filing PDF and extract text.
+    """Download a filing PDF and extract its text layer.
 
-    Returns {text, used_ocr: bool, page_count, empty_pages}.
-    Pages with no text layer are OCR'd with tesseract (installed in CI).
-    Scanned paper PTRs such as 9116378.pdf otherwise parse to zero rows.
+    Returns {text, used_ocr, page_count, empty_pages, content}. OCR is a
+    separate step: ``resolve_ptr_transactions`` runs it only when this text
+    yields no transactions. Scanned PTRs otherwise stay at zero rows.
     """
     session = session or _session()
     resp = session.get(pdf_url, timeout=config.REQUEST_TIMEOUT_SECONDS)
     resp.raise_for_status()
+    return extract_pdf_text(resp.content)
 
+
+def extract_pdf_text(content: bytes) -> dict:
+    """Text layer only. ``empty_pages`` counts pages with no extractable text."""
     text_parts = []
-    used_ocr = False
     empty_pages = 0
     page_count = 0
-    with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
         page_count = len(pdf.pages)
         for page in pdf.pages:
             page_text = page.extract_text() or ""
             if page_text.strip():
                 text_parts.append(page_text)
-                continue
-            empty_pages += 1
-            ocr_text = _ocr_page(page)
-            if ocr_text.strip():
-                used_ocr = True
-                text_parts.append(ocr_text)
-                continue
-            used_ocr = True
-
+            else:
+                empty_pages += 1
     return {
         "text": "\n".join(text_parts),
-        "used_ocr": used_ocr,
+        "used_ocr": False,
         "page_count": page_count,
         "empty_pages": empty_pages,
+        "content": content,
+    }
+
+
+def _ocr_with_pdf2image(content: bytes) -> str:
+    try:
+        import pytesseract
+        from pdf2image import convert_from_bytes
+    except ImportError as e:
+        logger.warning("OCR libraries unavailable: %s", e)
+        return ""
+    try:
+        images = convert_from_bytes(content, dpi=200)
+    except Exception as e:
+        logger.warning("pdf2image failed: %s", e)
+        return ""
+    parts = []
+    for image in images:
+        try:
+            parts.append(pytesseract.image_to_string(image) or "")
+        except Exception as e:
+            logger.warning("House PTR OCR failed: %s", e)
+    return "\n".join(parts)
+
+
+def _ocr_with_pdfplumber(content: bytes) -> str:
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            return "\n".join(_ocr_page(page) for page in pdf.pages)
+    except Exception as e:
+        logger.warning("pdfplumber OCR failed: %s", e)
+        return ""
+
+
+def ocr_pdf_bytes(content: bytes) -> str:
+    """OCR a PDF that has no usable text layer.
+
+    Prefers pytesseract + pdf2image (poppler). Falls back to rendering
+    each page with pdfplumber when poppler is missing.
+    """
+    if not content:
+        return ""
+    text = _ocr_with_pdf2image(content)
+    if text.strip():
+        return text
+    return _ocr_with_pdfplumber(content)
+
+
+def resolve_ptr_transactions(text: str, ocr=None) -> dict:
+    """Parse PTR rows. OCR only when the text layer has no transactions.
+
+    A failed OCR keeps ``parse_status`` ``failed`` and sets
+    ``parse_failure_reason``.
+    """
+    txns = parse_ptr_transactions(text or "")
+    if txns:
+        return {
+            "transactions": txns,
+            "used_ocr": False,
+            "parse_status": "parsed",
+            "parse_failure_reason": "",
+        }
+    ocr_text = ""
+    if ocr is not None:
+        try:
+            ocr_text = ocr() or ""
+        except Exception as e:
+            logger.warning("House PTR OCR failed: %s", e)
+            ocr_text = ""
+    ocr_txns = parse_ptr_transactions(ocr_text) if ocr_text.strip() else []
+    if ocr_txns:
+        return {
+            "transactions": ocr_txns,
+            "used_ocr": True,
+            "parse_status": "parsed",
+            "parse_failure_reason": "",
+        }
+    if not str(ocr_text or "").strip():
+        reason = "ocr_failed: no text extracted"
+    else:
+        reason = "ocr_failed: no transactions recognized"
+    logger.warning("House PTR parse_status=failed reason=%s", reason)
+    return {
+        "transactions": [],
+        "used_ocr": True,
+        "parse_status": "failed",
+        "parse_failure_reason": reason,
     }
 
 
@@ -430,30 +513,40 @@ def parse_ptr_transactions(pdf_text: str) -> list[dict]:
     return transactions
 
 
-def _flag_unreadable(hz, result: dict, rec: dict, pdf_result: dict, txns: list) -> None:
-    """Queue a review row the first time an unreadable PTR is inserted.
+def _flag_unreadable(
+    hz,
+    result: dict,
+    rec: dict,
+    pdf_result: dict,
+    txns: list,
+    *,
+    parse_failure_reason: str = "",
+    used_ocr: bool = False,
+) -> None:
+    """Queue a review row when a PTR still has no transactions after OCR.
 
-    Updates of a filing already in Horizons are not re-flagged, so the
-    daily job does not pile duplicate review items. The warning is logged
-    every run so a still-blank scan stays visible.
+    ``parse_status`` on the filing stays ``failed``. The reason string is
+    the note, including a re-parse of a filing already stored.
     """
-    if txns or not pdf_result.get("empty_pages"):
+    if txns:
         return
+    if not pdf_result.get("empty_pages") and not parse_failure_reason and not used_ocr:
+        return
+    reason_text = parse_failure_reason or "PTR parsed 0 transactions"
     logger.warning(
-        "House PTR parsed 0 transactions after text/OCR name=%r url=%s empty_pages=%s",
+        "House PTR parse_status=failed reason=%s name=%r url=%s empty_pages=%s",
+        reason_text,
         rec.get("name"),
         rec.get("pdf_url"),
         pdf_result.get("empty_pages"),
     )
-    if result.get("updated"):
-        return
     filing_id = result.get("filing_id") or result.get("id")
     if not filing_id:
         return
     hz.flag_manual_review(
         str(filing_id),
-        reason="low_ocr_confidence" if pdf_result.get("used_ocr") else "unexpected_structure",
-        notes=f"PTR parsed 0 transactions url={rec.get('pdf_url')}",
+        reason="low_ocr_confidence" if (used_ocr or pdf_result.get("used_ocr") or parse_failure_reason) else "unexpected_structure",
+        notes=f"{reason_text} url={rec.get('pdf_url')}",
     )
 
 
@@ -567,25 +660,40 @@ def run(
         try:
             pdf_result = parse_pdf(rec["pdf_url"], session=session)
             txns = []
-            if rec.get("filing_type_code") == "P" or "ptr" in (
+            parse_failure_reason = ""
+            used_ocr = bool(pdf_result.get("used_ocr"))
+            is_ptr = rec.get("filing_type_code") == "P" or "ptr" in (
                 rec.get("filing_type") or ""
-            ).lower():
-                txns = parse_ptr_transactions(pdf_result["text"])
+            ).lower()
+            if is_ptr:
+                content = pdf_result.get("content") or b""
+                resolved = resolve_ptr_transactions(
+                    pdf_result.get("text") or "",
+                    ocr=lambda: ocr_pdf_bytes(content),
+                )
+                txns = resolved["transactions"]
+                used_ocr = used_ocr or bool(resolved["used_ocr"])
+                parse_failure_reason = resolved["parse_failure_reason"]
+                pdf_result = dict(pdf_result)
+                pdf_result["used_ocr"] = used_ocr
 
             pb_filing_type = config.HOUSE_TO_PB_FILING_TYPE.get(
                 rec.get("filing_type_code") or "", "ptr"
             )
             state_code = (rec.get("state_district") or "")[:2] or None
             # OCR that recovered transactions is a successful parse. Zero
-            # transactions on a PTR stays failed so the run is visible.
-            parse_status = (
-                "failed" if (not txns and pb_filing_type == "ptr") else "parsed"
-            )
+            # transactions on a PTR stays failed, with the OCR reason.
+            if is_ptr and not txns:
+                parse_status = "failed"
+                if not parse_failure_reason:
+                    parse_failure_reason = "ocr_failed: no transactions recognized"
+            else:
+                parse_status = "parsed"
 
             if dry_run:
                 logger.info(
                     "[dry-run] House filing name=%r type=%s date=%s url=%s "
-                    "pages=%s empty_pages=%s transactions=%d",
+                    "pages=%s empty_pages=%s transactions=%d parse_status=%s reason=%s",
                     rec["name"],
                     rec["filing_type"],
                     rec["filing_date"],
@@ -593,6 +701,8 @@ def run(
                     pdf_result["page_count"],
                     pdf_result["empty_pages"],
                     len(txns),
+                    parse_status,
+                    parse_failure_reason,
                 )
                 for t in txns[:10]:
                     logger.info("[dry-run]   txn %s", t)
@@ -633,6 +743,15 @@ def run(
                 bioguide = (member or {}).get("bioguide_id") or ""
                 if bioguide:
                     filing["bioguide_id"] = bioguide
+                if parse_failure_reason:
+                    filing["parse_failure_reason"] = parse_failure_reason
+                    logger.warning(
+                        "House PTR parse_status=%s reason=%s name=%r url=%s",
+                        parse_status,
+                        parse_failure_reason,
+                        rec.get("name"),
+                        rec.get("pdf_url"),
+                    )
                 result = hz.submit_filing(filing, transactions=txns)
                 if result.get("skipped"):
                     continue
@@ -642,7 +761,15 @@ def run(
                     result.get("transactions_written"),
                     rec["name"],
                 )
-                _flag_unreadable(hz, result, rec, pdf_result, txns)
+                _flag_unreadable(
+                    hz,
+                    result,
+                    rec,
+                    pdf_result,
+                    txns,
+                    parse_failure_reason=parse_failure_reason,
+                    used_ocr=used_ocr,
+                )
                 parsed += 1
                 continue
 
