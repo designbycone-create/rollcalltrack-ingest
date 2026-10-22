@@ -18,7 +18,7 @@
 - LLM-only classification is not a write path
 - Appointing party must never become `ideology_score`
 - Workers default to `--dry-run`. Do not POST until the Horizons route returns 401 or 200, not 404
-- Reuse secrets `HORIZONS_BASE_URL`, `INGEST_API_KEY` / `INGEST_KEY`
+- Reuse secrets `HORIZONS_BASE_URL` and `INGEST_API_KEY` (`INGEST_KEY` is still read for one release when `INGEST_API_KEY` is unset)
 - No live CourtListener in CI
 - Do not mix this work with pushing the older 10 ingest commits; those are a separate operator step
 - Horizons page/routes are not implemented in this repo

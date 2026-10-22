@@ -1,17 +1,19 @@
 """Environment configuration. Loads from .env locally, from real env vars
 (GitHub Actions secrets) in CI.
 
-Primary write path: Horizons HTTP API
+Write path: Horizons HTTP API
   HORIZONS_BASE_URL  e.g. https://<app-id>.app-preview.com
   INGEST_API_KEY     sent as X-Ingest-Key
 
-Legacy/optional: PocketBase superuser (direct collection writes) still
-supported if INGEST_API_KEY is not set.
+INGEST_KEY is read only when INGEST_API_KEY is unset, for one release.
 """
+import logging
 import os
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger("rollcalltrack_ingest.config")
 
 load_dotenv()
 
@@ -38,19 +40,36 @@ elif _raw_db.startswith("http"):
 else:
     HORIZONS_BASE_URL = ""
 
-INGEST_API_KEY = (
-    os.environ.get("INGEST_API_KEY")
-    or os.environ.get("INGEST_KEY")
-    or os.environ.get("X_INGEST_KEY")
-    or os.environ.get("X-Ingest-Key")
-    or ""
-)
 
-# Legacy PocketBase direct access (optional)
+def _load_ingest_api_key() -> str:
+    """Canonical env var is INGEST_API_KEY (header X-Ingest-Key).
+
+    INGEST_KEY is still accepted for one release when INGEST_API_KEY is
+    unset. Workflows set INGEST_API_KEY only. Remove this fallback next
+    release.
+    """
+    primary = os.environ.get("INGEST_API_KEY") or ""
+    if primary:
+        return primary
+    legacy = os.environ.get("INGEST_KEY") or ""
+    if legacy:
+        logger.warning(
+            "INGEST_KEY is deprecated and will be removed next release; "
+            "rename it to INGEST_API_KEY"
+        )
+        return legacy
+    return (
+        os.environ.get("X_INGEST_KEY")
+        or os.environ.get("X-Ingest-Key")
+        or ""
+    )
+
+
+INGEST_API_KEY = _load_ingest_api_key()
+
+# Optional origin fallback when HORIZONS_BASE_URL is unset. Not used for auth.
 DATABASE_URL = _raw_db
 POCKETBASE_URL = _raw_db
-POCKETBASE_ADMIN_EMAIL = os.environ.get("POCKETBASE_ADMIN_EMAIL")
-POCKETBASE_ADMIN_PASSWORD = os.environ.get("POCKETBASE_ADMIN_PASSWORD")
 
 CONGRESS_GOV_API_KEY = os.environ.get("CONGRESS_GOV_API_KEY")
 LEGISCAN_API_KEY = os.environ.get("LEGISCAN_API_KEY")
@@ -118,23 +137,15 @@ def use_horizons_api() -> bool:
 def require_config(dry_run: bool = False, source: str = "all"):
     missing = []
     if not dry_run:
-        if use_horizons_api():
-            pass  # HORIZONS_BASE_URL + INGEST_API_KEY present
-        else:
-            # Fall back to PocketBase superuser path
-            if not POCKETBASE_URL:
-                missing.append(
-                    "INGEST_API_KEY (+ HORIZONS_BASE_URL or DATABASE_URL), "
-                    "or DATABASE_URL for legacy PocketBase"
-                )
-            if not POCKETBASE_ADMIN_EMAIL:
-                missing.append("POCKETBASE_ADMIN_EMAIL (or set INGEST_API_KEY)")
-            if not POCKETBASE_ADMIN_PASSWORD:
-                missing.append("POCKETBASE_ADMIN_PASSWORD (or set INGEST_API_KEY)")
-    # congress_enrich is skipped under Horizons API mode (roster owned by Horizons).
-    needs_congress = not CONGRESS_GOV_API_KEY and (
-        source in ("congress_enrich", "nominations")
-        or (source == "all" and not dry_run and not use_horizons_api())
+        if not HORIZONS_BASE_URL:
+            missing.append("HORIZONS_BASE_URL")
+        if not INGEST_API_KEY:
+            missing.append("INGEST_API_KEY")
+    # Nominations and the congress_enrich command still call Congress.gov.
+    # Scheduled --source all does not write member rows from this process.
+    needs_congress = not CONGRESS_GOV_API_KEY and source in (
+        "congress_enrich",
+        "nominations",
     )
     if needs_congress:
         missing.append("CONGRESS_GOV_API_KEY")
