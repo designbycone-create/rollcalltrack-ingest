@@ -18,6 +18,13 @@ these use ``"Senate"``). ``id`` / ``rc_id`` are ``s-{congress}-{year}-{roll}``
 so they do not collide with House ``{congress}-{session}-{roll}`` and so
 they match the nomination linker and ``/congress/senate-vote/{congress}/{year}/{roll}``.
 Re-posting the same ``source_url`` (the detail XML URL) is the idempotency key.
+
+Session 1 of a congress (``vote_menu_119_1.xml``, ids ``s-119-2025-N``) is
+not the daily job. ``run_sessions(senate_session="1"|"all")`` backfills it.
+The scheduled ``--source all`` run keeps calling ``run`` with no session, so
+it still posts only the current session. Vote POSTs are batched and spaced
+so a 650-roll backfill stays under the origin's ~100 requests / 5 minutes.
+``_post_ingest`` still applies Retry-After backoff when a POST is refused.
 """
 from __future__ import annotations
 
@@ -55,6 +62,12 @@ DETAIL_URL = (
 
 HORIZONS_BATCH_SIZE = 25
 DETAIL_DELAY_SECONDS = 0.5
+# Origin reads advertise `ratelimit-policy: 100;w=300`. One batch POST is
+# one request. 3.1s matches HorizonsIngestClient's list-GET gap: 99 gaps
+# are just over 5 minutes, so a sustained run cannot cross 100 requests
+# in that window. A 650-roll session is ~27 POSTs and finishes inside one
+# window. 429s are still retried by `_post_ingest` (Retry-After + backoff).
+POST_INTERVAL_SECONDS = 3.1
 
 _MONTHS = {
     "jan": 1,
@@ -115,6 +128,34 @@ def current_senate_session(today: date | None = None) -> tuple[int, int]:
     start_year = 1789 + (congress - 1) * 2
     session = 2 if today >= date(start_year + 1, 1, 3) else 1
     return congress, session
+
+
+def resolve_sessions(
+    senate_session: str | None,
+    *,
+    congress: int | None = None,
+    today: date | None = None,
+) -> list[tuple[int, int]]:
+    """``(congress, session)`` pairs for a manual backfill choice.
+
+    ``current`` is today's session only. ``1`` and ``2`` are that session of
+    ``congress`` (the current congress when ``congress`` is omitted).
+    ``all`` is sessions 1 then 2, so 2025 rolls are posted before the
+    session the daily job already covers.
+    """
+    today = today or date.today()
+    choice = (senate_session or "current").strip().lower()
+    current_congress_n, current_session_n = current_senate_session(today)
+    congress_n = current_congress_n if congress is None else int(congress)
+    if choice == "current":
+        return [(congress_n, current_session_n)]
+    if choice == "all":
+        return [(congress_n, 1), (congress_n, 2)]
+    if choice in ("1", "2"):
+        return [(congress_n, int(choice))]
+    raise ValueError(
+        f"senate_session must be current, 1, 2, or all (got {senate_session!r})"
+    )
 
 
 def _collapse(value: str | None) -> str:
@@ -433,12 +474,15 @@ def run(
     fetcher=None,
     lis_to_bioguide: dict[str, str] | None = None,
     include_records: bool = False,
+    sleeper=time.sleep,
 ) -> dict:
     """Fetch the current (or given) session menu and submit Senate roll calls.
 
     ``days_back`` limits which menu rows are posted. ``None`` posts the
     whole session. The same ``rc_id`` and detail ``source_url`` are produced
     on every run, and duplicate vote numbers in the menu are dropped.
+    Batches of ``HORIZONS_BATCH_SIZE`` are one origin POST each, with
+    ``POST_INTERVAL_SECONDS`` between them.
     """
     today = today or date.today()
     if congress is None or session is None:
@@ -505,7 +549,14 @@ def run(
                 len(rec.get("member_votes") or []),
             )
     elif client is not None and getattr(client, "configured", True):
-        for start in range(0, len(records), HORIZONS_BATCH_SIZE):
+        for index, start in enumerate(range(0, len(records), HORIZONS_BATCH_SIZE)):
+            if index:
+                logger.info(
+                    "Pacing Senate vote POST %.1fs "
+                    "(origin budget 100 requests / 5 min)",
+                    POST_INTERVAL_SECONDS,
+                )
+                sleeper(POST_INTERVAL_SECONDS)
             batch = records[start : start + HORIZONS_BATCH_SIZE]
             try:
                 result = client.submit_votes(batch) or {}
@@ -538,6 +589,100 @@ def run(
     if include_records:
         result["records"] = records
     return result
+
+
+def run_sessions(
+    *,
+    senate_session: str = "current",
+    congress: int | None = None,
+    days_back: int | None = None,
+    max_records: int | None = None,
+    dry_run: bool = False,
+    fetch_details: bool = True,
+    client=None,
+    today: date | None = None,
+    menu_xml: bytes | None = None,
+    fetcher=None,
+    lis_to_bioguide: dict[str, str] | None = None,
+    include_records: bool = False,
+    sleeper=time.sleep,
+) -> dict:
+    """Post one or more Senate sessions. ``current`` is today's session only.
+
+    ``1`` reads ``vote_menu_{congress}_1.xml`` (119th Congress → 2025,
+    ``s-119-2025-N``). ``all`` posts session 1, then session 2. Each session
+    reuses ``run`` (question, en-bloc results, Eastern offsets, member
+    positions, batched idempotent POSTs). The congress-legislators roster
+    is loaded once for a multi-session run.
+    """
+    today = today or date.today()
+    pairs = resolve_sessions(senate_session, congress=congress, today=today)
+    shared_menu = menu_xml if len(pairs) == 1 else None
+    if menu_xml is not None and len(pairs) != 1:
+        logger.warning("Ignoring menu_xml for a multi-session Senate backfill")
+
+    roster = lis_to_bioguide
+    if roster is None and fetch_details and len(pairs) > 1:
+        roster = load_lis_to_bioguide()
+
+    total: dict = {
+        "found": 0,
+        "parsed": 0,
+        "failed": 0,
+        "submitted": 0,
+        "sessions": [],
+    }
+    errors: list[str] = []
+    combined: list[dict] = []
+    for index, (congress_n, session_n) in enumerate(pairs):
+        if index and not dry_run:
+            logger.info(
+                "Pacing Senate vote POST %.1fs (origin budget 100 requests / 5 min)",
+                POST_INTERVAL_SECONDS,
+            )
+            sleeper(POST_INTERVAL_SECONDS)
+        logger.info(
+            "Senate roll calls congress=%s session=%s (requested %s)",
+            congress_n,
+            session_n,
+            senate_session or "current",
+        )
+        result = run(
+            congress=congress_n,
+            session=session_n,
+            days_back=days_back,
+            max_records=max_records,
+            dry_run=dry_run,
+            fetch_details=fetch_details,
+            client=client,
+            today=today,
+            menu_xml=shared_menu,
+            fetcher=fetcher,
+            lis_to_bioguide=roster,
+            include_records=include_records,
+            sleeper=sleeper,
+        )
+        for key in ("found", "parsed", "failed", "submitted"):
+            total[key] += int(result.get(key) or 0)
+        summary = {
+            "congress": congress_n,
+            "session": session_n,
+            "found": int(result.get("found") or 0),
+            "parsed": int(result.get("parsed") or 0),
+            "failed": int(result.get("failed") or 0),
+            "submitted": int(result.get("submitted") or 0),
+        }
+        if result.get("error"):
+            summary["error"] = result["error"]
+            errors.append(f"session {session_n}: {result['error']}")
+        total["sessions"].append(summary)
+        if include_records:
+            combined.extend(result.get("records") or [])
+    if errors:
+        total["error"] = "; ".join(errors)
+    if include_records:
+        total["records"] = combined
+    return total
 
 
 def _log(client, dry_run: bool, found: int, parsed: int, failed: int, note: str = "") -> None:
