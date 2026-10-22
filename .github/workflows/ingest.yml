@@ -24,6 +24,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
 
       - name: Run ingest
+        # --source all is House/Senate disclosures plus Senate roll calls.
+        # senate.gov blocks the Hostinger IP, so this runner fetches LIS XML.
         env:
           # Horizons HTTP ingest API (X-Ingest-Key). Superuser PB path not required.
           HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}

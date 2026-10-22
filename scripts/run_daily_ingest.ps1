@@ -1,5 +1,6 @@
 # Daily disclosure ingest (free local runner).
-# Loads .env from repo root, runs house+senate via Horizons API.
+# Loads .env from repo root, runs house+senate disclosures and Senate
+# roll calls via Horizons API.
 # Exit codes: 0 ok, 1 missing config, other = python exit code
 
 $ErrorActionPreference = "Continue"
