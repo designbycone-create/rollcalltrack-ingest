@@ -3,11 +3,13 @@
   python -m ingest.main --source house --dry-run
   python -m ingest.main --source senate --max-filings 1
   python -m ingest.main --source house --filing-id 20035588
+  python -m ingest.main --source house --live
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from contextlib import nullcontext
 
@@ -67,6 +69,14 @@ def main():
         help="Parse and log but don't write (no secrets required for house/senate)",
     )
     parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Post filings and transactions to the configured endpoint. "
+            "Required unless INGEST_LIVE=1. Tests cannot use this to reach production."
+        ),
+    )
+    parser.add_argument(
         "--full-refresh",
         action="store_true",
         help="Full directory refresh (fjc; this job has no incremental mode)",
@@ -118,6 +128,9 @@ def main():
         help="Agency name/abbrev (usaspending or oversight)",
     )
     args = parser.parse_args()
+
+    if args.live:
+        os.environ["INGEST_LIVE"] = "1"
 
     if args.filing_id and args.source != "house":
         logger.error(

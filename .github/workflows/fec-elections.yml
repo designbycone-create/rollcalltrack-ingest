@@ -30,6 +30,7 @@ jobs:
       - name: Run OpenFEC candidate ingest
         env:
           HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_LIVE: "1"
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
           FEC_API_KEY: ${{ secrets.FOIA_GOV_API_KEY }}
           FOIA_GOV_API_KEY: ${{ secrets.FOIA_GOV_API_KEY }}

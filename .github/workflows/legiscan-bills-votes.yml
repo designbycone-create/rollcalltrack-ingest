@@ -43,6 +43,7 @@ jobs:
       - name: Run LegiScan bills/votes
         env:
           HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_LIVE: "1"
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
           LEGISCAN_API_KEY: ${{ secrets.LEGISCAN_API_KEY }}
         run: |

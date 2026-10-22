@@ -634,6 +634,8 @@ def run(
                 if bioguide:
                     filing["bioguide_id"] = bioguide
                 result = hz.submit_filing(filing, transactions=txns)
+                if result.get("skipped"):
+                    continue
                 logger.info(
                     "House submitted filing_id=%s txns=%s name=%r",
                     result.get("filing_id"),

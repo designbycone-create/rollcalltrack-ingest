@@ -16,6 +16,7 @@ from typing import Any
 import requests
 
 from . import config
+from .guards import assert_remote_post_allowed, skip_reason
 from .names import normalize_state, parse_filer_name, parse_state_district
 
 logger = logging.getLogger("rollcalltrack_ingest.db")
@@ -66,6 +67,7 @@ class PocketBase:
         return resp.json()
 
     def create(self, collection: str, body: dict) -> dict:
+        assert_remote_post_allowed(self.base)
         resp = self.session.post(
             self._url(collection),
             json=body,
@@ -80,6 +82,7 @@ class PocketBase:
         return resp.json()
 
     def update(self, collection: str, record_id: str, body: dict) -> dict:
+        assert_remote_post_allowed(self.base)
         resp = self.session.patch(
             self._url(collection, record_id),
             json=body,
@@ -190,6 +193,8 @@ def upsert_filing(conn: PocketBase, filing: dict) -> str:
     source_url = filing.get("source_url") or ""
     if not source_url:
         raise ValueError("source_url is required — refuse to store filing without origin link")
+    if skip_reason(filing, kind="filing", require_name=True):
+        return ""
 
     body = {
         "chamber": filing.get("chamber") if filing.get("chamber") in ("house", "senate") else None,
@@ -235,6 +240,8 @@ def upsert_transaction(conn: PocketBase, txn: dict) -> None:
     filing_id = txn.get("filing_id")
     if not filing_id:
         raise ValueError("filing_id required")
+    if skip_reason(txn, kind="transaction", require_name=False):
+        return
     if txn.get("line_index") is None:
         raise ValueError("line_index required")
     try:

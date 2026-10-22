@@ -26,6 +26,7 @@ jobs:
       - name: Run JCS snapshot
         env:
           HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_LIVE: "1"
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
         run: |
           DRY="${{ github.event.inputs.dry_run }}"

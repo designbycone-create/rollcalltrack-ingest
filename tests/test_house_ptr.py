@@ -1,5 +1,6 @@
 """House PTR text parsing: tickers and wrapped amount rows."""
 import re
+from datetime import date
 
 from ingest import db
 from ingest.house import _ocr_page, extract_ticker, parse_ptr_transactions
@@ -206,7 +207,11 @@ def test_horizons_payload_includes_line_index_and_ticker(monkeypatch):
     monkeypatch.setattr(hz, "_post_ingest", fake_post)
     txns = parse_ptr_transactions(_IDENTICAL_LMT_LINES)
     hz.submit_filing(
-        {"source_url": "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20035588.pdf"},
+        {
+            "source_url": "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20035588.pdf",
+            "member_name": "Kevin Hern",
+            "filing_date": date.today().isoformat(),
+        },
         transactions=txns,
     )
     rows = seen["body"]["payload"]["transactions"]

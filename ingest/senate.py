@@ -403,6 +403,8 @@ def run(
                 result = hz.submit_filing(
                     filing, transactions=detail["transactions"]
                 )
+                if result.get("skipped"):
+                    continue
                 logger.info(
                     "Senate submitted filing_id=%s txns=%s name=%r",
                     result.get("filing_id"),

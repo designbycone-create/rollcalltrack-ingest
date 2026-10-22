@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 import requests
 
 from . import config
+from .guards import assert_remote_post_allowed, skip_reason
 from .legislators import match_legislator
 from .names import (
     member_record_compatible,
@@ -124,6 +125,7 @@ class HorizonsIngestClient:
         return False
 
     def _post_ingest(self, body: dict, path: str = "/hcgi/api/ingest/disclosures") -> requests.Response:
+        assert_remote_post_allowed(self.base)
         delay = 5.0
         last = None
         for attempt in range(6):
@@ -1271,6 +1273,12 @@ class HorizonsIngestClient:
         """POST type=filing with nested payload. Returns API JSON body."""
         if not filing.get("source_url"):
             raise ValueError("source_url is required on every filing")
+        if skip_reason(filing, kind="filing", require_name=True):
+            return {
+                "ok": False,
+                "skipped": True,
+                "transactions_written": 0,
+            }
 
         prepared: list[dict] = []
         for i, txn in enumerate(transactions or []):
@@ -1279,6 +1287,8 @@ class HorizonsIngestClient:
             # can tell identical trades apart.
             if row.get("line_index") is None:
                 row["line_index"] = i
+            if skip_reason(row, kind="transaction", require_name=False):
+                continue
             prepared.append(row)
         txns = [clean_transaction(t) for t in prepared]
         filing_out = {

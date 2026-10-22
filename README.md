@@ -23,8 +23,10 @@ Auth is a single header: `X-Ingest-Key`. No superuser password required.
      `https://<app-id>.app-preview.com`
    - `INGEST_API_KEY` — sent as `X-Ingest-Key` (from Horizons env vars)
 3. Test parse-only (no API): `python -m ingest.main --source house --dry-run`
-4. Test a real write once secrets are set (members must already exist in
-   Horizons for name matching to succeed).
+4. A real write requires `--live` or `INGEST_LIVE=1` in addition to the
+   secrets (members must already exist in Horizons for name matching to
+   succeed). Pytest never posts to that endpoint: tests stay dry-run even
+   if the variable is set in the environment.
 
 ## Running on a schedule (free options)
 
@@ -107,8 +109,8 @@ be re-posted by House DocID. `--filing-id` ignores `--days-back` and
 The flag is only valid with `--source house`.
 
 ```bash
-python -m ingest.main --source house --filing-id 20035588
-python -m ingest.main --source house --filing-id 20035588 --year 2026
+python -m ingest.main --source house --live --filing-id 20035588
+python -m ingest.main --source house --live --filing-id 20035588 --year 2026
 ```
 
 Kevin Hern's PTR `20035588` is the case this fixes: 24 transaction lines,

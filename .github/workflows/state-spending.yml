@@ -42,6 +42,7 @@ jobs:
       - name: Run state spending ingest
         env:
           HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_LIVE: "1"
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
         run: |
           FY="${{ github.event.inputs.fiscal_year }}"

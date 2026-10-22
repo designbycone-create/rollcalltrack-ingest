@@ -64,11 +64,11 @@ if (-not $py -or -not (Test-Path $py)) {
 }
 Write-Log "python=$py"
 
-Write-Log "running: $py -m ingest.main --source all"
+Write-Log "running: $py -m ingest.main --source all --live"
 
 # Native Python writes logs to stderr; do not treat as terminating errors.
 $p = Start-Process -FilePath $py `
-    -ArgumentList @("-m", "ingest.main", "--source", "all") `
+    -ArgumentList @("-m", "ingest.main", "--source", "all", "--live") `
     -WorkingDirectory $RepoRoot `
     -NoNewWindow `
     -Wait `
