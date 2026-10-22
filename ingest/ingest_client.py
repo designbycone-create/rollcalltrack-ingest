@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 
@@ -41,6 +41,35 @@ INGEST_BACKOFF_BASE = 5.0
 INGEST_BACKOFF_CAP = 90.0
 
 logger = logging.getLogger("rollcalltrack_ingest.ingest_client")
+
+_PB_META = ("collectionId", "collectionName", "created", "updated")
+# Public member-disclosure reads 429 after a short burst. Pace the catalog
+# and the lookups that follow it on the same client.
+_LIST_GET_INTERVAL_SECONDS = 1.0
+_LIST_RETRY_STATUS = frozenset({403, 429, 500, 502, 503, 504})
+
+
+class DisclosureListError(RuntimeError):
+    """Raised when no disclosure list route returns filings.
+
+    A missing route must not look like an empty catalog. An empty catalog
+    makes the backfill report zero changes and exit 0.
+    """
+
+
+def _without_server_meta(row: dict) -> dict:
+    return {key: value for key, value in row.items() if key not in _PB_META}
+
+
+def _row_id_is_bioguide(member: dict) -> bool:
+    """True when this row's id is a congressional bioguide, not a database id."""
+    member_id = str(member.get("id") or "").strip()
+    bioguide = str(member.get("bioguide_id") or "").strip()
+    if not member_id:
+        return False
+    if bioguide and member_id.upper() == bioguide.upper():
+        return True
+    return bool(re.fullmatch(r"[A-Za-z]\d{6}", member_id))
 
 
 class LookupRateLimited(RuntimeError):
@@ -191,6 +220,8 @@ class HorizonsIngestClient:
         self.timeout = timeout or config.REQUEST_TIMEOUT_SECONDS
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.USER_AGENT})
+        self._min_get_interval = 0.0
+        self._last_get_at = 0.0
         # Name/state/chamber → member or None. Lives for this client (one run).
         self._lookup_cache: dict[tuple[str, str, str, str], dict | None] = {}
 
@@ -198,7 +229,23 @@ class HorizonsIngestClient:
     def configured(self) -> bool:
         return bool(self.base and self.ingest_key)
 
+    def _pace_get(self) -> None:
+        interval = float(getattr(self, "_min_get_interval", 0) or 0)
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        wait = self._last_get_at + interval - now
+        if wait > 0:
+            time.sleep(wait)
+        self._last_get_at = time.monotonic()
+
+    def _slow_list_gets(self) -> None:
+        current = float(getattr(self, "_min_get_interval", 0) or 0)
+        base = current if current > 0 else _LIST_GET_INTERVAL_SECONDS
+        self._min_get_interval = min(base * 2, 4.0)
+
     def _get(self, path: str, params: dict | None = None) -> requests.Response:
+        self._pace_get()
         url = f"{self.base}{path}"
         if params:
             url = f"{url}?{urlencode(params)}"
@@ -1120,70 +1167,215 @@ class HorizonsIngestClient:
         return data
 
     def list_disclosure_filings(self) -> list[dict]:
-        """Page through stored disclosure filings. Empty list when no route answers."""
-        return self._list_first(
-            (
-                "/hcgi/api/filings",
-                "/hcgi/api/disclosures",
-                "/hcgi/api/disclosures/filings",
-            ),
-            ("items", "filings", "disclosure_filings"),
-        )
+        """Every stored disclosure filing, with that filing's transactions nested.
+
+        Public reads are ``GET /hcgi/api/members`` (paged) and
+        ``GET /hcgi/api/members/{id}/disclosures``. ``/hcgi/api/filings`` and
+        ``/hcgi/api/disclosures/filings`` are not deployed. Raises
+        ``DisclosureListError`` when those reads do not answer.
+        """
+        filings, _transactions = self._disclosure_catalog()
+        return filings
 
     def list_disclosure_transactions(self) -> list[dict]:
-        """Page through stored disclosure transactions."""
-        return self._list_first(
-            (
-                "/hcgi/api/transactions",
-                "/hcgi/api/disclosures/transactions",
-            ),
-            ("items", "transactions"),
-        )
+        """Transactions belonging to the filings from ``list_disclosure_filings``."""
+        _filings, transactions = self._disclosure_catalog()
+        return transactions
 
-    def _list_first(self, paths: tuple[str, ...], item_keys: tuple[str, ...]) -> list[dict]:
-        for path in paths:
-            rows = self._list_pages(path, item_keys)
-            if rows is not None:
-                logger.info("Listed %d rows from %s", len(rows), path)
-                return rows
-        logger.warning("No list route responded for %s", ", ".join(paths))
-        return []
+    def _disclosure_catalog(self) -> tuple[list[dict], list[dict]]:
+        cached = getattr(self, "_disclosure_catalog_cache", None)
+        if cached is not None:
+            return cached
+        catalog = self._fetch_disclosure_catalog()
+        self._disclosure_catalog_cache = catalog
+        return catalog
 
-    def _list_pages(self, path: str, item_keys: tuple[str, ...]) -> list[dict] | None:
-        """Return rows, or None when this path is not deployed (404)."""
-        out: list[dict] = []
-        page = 1
-        while page <= 200:
+    def _fetch_disclosure_catalog(self) -> tuple[list[dict], list[dict]]:
+        # Keep this interval for later member lookups in the same process.
+        # A burst of /members/{id}/disclosures returns HTTP 429 and a partial
+        # catalog would under-count the filings the backfill is supposed to see.
+        if float(getattr(self, "_min_get_interval", 0) or 0) <= 0:
+            self._min_get_interval = _LIST_GET_INTERVAL_SECONDS
+        members = self._list_federal_members()
+        filings_by_id: dict[str, dict] = {}
+        transactions: list[dict] = []
+        seen_tx: set[tuple[str, str, str]] = set()
+        disclosures_ok = 0
+        for member in members:
+            member_key = str(member.get("id") or member.get("bioguide_id") or "").strip()
+            if not member_key:
+                continue
+            path = f"/hcgi/api/members/{quote(member_key, safe='')}/disclosures"
             try:
-                resp = self._get(path, {"page": page, "limit": 100})
-            except requests.RequestException as e:
-                logger.warning("list %s failed: %s", path, e)
-                return []
+                resp = self._get_ok(path)
+            except Exception as exc:
+                raise DisclosureListError(
+                    f"GET {path} failed: {exc}. Refusing a partial filing list."
+                ) from exc
             if resp.status_code == 404:
-                return None
+                continue
             if resp.status_code != 200:
-                logger.warning("list %s HTTP %s", path, resp.status_code)
-                return []
+                raise DisclosureListError(
+                    f"GET {path} HTTP {resp.status_code}. "
+                    "Refusing a partial filing list."
+                )
             try:
                 data = resp.json()
-            except ValueError:
-                return []
-            rows: list[dict] = []
-            for key in item_keys:
-                candidate = data.get(key)
-                if candidate:
-                    rows = candidate
-                    break
+            except ValueError as exc:
+                raise DisclosureListError(
+                    f"GET {path} did not return JSON. Refusing a partial filing list."
+                ) from exc
+            disclosures_ok += 1
+            if disclosures_ok % 50 == 0:
+                logger.info(
+                    "disclosure list progress members=%d filings=%d",
+                    disclosures_ok,
+                    len(filings_by_id),
+                )
+            member_filings = [
+                _without_server_meta(row)
+                for row in (data.get("filings") or [])
+                if isinstance(row, dict)
+            ]
+            member_txns = [
+                _without_server_meta(row)
+                for row in (data.get("transactions") or [])
+                if isinstance(row, dict)
+            ]
+            grouped: dict[str, list[dict]] = {}
+            for txn in member_txns:
+                filing_id = str(txn.get("filing_id") or "").strip()
+                identity = (
+                    filing_id,
+                    str(txn.get("id") or ""),
+                    str(txn.get("line_index")),
+                )
+                if identity in seen_tx:
+                    continue
+                seen_tx.add(identity)
+                transactions.append(txn)
+                grouped.setdefault(filing_id, []).append(txn)
+            for filing in member_filings:
+                filing_id = str(filing.get("id") or "").strip()
+                owned = grouped.get(filing_id, [])
+                owned.sort(key=lambda row: (row.get("line_index") is None, row.get("line_index") or 0))
+                if filing_id and filing_id in filings_by_id:
+                    existing = filings_by_id[filing_id]
+                    have = {
+                        (
+                            str(row.get("id") or ""),
+                            str(row.get("line_index")),
+                        )
+                        for row in existing.get("transactions") or []
+                    }
+                    for txn in owned:
+                        key = (str(txn.get("id") or ""), str(txn.get("line_index")))
+                        if key not in have:
+                            existing.setdefault("transactions", []).append(txn)
+                    continue
+                filing = dict(filing)
+                filing["transactions"] = owned
+                key = filing_id or str(filing.get("source_url") or len(filings_by_id))
+                filings_by_id[key] = filing
+        if disclosures_ok == 0:
+            raise DisclosureListError(
+                "GET /hcgi/api/members/{id}/disclosures did not return a filing list. "
+                "GET /hcgi/api/filings, /hcgi/api/disclosures/filings, and "
+                "/hcgi/api/transactions are not deployed."
+            )
+        filings = list(filings_by_id.values())
+        house = sum(1 for row in filings if str(row.get("chamber") or "").lower() == "house")
+        senate = sum(1 for row in filings if str(row.get("chamber") or "").lower() == "senate")
+        logger.info(
+            "Listed %d filings (%d House, %d Senate) and %d transactions "
+            "from %d members via /hcgi/api/members/{id}/disclosures",
+            len(filings),
+            house,
+            senate,
+            len(transactions),
+            disclosures_ok,
+        )
+        return filings, transactions
+
+    def _list_federal_members(self) -> list[dict]:
+        """Page GET /hcgi/api/members?jurisdiction=federal."""
+        out: list[dict] = []
+        page = 1
+        limit = 100
+        while page <= 30:
+            path = "/hcgi/api/members"
+            try:
+                resp = self._get_ok(
+                    path,
+                    {"page": page, "limit": limit, "jurisdiction": "federal"},
+                )
+            except requests.RequestException as exc:
+                raise DisclosureListError(
+                    f"GET {path} failed: {exc}"
+                ) from exc
+            if resp.status_code == 429:
+                raise DisclosureListError(
+                    f"GET {path} stayed rate-limited (HTTP 429)"
+                )
+            if resp.status_code == 404:
+                raise DisclosureListError(
+                    "GET /hcgi/api/members returned 404. "
+                    "Disclosure filings are not listed on /hcgi/api/filings, "
+                    "/hcgi/api/disclosures, or /hcgi/api/disclosures/filings."
+                )
+            if resp.status_code != 200:
+                raise DisclosureListError(
+                    f"GET {path} HTTP {resp.status_code}"
+                )
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise DisclosureListError(
+                    f"GET {path} did not return JSON"
+                ) from exc
+            rows = data.get("items") or data.get("members") or []
+            if not isinstance(rows, list):
+                raise DisclosureListError(f"GET {path} items were not a list")
+            out.extend(row for row in rows if isinstance(row, dict))
             if not rows:
                 break
-            out.extend(rows)
             total = data.get("total")
+            total_pages = data.get("totalPages")
             if total is not None and len(out) >= int(total):
                 break
-            if len(rows) < 100:
+            if total_pages is not None and page >= int(total_pages):
+                break
+            if total is None and total_pages is None and len(rows) < limit:
                 break
             page += 1
         return out
+
+    def _get_ok(self, path: str, params: dict | None = None, attempts: int = 8):
+        """GET, backing off on rate limits and transient gateway errors."""
+        delay = 3.0
+        last = None
+        for attempt in range(attempts):
+            try:
+                last = self._get(path, params)
+            except Exception as exc:
+                if attempt == attempts - 1:
+                    raise
+                self._slow_list_gets()
+                logger.warning("list %s error %s, retry in %ss", path, exc, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            if last.status_code not in _LIST_RETRY_STATUS:
+                return last
+            if attempt == attempts - 1:
+                break
+            self._slow_list_gets()
+            logger.warning(
+                "list %s HTTP %s, retry in %ss", path, last.status_code, delay
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+        return last
 
     def lookup_member_by_name(
         self,
@@ -1273,7 +1465,16 @@ class HorizonsIngestClient:
                 )
                 rate_limited = True
                 return None
-            return accept_name_hit(candidate, member)
+            hit = accept_name_hit(candidate, member)
+            if hit and _row_id_is_bioguide(hit):
+                logger.info(
+                    "Member lookup name=%r id=%s is a bioguide; "
+                    "continuing to the database id",
+                    candidate,
+                    hit.get("id"),
+                )
+                return None
+            return hit
 
         for candidate in lookup_names:
             hit = lookup_name(candidate)

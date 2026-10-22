@@ -364,6 +364,41 @@ def test_live_does_not_replace_trades_when_none_were_listed(monkeypatch):
     assert result["unresolved"] == 1
 
 
+def test_run_fails_when_the_list_route_does_not_answer():
+    from ingest.ingest_client import DisclosureListError
+
+    class _Broken:
+        def list_disclosure_filings(self):
+            raise DisclosureListError("GET /hcgi/api/members returned 404")
+
+        def list_disclosure_transactions(self):
+            raise AssertionError("filings list should have failed first")
+
+    result = run(client=_Broken(), live=False)
+    assert result["ok"] is False
+    assert result["filings_changed"] == 0
+    assert "404" in result["error"]
+
+
+def test_cli_exits_when_the_list_route_does_not_answer(monkeypatch):
+    import ingest.backfill_members as mod
+
+    monkeypatch.setattr(
+        mod,
+        "run",
+        lambda client=None, live=False: {
+            "ok": False,
+            "error": "GET /hcgi/api/members returned 404",
+            "dry_run": True,
+            "filings_changed": 0,
+            "transactions_changed": 0,
+            "unresolved": 0,
+        },
+    )
+    monkeypatch.setattr(mod, "get_client", lambda: object())
+    assert mod.main([]) == 1
+
+
 def test_cli_defaults_to_dry_run(monkeypatch):
     import ingest.backfill_members as mod
 

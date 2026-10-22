@@ -139,6 +139,17 @@ writer then stores the filing with no member link). When no transactions
 were listed, the live run does not POST, because an empty list would drop
 trades.
 
+Filings are read from `GET /hcgi/api/members` (paged) and
+`GET /hcgi/api/members/{id}/disclosures`, which returns that member's
+filings and transactions (`line_index`, `ticker`, `ticker_confidence`)
+side by side. `GET /hcgi/api/filings`, `GET /hcgi/api/disclosures/filings`,
+and `GET /hcgi/api/transactions` are not deployed. `GET /hcgi/api/disclosures/recent`
+is a capped transaction feed and is not the filing index. If the members
+route does not answer, or a member disclosure stays rate-limited or
+unavailable, the command exits non-zero instead of reporting zero
+changes or a partial list. Reads are paced so the public list does not
+return HTTP 429, and they do not need `INGEST_API_KEY`.
+
 ```bash
 python -m ingest.backfill_members
 python -m ingest.backfill_members --live

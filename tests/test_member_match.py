@@ -315,6 +315,41 @@ def test_lookup_tries_full_name_then_last_name_then_bioguide(monkeypatch):
     assert all("district" not in call for call in calls)
 
 
+def test_lookup_skips_a_bioguide_name_hit_for_the_database_id(monkeypatch):
+    """Name search can return the bioguide as id. The database id is the bioguide query."""
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    calls = []
+
+    def fake_lookup(**params):
+        calls.append(params)
+        if params.get("bioguide_id") == "T000490":
+            return {
+                "id": "j43grpn4xtl9mip",
+                "bioguide_id": "T000490",
+                "name": "David J. Taylor",
+                "state": "Ohio",
+                "party": "R",
+            }
+        return {
+            "id": "T000490",
+            "bioguide_id": "T000490",
+            "name": "David J. Taylor",
+            "state": "Ohio",
+            "party": "R",
+        }
+
+    monkeypatch.setattr(hz, "_lookup_http", fake_lookup)
+    monkeypatch.setattr("ingest.ingest_client.match_legislator", lambda *a, **k: None)
+    member = hz.lookup_member_by_name(
+        "David J. Taylor",
+        state="OH",
+        bioguide_id="T000490",
+        chamber="house",
+    )
+    assert member["id"] == "j43grpn4xtl9mip"
+    assert calls[-1] == {"bioguide_id": "T000490"}
+
+
 def test_lookup_stops_when_full_name_and_state_match(monkeypatch):
     hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
     calls = []
