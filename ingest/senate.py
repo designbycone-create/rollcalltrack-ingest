@@ -290,12 +290,12 @@ def _normalize_owner(raw: str) -> str:
 
 def run(
     conn=None,
-    days_back: int = 2,
+    days_back: int = 90,
     dry_run: bool = False,
     max_filings: int | None = None,
     client: HorizonsIngestClient | None = None,
 ) -> dict:
-    """days_back is intentionally short for the daily scheduled job."""
+    """days_back defaults to 90 so filings stored without a member are rematched."""
     found, parsed, failed = 0, 0, 0
     since = date.today() - timedelta(days=days_back)
     hz = client if client is not None else (
@@ -312,13 +312,13 @@ def run(
         logger.error("Failed to search Senate eFD: %s", e)
         if use_hz:
             hz.submit_ingestion_log(
-                "senate_efd", 0, 0, 0, note=f"search failed: {e}"
+                "senate_efd", 0, 0, 1, note=f"search failed: {e}"
             )
         elif conn is not None and not dry_run:
             db.log_ingestion_run(
-                conn, "senate", 0, 0, 0, note=f"search failed: {e}"
+                conn, "senate", 0, 0, 1, note=f"search failed: {e}"
             )
-        return {"found": 0, "parsed": 0, "failed": 0}
+        return {"found": 0, "parsed": 0, "failed": 1, "error": "search failed"}
 
     if max_filings is not None:
         filings = filings[:max_filings]
@@ -367,6 +367,7 @@ def run(
                 member = hz.lookup_member_by_name(
                     rec["name"],
                     office=rec.get("office"),
+                    chamber="senate",
                 )
                 if not member:
                     logger.warning(

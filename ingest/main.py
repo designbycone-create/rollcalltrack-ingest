@@ -142,7 +142,7 @@ def main():
     with cm as conn:
         if args.source in ("house", "all"):
             logger.info("=== Running House ingest ===")
-            house_days = args.days_back if args.days_back is not None else 14
+            house_days = args.days_back if args.days_back is not None else 90
             max_f = args.max_filings
             if args.dry_run and max_f is None:
                 max_f = 5
@@ -157,7 +157,7 @@ def main():
 
         if args.source in ("senate", "all"):
             logger.info("=== Running Senate ingest ===")
-            senate_days = args.days_back if args.days_back is not None else 2
+            senate_days = args.days_back if args.days_back is not None else 90
             max_f = args.max_filings
             if args.dry_run and max_f is None:
                 max_f = 5
@@ -372,6 +372,36 @@ def main():
     logger.info("=== Run summary ===")
     for source, r in results.items():
         logger.info("%s: %s", source, r)
+    _write_step_summary(results)
+    failed = 0
+    for r in results.values():
+        if isinstance(r, dict):
+            failed += int(r.get("failed") or 0)
+    if failed:
+        logger.error(
+            "Ingest finished with %s failed record(s). "
+            "See the log above for source_url and HTTP status.",
+            failed,
+        )
+        sys.exit(1)
+
+
+def _write_step_summary(results: dict) -> None:
+    """GitHub Actions job summary when GITHUB_STEP_SUMMARY is set."""
+    import os
+
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    lines = ["## Disclosure ingest", ""]
+    for source, result in results.items():
+        lines.append(f"- **{source}**: `{result}`")
+    lines.append("")
+    try:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+    except OSError as e:
+        logger.warning("Could not write GITHUB_STEP_SUMMARY: %s", e)
 
 
 if __name__ == "__main__":
