@@ -1014,7 +1014,17 @@ _GENERIC_ASSET_TOKENS = {
 def _is_form_boilerplate(upper: str) -> bool:
     """Preprinted instructions and the sample 'Example Mega Corp' row."""
     letters = re.sub(r"[^A-Z]", "", upper)
-    if "FILEAN" in letters or "NOTHINGTOREPORT" in letters or "PENALTY" in letters:
+    if "FILEAN" in letters or "NOTHINGTOREPORT" in letters:
+        return True
+    # "A $200 penalty shall be assessed" — OCR drops the L in penalty.
+    if "PENALTY" in letters or "PENAITY" in letters or "PENALTI" in letters:
+        return True
+    if "ASSESSED" in letters and ("PENAL" in letters or "SHALL" in letters or "SHAIL" in letters):
+        return True
+    # "State CA District 17" is the member header. OCR writes STNCT / DISTUCT.
+    if "STNCT" in letters or "DISTNET" in letters or "DISTUCT" in letters:
+        return True
+    if "STATE" in letters and "DIST" in letters and len(letters) <= 28:
         return True
     if any(snip in letters for snip in ("ORIGINALAND", "ORGINALAND", "ONGINALAND")):
         return True

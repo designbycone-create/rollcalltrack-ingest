@@ -66,7 +66,10 @@ def test_form_instructions_and_sample_row_are_not_transactions():
         "CORPORATION CMN CLASS B",
         "Please see the attached schedule",
         "200 penalty shail be assessed against anyone who files late",
+        "200 penaity shall be assessed against",
         "ICLASS A",
+        "State CA CD stnct. 17",
+        "State CA Distuct 17",
     ]
     for name in rejected:
         assert _plausible_asset(_clean_asset(name)[1]) is False, name
