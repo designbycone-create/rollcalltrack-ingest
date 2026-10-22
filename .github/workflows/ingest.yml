@@ -16,13 +16,16 @@ on:
           - "2"
           - all
       dry_run:
-        description: "true = parse and do not POST. Scheduled runs ignore this and post. Set true before a session 1 or all backfill."
+        # Do not offer true/false. GitHub coerces those choice strings to
+        # booleans, the selected true fails to match, and the default false
+        # is what the expression inserts (run 39839118977 posted 659 rolls).
+        description: "dry-run does not POST. live posts. true, false, empty, or any other value does not POST. Scheduled runs ignore this and post."
         required: false
         type: choice
-        default: "false"
+        default: dry-run
         options:
-          - "false"
-          - "true"
+          - dry-run
+          - live
 
 jobs:
   ingest:
@@ -50,38 +53,14 @@ jobs:
         # session only. senate.gov blocks the Hostinger IP, so this runner
         # fetches LIS XML. A dispatch with senate_session=1 or all backfills
         # that session and does not re-run disclosures.
+        # INGEST_LIVE is not set here. scripts/dispatch_ingest.sh exports it
+        # only for the schedule or an explicit dry_run=live choice.
         env:
-          # Horizons HTTP ingest API. Auth is X-Ingest-Key from INGEST_API_KEY.
           HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
-          INGEST_LIVE: "1"
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
-        run: |
-          set -euo pipefail
-          # Scheduled runs stay on the current Senate session. Inputs are dispatch-only.
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            python -m ingest.main --source all --live
-            exit 0
-          fi
-          SESSION="${{ inputs.senate_session }}"
-          SESSION="${SESSION:-current}"
-          DRY="${{ inputs.dry_run }}"
-          DRY="${DRY:-false}"
-          case "$SESSION" in
-            current|1|2|all) ;;
-            *)
-              echo "Invalid senate_session: $SESSION" >&2
-              exit 1
-              ;;
-          esac
-          if [ "$SESSION" = "current" ]; then
-            CMD=(python -m ingest.main --source all)
-          else
-            CMD=(python -m ingest.main --source senate_votes --senate-session "$SESSION")
-          fi
-          if [ "$DRY" = "true" ]; then
-            CMD+=(--dry-run)
-          else
-            CMD+=(--live)
-          fi
-          echo "Running: ${CMD[*]}"
-          "${CMD[@]}"
+          DISPATCH_EVENT: ${{ github.event_name }}
+          # github.event.inputs keeps the raw string. The inputs context
+          # boolean-coerces the words true and false.
+          DISPATCH_SESSION: ${{ github.event.inputs.senate_session }}
+          DISPATCH_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: bash scripts/dispatch_ingest.sh
