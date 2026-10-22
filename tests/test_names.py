@@ -1,5 +1,12 @@
 """Offline unit tests for name normalization / member-match keys."""
-from ingest.names import parse_filer_name, parse_state_district, normalize_state
+from ingest.names import (
+    first_names_compatible,
+    member_record_compatible,
+    parse_filer_name,
+    parse_state_district,
+    normalize_state,
+    state_display_name,
+)
 
 
 def test_house_middle_name_variants():
@@ -39,6 +46,43 @@ def test_state_district():
     assert parse_state_district("CA33") == ("CA", 33)
     assert normalize_state("California") == "CA"
     assert normalize_state("al") == "AL"
+    assert state_display_name("NJ") == "New Jersey"
+    assert state_display_name("DC") == "District of Columbia"
+
+
+def test_embedded_title_and_nickname_quotes():
+    p = parse_filer_name('Richard Dean Dr McCormick')
+    assert p.first == "Richard" and p.last == "McCormick"
+    assert "dr" not in [t.lower() for t in p.middle_tokens]
+    chuck = parse_filer_name('Charles J. "Chuck" Fleischmann')
+    assert chuck.first == "Charles" and chuck.last == "Fleischmann"
+    assert first_names_compatible("Josh", "Joshua")
+    assert first_names_compatible("Rohit", "Ro")
+    assert first_names_compatible("Thomas", "Tommy")
+    assert not first_names_compatible("Josh", "John")
+
+
+def test_lookup_hit_must_be_the_same_person():
+    assert not member_record_compatible(
+        "Richard W. Allen",
+        {"id": "M001218", "bioguide_id": "M001218", "name": "Richard McCormick", "state": "Georgia"},
+        state="GA",
+    )
+    assert not member_record_compatible(
+        "Richard W. Allen",
+        {"id": "LS25179", "bioguide_id": "LS25179", "name": "Gary Richardson", "state": "GA"},
+        state="GA",
+    )
+    assert member_record_compatible(
+        "Rohit Khanna",
+        {"id": "K000389", "bioguide_id": "K000389", "name": "Ro Khanna", "state": "California"},
+        state="CA",
+    )
+    assert member_record_compatible(
+        "Josh Gottheimer",
+        {"id": "G000583", "bioguide_id": "G000583", "name": "Josh Gottheimer", "state": "New Jersey"},
+        state="NJ",
+    )
 
 
 if __name__ == "__main__":
@@ -49,6 +93,8 @@ if __name__ == "__main__":
         test_senate_office_expands_name,
         test_title_stripped,
         test_state_district,
+        test_embedded_title_and_nickname_quotes,
+        test_lookup_hit_must_be_the_same_person,
     ]:
         fn()
         print("ok", fn.__name__)

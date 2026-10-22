@@ -18,7 +18,13 @@ from urllib.parse import urlencode
 import requests
 
 from . import config
-from .names import parse_filer_name, parse_state_district
+from .legislators import match_legislator
+from .names import (
+    member_record_compatible,
+    parse_filer_name,
+    parse_state_district,
+    state_display_name,
+)
 
 logger = logging.getLogger("rollcalltrack_ingest.ingest_client")
 
@@ -985,11 +991,14 @@ class HorizonsIngestClient:
         office: str | None = None,
         bioguide_id: str | None = None,
         state_district: str | None = None,
+        chamber: str | None = None,
     ) -> dict | None:
         """Resolve a filer to a Horizons members row.
 
-        Tries bioguide_id, then multiple name formats (First Last and Last, First),
-        then congress roster → bioguide. Logs every attempt.
+        Order: explicit bioguide, local congress-legislators match, then
+        name search. Name hits are rejected unless the last name and given
+        name agree (the API has returned a different member, and a 2-letter
+        state code does not match the stored full state name).
         """
         if state_district and (state is None or district is None):
             sc, dist = parse_state_district(state_district)
@@ -1000,13 +1009,30 @@ class HorizonsIngestClient:
         # 1) bioguide exact
         if bioguide_id:
             member = self._lookup_http(bioguide_id=bioguide_id)
-            if member:
+            if member and member_record_compatible(
+                name, member, state=state, office=office
+            ):
                 logger.info(
                     "Member lookup bioguide_id=%s → %s (%s)",
                     bioguide_id,
                     member.get("id"),
                     member.get("name"),
                 )
+                return member
+
+        # 2) Official roster → bioguide. Avoids state=NJ vs "New Jersey"
+        # and nickname gaps (Rohit/Ro, Thomas/Tommy) before any fuzzy search.
+        local = match_legislator(
+            name,
+            state=state,
+            district=district,
+            chamber=chamber,
+            office=office,
+            state_district=state_district,
+        )
+        if local:
+            member = self._accept_bioguide(name, local, state=state, office=office)
+            if member:
                 return member
 
         parsed = parse_filer_name(name, office=office)
@@ -1032,41 +1058,49 @@ class HorizonsIngestClient:
                 add(f"{tokens[-2]} {tokens[-1]}, {tokens[0]}")
                 add(f"{tokens[-1]}, {' '.join(tokens[:-1])}")
 
-        for cand in candidates:
-            params: dict[str, Any] = {"name": cand}
-            if state:
-                params["state"] = state
-            if district is not None:
-                params["district"] = district
-            logger.info(
-                "Member lookup attempt name=%r state=%r district=%r",
-                cand,
-                state,
-                district,
-            )
-            member = self._lookup_http(**params)
-            if member:
-                logger.info(
-                    "Member lookup HIT name=%r → id=%s bioguide=%s stored_name=%r",
-                    cand,
-                    member.get("id"),
-                    member.get("bioguide_id"),
-                    member.get("name"),
-                )
-                return member
-            logger.info("Member lookup MISS name=%r", cand)
+        # Live lookup compares state to the full name ("New Jersey"), not "NJ".
+        state_label = state_display_name(state) or None
+        state_attempts: list[str | None] = []
+        for candidate_state in (state_label, None):
+            if candidate_state not in state_attempts:
+                state_attempts.append(candidate_state)
 
-        # Fallback: congress roster → bioguide
-        bid = self._bioguide_from_congress(parsed, state=state, district=district)
-        if bid:
-            member = self._lookup_http(bioguide_id=bid)
-            if member:
-                logger.info(
-                    "Member lookup via congress bioguide=%s → %s",
-                    bid,
-                    member.get("name"),
-                )
-                return member
+        for cand in candidates:
+            for try_state in state_attempts:
+                district_attempts: list[int | None] = [district]
+                if district is not None:
+                    district_attempts.append(None)
+                for try_district in district_attempts:
+                    logger.info(
+                        "Member lookup attempt name=%r state=%r district=%r",
+                        cand,
+                        try_state,
+                        try_district,
+                    )
+                    member = self._lookup_http(
+                        name=cand, state=try_state, district=try_district
+                    )
+                    if not member:
+                        logger.info("Member lookup MISS name=%r", cand)
+                        continue
+                    if not member_record_compatible(
+                        name, member, state=state, office=office
+                    ):
+                        logger.info(
+                            "Member lookup REJECT name=%r hit=%r bioguide=%s",
+                            cand,
+                            member.get("name"),
+                            member.get("bioguide_id"),
+                        )
+                        continue
+                    logger.info(
+                        "Member lookup HIT name=%r → id=%s bioguide=%s stored_name=%r",
+                        cand,
+                        member.get("id"),
+                        member.get("bioguide_id"),
+                        member.get("name"),
+                    )
+                    return member
 
         logger.warning(
             "Member lookup FAILED for name=%r state=%s district=%s office=%r "
@@ -1079,15 +1113,69 @@ class HorizonsIngestClient:
         )
         return None
 
+    def _accept_bioguide(
+        self,
+        name: str,
+        local: dict,
+        *,
+        state: str | None,
+        office: str | None,
+    ) -> dict | None:
+        """Prefer the Horizons row for this bioguide; fall back to the roster."""
+        bioguide = local.get("bioguide") or ""
+        member = self._lookup_http(bioguide_id=bioguide) if bioguide else None
+        if member and member_record_compatible(name, member, state=state, office=office):
+            logger.info(
+                "Member lookup via legislator bioguide=%s → %s (%s)",
+                bioguide,
+                member.get("id"),
+                member.get("name"),
+            )
+            if not member.get("party") and local.get("party"):
+                member = dict(member)
+                member["party"] = local["party"]
+            return member
+        if member:
+            logger.info(
+                "Horizons bioguide %s returned %r — using roster name %r",
+                bioguide,
+                member.get("name"),
+                local.get("official_full"),
+            )
+        else:
+            logger.info(
+                "Horizons has no row for bioguide %s; submitting roster identity",
+                bioguide,
+            )
+        display_state = state_display_name(local.get("state")) or local.get("state") or ""
+        return {
+            "id": bioguide,
+            "bioguide_id": bioguide,
+            "name": local.get("official_full") or name,
+            "party": local.get("party") or "",
+            "state": display_state,
+            "district": local.get("district"),
+            "chamber": (local.get("chamber") or "").title(),
+        }
+
     def _lookup_http(self, **params) -> dict | None:
         # drop Nones
         params = {k: v for k, v in params.items() if v is not None and v != ""}
         if not params:
             return None
-        try:
-            resp = self._get("/hcgi/api/members/lookup", params)
-        except requests.RequestException as e:
-            logger.error("lookup request failed: %s", e)
+        resp = None
+        for attempt in range(4):
+            try:
+                resp = self._get("/hcgi/api/members/lookup", params)
+            except requests.RequestException as e:
+                logger.error("lookup request failed: %s", e)
+                return None
+            if resp.status_code != 429:
+                break
+            delay = 2 * (attempt + 1)
+            logger.warning("lookup HTTP 429, retry in %ss", delay)
+            time.sleep(delay)
+        if resp is None:
             return None
         if resp.status_code != 200:
             logger.warning("lookup HTTP %s: %s", resp.status_code, resp.text[:200])
@@ -1172,22 +1260,37 @@ class HorizonsIngestClient:
             raise ValueError("source_url is required on every filing")
 
         txns = [clean_transaction(t) for t in (transactions or [])]
+        filing_out = dict(filing)
         body = {
             "type": "filing",
             "payload": {
-                "filing": filing,
+                "filing": filing_out,
                 "transactions": txns,
                 "annual_assets": annual_assets or [],
             },
         }
         logger.info(
             "Submitting filing source_url=%s member_id=%s bioguide=%s txns=%d",
-            filing.get("source_url"),
-            filing.get("member_id"),
-            filing.get("bioguide_id"),
+            filing_out.get("source_url"),
+            filing_out.get("member_id"),
+            filing_out.get("bioguide_id"),
             len(txns),
         )
         resp = self._post_ingest(body)
+        # Some member ids 500 the Horizons writer while the same payload
+        # without member_id is accepted. Keep party, name, and bioguide so
+        # the filing still lands instead of dropping the PTR.
+        if resp.status_code == 500 and filing_out.get("member_id"):
+            logger.warning(
+                "Ingest HTTP 500 for source_url=%s member_id=%s; "
+                "retrying without member_id",
+                filing_out.get("source_url"),
+                filing_out.get("member_id"),
+            )
+            retry_filing = dict(filing_out)
+            retry_filing.pop("member_id", None)
+            body["payload"]["filing"] = retry_filing
+            resp = self._post_ingest(body)
         try:
             data = resp.json()
         except ValueError:

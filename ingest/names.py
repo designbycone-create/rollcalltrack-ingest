@@ -17,6 +17,11 @@ _TITLES = re.compile(
     r"^(?:hon\.?|the\s+hon(?:orable)?\.?|rep\.?|sen\.?|mr\.?|mrs\.?|ms\.?|dr\.?)\s+",
     re.I,
 )
+# House index sometimes embeds "Dr" / "Mr" between given names ("Richard Dean Dr").
+_INNER_TITLES = re.compile(
+    r"\b(?:hon|honorable|rep|sen|mr|mrs|ms|dr|miss)\b\.?",
+    re.I,
+)
 _SUFFIXES = re.compile(
     r",?\s+(?:jr\.?|sr\.?|ii|iii|iv|v|esq\.?)$",
     re.I,
@@ -92,9 +97,11 @@ def normalize_state(state: str | None) -> str | None:
 
 def _clean_base(name: str) -> str:
     s = (name or "").strip()
+    s = s.replace("“", " ").replace("”", " ").replace('"', " ")
     s = _ROLE_PAREN.sub("", s)
     s = _TITLES.sub("", s)
     s = _SUFFIXES.sub("", s)
+    s = _INNER_TITLES.sub(" ", s)
     s = s.replace(".", " ")
     s = s.replace("-", " ")
     s = s.replace("'", "")
@@ -175,6 +182,190 @@ def parse_filer_name(name: str, office: str | None = None) -> ParsedName:
         middle_tokens=middle,
         variants=tuple(variants),
     )
+
+
+# Groups are united if they share a spelling, so each token maps to one set.
+_NICKNAME_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"josh", "joshua"}),
+    frozenset({"ro", "rohit"}),
+    frozenset({"rob", "robert", "bob", "bobby", "robbie"}),
+    frozenset({"bill", "william", "billy", "will", "willy", "liam"}),
+    frozenset({"jim", "james", "jimmy", "jamie"}),
+    frozenset({"mike", "michael", "mick", "mickey"}),
+    frozenset({"chris", "christopher"}),
+    frozenset({"christine", "christina", "tina", "chrissy"}),
+    frozenset({"tom", "thomas", "tommy"}),
+    frozenset({"dan", "daniel", "danny"}),
+    frozenset({"dave", "david"}),
+    frozenset({"chuck", "charles", "charlie", "chas"}),
+    frozenset({"dick", "richard", "rick", "rich", "ricky"}),
+    frozenset({"ben", "benjamin", "benny"}),
+    frozenset({"matt", "matthew"}),
+    frozenset({"pat", "patrick"}),
+    frozenset({"patricia", "patty", "tricia"}),
+    frozenset({"tony", "anthony"}),
+    frozenset({"ted", "theodore", "theo", "teddy"}),
+    frozenset({"ed", "edward", "eddie", "ned"}),
+    frozenset({"joe", "joseph", "joey"}),
+    frozenset({"andy", "andrew", "drew"}),
+    frozenset({"jeff", "jeffrey", "jeffery"}),
+    frozenset({"greg", "gregory"}),
+    frozenset({"steve", "steven", "stephen"}),
+    frozenset({"nick", "nicholas", "nic"}),
+    frozenset({"sam", "samuel", "sammy"}),
+    frozenset({"alex", "alexander", "alexandra"}),
+    frozenset({"don", "donald", "donnie"}),
+    frozenset({"ron", "ronald", "ronnie"}),
+    frozenset({"jerry", "gerald", "gerry"}),
+    frozenset({"tim", "timothy", "timmy"}),
+    frozenset({"terry", "terence", "terrence"}),
+    frozenset({"larry", "lawrence"}),
+    frozenset({"katie", "kate", "kathy", "katherine", "catherine", "kathryn", "cathy"}),
+    frozenset({"beth", "elizabeth", "liz", "lizzy", "betty", "betsy", "eliza"}),
+    frozenset({"debbie", "deb", "deborah"}),
+    frozenset({"becky", "rebecca"}),
+    frozenset({"jenny", "jen", "jennifer"}),
+    frozenset({"peggy", "peg", "margaret", "maggie", "meg"}),
+    frozenset({"john", "jon", "johnny", "jack"}),
+    frozenset({"frank", "francis"}),
+    frozenset({"fred", "frederick", "freddy", "freddie"}),
+    frozenset({"hank", "henry"}),
+    frozenset({"harry", "harold"}),
+    frozenset({"hal", "harold"}),
+    frozenset({"sue", "susan", "suzan", "suzanne", "suzy"}),
+    frozenset({"abby", "abigail"}),
+    frozenset({"al", "alan", "albert"}),
+    frozenset({"bernie", "bernard"}),
+    frozenset({"brad", "bradley"}),
+    frozenset({"cindy", "cynthia"}),
+    frozenset({"doug", "douglas"}),
+    frozenset({"gene", "eugene"}),
+    frozenset({"jake", "jacob"}),
+    frozenset({"ken", "kenneth", "kenny"}),
+    frozenset({"kim", "kimberly"}),
+    frozenset({"marty", "martin"}),
+    frozenset({"nate", "nathan", "nathaniel"}),
+    frozenset({"pam", "pamela"}),
+    frozenset({"pete", "peter"}),
+    frozenset({"phil", "philip", "phillip"}),
+    frozenset({"ray", "raymond"}),
+    frozenset({"russ", "russell"}),
+    frozenset({"vince", "vincent"}),
+    frozenset({"walt", "walter", "wally"}),
+    frozenset({"zach", "zachary", "zack"}),
+    frozenset({"thad", "thaddeus"}),
+    frozenset({"max", "maxwell"}),
+    frozenset({"gus", "augustus"}),
+    frozenset({"lou", "louis"}),
+    frozenset({"scott", "scotty"}),
+)
+
+_NICKNAME_INDEX: dict[str, frozenset[str]] | None = None
+
+
+def _nickname_index() -> dict[str, frozenset[str]]:
+    global _NICKNAME_INDEX
+    if _NICKNAME_INDEX is not None:
+        return _NICKNAME_INDEX
+    parent: dict[str, str] = {}
+
+    def find(x: str) -> str:
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        pa, pb = find(a), find(b)
+        if pa != pb:
+            parent[pb] = pa
+
+    for group in _NICKNAME_GROUPS:
+        items = list(group)
+        for other in items[1:]:
+            union(items[0], other)
+    clusters: dict[str, set[str]] = {}
+    for name in list(parent):
+        clusters.setdefault(find(name), set()).add(name)
+    _NICKNAME_INDEX = {name: frozenset(group) for group in clusters.values() for name in group}
+    return _NICKNAME_INDEX
+
+
+def nicknames_for(first: str) -> frozenset[str]:
+    """Spellings treated as the same given name (Josh/Joshua, Rohit/Ro)."""
+    token = (first or "").lower().strip(".")
+    if not token:
+        return frozenset()
+    return _nickname_index().get(token, frozenset({token}))
+
+
+def first_names_compatible(a: str, b: str) -> bool:
+    """True when two given names can be the same person.
+
+    Exact match, nickname group, or a shared prefix of at least 4 letters
+    (so 'Josh' does not swallow 'John', but 'Josh'/'Joshua' still match
+    via the nickname group).
+    """
+    left = (a or "").lower().strip(".")
+    right = (b or "").lower().strip(".")
+    if not left or not right:
+        return False
+    if left == right or left in nicknames_for(right):
+        return True
+    short, long = (left, right) if len(left) <= len(right) else (right, left)
+    return len(short) >= 4 and long.startswith(short)
+
+
+def state_display_name(code: str | None) -> str:
+    """'NJ' → 'New Jersey'. Empty string when the code is unknown."""
+    key = (code or "").strip().upper()
+    raw = STATE_CODES.get(key)
+    if not raw:
+        return ""
+    parts = []
+    for i, word in enumerate(raw.split()):
+        parts.append(word if i and word in {"of"} else word.capitalize())
+    return " ".join(parts)
+
+
+def member_record_compatible(
+    filer_name: str,
+    member: dict,
+    *,
+    state: str | None = None,
+    office: str | None = None,
+) -> bool:
+    """Reject lookup hits that are a different person.
+
+    The Horizons name search is a fuzzy contains match. It has returned
+    state legislators (bioguide ``LS…``) and, for ``Allen, Richard``,
+    Richard McCormick. A hit must share a last name and a compatible
+    given name, and must not be a LegiScan id.
+    """
+    parsed = parse_filer_name(filer_name, office=office)
+    if not parsed.last:
+        return False
+    bioguide = str(member.get("bioguide_id") or "")
+    member_id = str(member.get("id") or "")
+    if bioguide.upper().startswith("LS") or member_id.upper().startswith("LS"):
+        return False
+    stored = parse_filer_name(str(member.get("name") or ""))
+    if not stored.last:
+        return False
+    filer_last = parsed.last.lower()
+    stored_last = stored.last.lower()
+    stored_full = (stored.full or "").lower()
+    if filer_last != stored_last and filer_last not in stored_full.split():
+        return False
+    if parsed.first and stored.first and not first_names_compatible(parsed.first, stored.first):
+        return False
+    if state:
+        want = normalize_state(state)
+        got = normalize_state(member.get("state"))
+        if want and got and want != got:
+            return False
+    return True
 
 
 def first_token_prefix(first: str) -> str:

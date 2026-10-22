@@ -38,6 +38,10 @@ _TYPE_MAP = {
     "E": "exchange",
 }
 
+# Ticker printed on the House form as "(AAPL)" or "(BRK.B)". Not "(partial)".
+_TICKER_RE = re.compile(r"\(([A-Z]{1,5}(?:\.[A-Z]{1,2})?)\)")
+_ASSET_CODE_TICKERS = {"ST", "OT", "GS", "DC", "OL", "PS"}
+
 # Match a fully-normalized single-line PTR transaction row
 _TXN_LINE_RE = re.compile(
     r"(?:(?P<owner>SP|JT|DC|C)\s+)?"
@@ -47,6 +51,32 @@ _TXN_LINE_RE = re.compile(
     r"(?P<notify_date>\d{2}/\d{2}/\d{4})\s+"
     r"(?P<amount_range>\$[\d,]+\s*-\s*\$[\d,]+)"
 )
+
+
+def extract_ticker(asset_name: str) -> tuple[str | None, str]:
+    """Pull a parenthetical ticker off a House asset line.
+
+    Returns (ticker, confidence). Confidence is ``medium`` when the symbol
+    was read off the form, ``none`` when the line has no symbol.
+    """
+    matches = _TICKER_RE.findall(asset_name or "")
+    for ticker in reversed(matches):
+        if ticker in _ASSET_CODE_TICKERS:
+            continue
+        return ticker, "medium"
+    return None, "none"
+
+
+def _ocr_page(page) -> str:
+    """OCR one pdfplumber page. Empty string when tesseract is unavailable."""
+    try:
+        import pytesseract
+
+        image = page.to_image(resolution=200).original
+        return pytesseract.image_to_string(image) or ""
+    except Exception as e:
+        logger.warning("House PTR OCR failed: %s", e)
+        return ""
 
 
 def _session() -> requests.Session:
@@ -187,9 +217,8 @@ def parse_pdf(pdf_url: str, session: requests.Session | None = None) -> dict:
     """Download a filing PDF and extract text.
 
     Returns {text, used_ocr: bool, page_count, empty_pages}.
-    OCR fallback is intentionally not implemented yet: live sampling of
-    recent PTR PDFs (2025) all had extractable text layers. Revisit if
-    empty_pages becomes common on older/paper filings.
+    Pages with no text layer are OCR'd with tesseract (installed in CI).
+    Scanned paper PTRs such as 9116378.pdf otherwise parse to zero rows.
     """
     session = session or _session()
     resp = session.get(pdf_url, timeout=config.REQUEST_TIMEOUT_SECONDS)
@@ -203,16 +232,20 @@ def parse_pdf(pdf_url: str, session: requests.Session | None = None) -> dict:
         page_count = len(pdf.pages)
         for page in pdf.pages:
             page_text = page.extract_text() or ""
-            if not page_text.strip():
-                empty_pages += 1
-                used_ocr = True
-                # OCR TODO (pytesseract): only worth wiring if empty_pages is common.
+            if page_text.strip():
+                text_parts.append(page_text)
                 continue
-            text_parts.append(page_text)
+            empty_pages += 1
+            ocr_text = _ocr_page(page)
+            if ocr_text.strip():
+                used_ocr = True
+                text_parts.append(ocr_text)
+                continue
+            used_ocr = True
 
     return {
         "text": "\n".join(text_parts),
-        "used_ocr": used_ocr and not any(text_parts),
+        "used_ocr": used_ocr,
         "page_count": page_count,
         "empty_pages": empty_pages,
     }
@@ -242,6 +275,21 @@ def _normalize_ptr_text(pdf_text: str) -> str:
                     j += 1
                     continue
                 if re.search(r"\d{2}/\d{2}/\d{4}", nxt):
+                    # Maturity dates sit between a wrapped amount:
+                    # "$15,001 -" / "12/10/2026 [GS] $50,000"
+                    amount = re.search(r"\$[\d,]+", nxt)
+                    looks_like_next_row = bool(
+                        re.search(r"\b(?:S\s*\(\s*partial\s*\)|[PSE])\b", nxt)
+                        and re.search(r"\d{2}/\d{2}/\d{4}.*\d{2}/\d{2}/\d{4}", nxt)
+                    )
+                    if amount and not looks_like_next_row:
+                        before = nxt[: amount.start()].strip()
+                        before = re.sub(r"\s*\[[A-Z]{1,4}\]\s*", " ", before).strip()
+                        if before:
+                            asset_extra.append(before)
+                        line = f"{line} {amount.group(0)}"
+                        j += 1
+                        break
                     break
                 m = re.search(r"\$[\d,]+", nxt)
                 if m:
@@ -361,6 +409,7 @@ def parse_ptr_transactions(pdf_text: str) -> list[dict]:
 
         owner_code = (m.group("owner") or "").upper()
         filer_relation = _OWNER_MAP.get(owner_code, "self")
+        ticker, ticker_confidence = extract_ticker(asset)
 
         transactions.append(
             {
@@ -372,9 +421,38 @@ def parse_ptr_transactions(pdf_text: str) -> list[dict]:
                 "amount_range_raw": re.sub(
                     r"\s+", " ", m.group("amount_range")
                 ).strip(),
+                "ticker": ticker,
+                "ticker_confidence": ticker_confidence,
             }
         )
     return transactions
+
+
+def _flag_unreadable(hz, result: dict, rec: dict, pdf_result: dict, txns: list) -> None:
+    """Queue a review row the first time an unreadable PTR is inserted.
+
+    Updates of a filing already in Horizons are not re-flagged, so the
+    daily job does not pile duplicate review items. The warning is logged
+    every run so a still-blank scan stays visible.
+    """
+    if txns or not pdf_result.get("empty_pages"):
+        return
+    logger.warning(
+        "House PTR parsed 0 transactions after text/OCR name=%r url=%s empty_pages=%s",
+        rec.get("name"),
+        rec.get("pdf_url"),
+        pdf_result.get("empty_pages"),
+    )
+    if result.get("updated"):
+        return
+    filing_id = result.get("filing_id") or result.get("id")
+    if not filing_id:
+        return
+    hz.flag_manual_review(
+        str(filing_id),
+        reason="low_ocr_confidence" if pdf_result.get("used_ocr") else "unexpected_structure",
+        notes=f"PTR parsed 0 transactions url={rec.get('pdf_url')}",
+    )
 
 
 def _parse_filing_date(s: str) -> date | None:
@@ -390,7 +468,7 @@ def run(
     conn=None,
     year: int | None = None,
     dry_run: bool = False,
-    days_back: int | None = 14,
+    days_back: int | None = 90,
     max_filings: int | None = None,
     ptr_only: bool = True,
     client: HorizonsIngestClient | None = None,
@@ -398,8 +476,8 @@ def run(
     """Ingest House filings.
 
     days_back: only process filings whose FilingDate is within this many
-      days of today. None = no date filter (full year — slow). Default 14
-      so the daily job doesn't re-download every PTR of the year.
+      days of today. None = no date filter (full year — slow). Default 90
+      so the daily job rematches filings stored without a member.
     max_filings: optional hard cap (useful for dry-run smoke tests).
     ptr_only: this pass only handles PTRs (FilingType P).
     client: Horizons HTTP client (preferred). Falls back to PocketBase conn.
@@ -418,13 +496,13 @@ def run(
         logger.error("Failed to fetch House bulk index: %s", e)
         if use_hz:
             hz.submit_ingestion_log(
-                "house_clerk", 0, 0, 0, note=f"index fetch failed: {e}"
+                "house_clerk", 0, 0, 1, note=f"index fetch failed: {e}"
             )
         elif conn is not None and not dry_run:
             db.log_ingestion_run(
-                conn, "house", 0, 0, 0, note=f"index fetch failed: {e}"
+                conn, "house", 0, 0, 1, note=f"index fetch failed: {e}"
             )
-        return {"found": 0, "parsed": 0, "failed": 0}
+        return {"found": 0, "parsed": 0, "failed": 1, "error": "index fetch failed"}
 
     if ptr_only:
         index_records = [r for r in index_records if r.get("filing_type_code") == "P"]
@@ -471,10 +549,10 @@ def run(
                 rec.get("filing_type_code") or "", "ptr"
             )
             state_code = (rec.get("state_district") or "")[:2] or None
+            # OCR that recovered transactions is a successful parse. Zero
+            # transactions on a PTR stays failed so the run is visible.
             parse_status = (
-                "failed"
-                if pdf_result["used_ocr"] or (not txns and pb_filing_type == "ptr")
-                else "parsed"
+                "failed" if (not txns and pb_filing_type == "ptr") else "parsed"
             )
 
             if dry_run:
@@ -501,6 +579,7 @@ def run(
                 member = hz.lookup_member_by_name(
                     rec["name"],
                     state_district=rec.get("state_district"),
+                    chamber="house",
                 )
                 # Live may lack a members roster while still accepting filings
                 # (member_id optional; bioguide + denormalized name still useful).
@@ -534,6 +613,7 @@ def run(
                     result.get("transactions_written"),
                     rec["name"],
                 )
+                _flag_unreadable(hz, result, rec, pdf_result, txns)
                 parsed += 1
                 continue
 
@@ -576,8 +656,8 @@ def run(
                     {
                         "filing_id": filing_id,
                         "member_id": member_id,
-                        "ticker": None,
-                        "ticker_confidence": "unconfirmed",
+                        "ticker": txn.get("ticker"),
+                        "ticker_confidence": txn.get("ticker_confidence") or "unconfirmed",
                         "amount_range_low": None,
                         "amount_range_high": None,
                         "asset_category": None,
