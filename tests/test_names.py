@@ -9,6 +9,7 @@ from ingest.names import (
     normalize_state,
     state_display_name,
     state_for_member_lookup,
+    state_from_office,
 )
 
 
@@ -114,6 +115,22 @@ def test_senate_office_title_is_not_a_name():
     assert parsed.first == "Richard"
     assert parsed.last == "Blumenthal"
     assert "senator" not in parsed.full.lower()
+
+
+def test_state_from_efd_office_line():
+    assert state_from_office("Senator (KY)") == "KY"
+    assert state_from_office("Senator (ky)") == "KY"
+    assert state_from_office("Senator from West Virginia") == "WV"
+    assert state_from_office("Senator from Virginia") == "VA"
+    assert state_from_office("McConnell, A. Mitchell Jr. (Senator)") is None
+    assert state_from_office("Boozman, John (Senator)") is None
+    assert state_from_office("Capito, Shelley Moore (Jr)") is None
+
+
+def test_mitchell_is_a_nickname_for_mitch():
+    assert first_names_compatible("Mitchell", "Mitch")
+    assert first_names_compatible("Mitch", "Mitchell")
+    assert not first_names_compatible("A", "Mitch")
 
 
 def test_mcconnell_initial_and_middle_name():

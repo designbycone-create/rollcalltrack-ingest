@@ -149,6 +149,24 @@ def is_bare_office_title(text: str | None) -> bool:
     return all(t in _BARE_OFFICE_WORDS for t in tokens)
 
 
+def _given_name_tokens(parsed: ParsedName) -> list[str]:
+    """Given-name tokens long enough to compare. Skips a lone initial."""
+    tokens: list[str] = []
+
+    def add(value: str | None) -> None:
+        text = (value or "").strip(".")
+        if len(text) <= 1:
+            return
+        if text not in tokens:
+            tokens.append(text)
+
+    add(preferred_given_name(parsed))
+    add(parsed.first)
+    for mid in parsed.middle_tokens:
+        add(mid)
+    return tokens
+
+
 def preferred_given_name(parsed: ParsedName) -> str:
     """Given name to match and to send to /members/lookup.
 
@@ -280,6 +298,9 @@ _NICKNAME_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"bill", "william", "billy", "will", "willy", "liam"}),
     frozenset({"jim", "james", "jimmy", "jamie"}),
     frozenset({"mike", "michael", "mick", "mickey"}),
+    # A. Mitchell McConnell is filed under the middle name. Mitch is that name,
+    # not a shortening of Michael.
+    frozenset({"mitch", "mitchell"}),
     frozenset({"chris", "christopher"}),
     frozenset({"christine", "christina", "tina", "chrissy"}),
     frozenset({"tom", "thomas", "tommy"}),
@@ -405,6 +426,29 @@ def first_names_compatible(a: str, b: str) -> bool:
     return len(short) >= 4 and long.startswith(short)
 
 
+def state_from_office(office: str | None) -> str | None:
+    """USPS code embedded in an eFD office line, if there is one.
+
+    Senate rows often look like ``McConnell, A. Mitchell Jr. (Senator)`` and
+    carry no state. Some say ``Senator (KY)`` or name the state in words.
+    """
+    if not office:
+        return None
+    text = f" {_WS.sub(' ', office.lower())} "
+    for name, code in sorted(
+        ((name, code) for code, name in STATE_CODES.items()),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if f" {name} " in text:
+            return code
+    for match in re.finditer(r"\(([A-Za-z]{2})\)", office):
+        code = match.group(1).upper()
+        if code in STATE_CODES:
+            return code
+    return None
+
+
 def state_display_name(code: str | None) -> str:
     """'NJ' → 'New Jersey'. Empty string when the code is unknown."""
     key = (code or "").strip().upper()
@@ -446,10 +490,15 @@ def member_record_compatible(
     stored_full = (stored.full or "").lower()
     if filer_last != stored_last and filer_last not in stored_full.split():
         return False
-    filer_given = preferred_given_name(parsed)
+    # "A. Mitchell" fails a first-initial check against "Mitch". A longer
+    # middle token or nickname (Mitchell → Mitch) is enough.
+    filer_tokens = _given_name_tokens(parsed)
     stored_givens = [stored.first, *stored.middle_tokens]
-    if filer_given and stored.first and not any(
-        first_names_compatible(filer_given, other) for other in stored_givens if other
+    if filer_tokens and stored.first and not any(
+        first_names_compatible(token, other)
+        for token in filer_tokens
+        for other in stored_givens
+        if other
     ):
         return False
     if state:

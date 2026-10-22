@@ -186,16 +186,22 @@ def test_lookup_throttles_between_calls(monkeypatch):
     monkeypatch.setattr("ingest.ingest_client.time.monotonic", monotonic)
     monkeypatch.setattr("ingest.ingest_client.time.sleep", sleep)
 
+    calls = []
+
     def fake_get(path, params=None):
+        calls.append(dict(params or {}))
         return _Resp(
             200,
             {"found": True, "member": {"id": "B001236", "bioguide_id": "B001236", "name": "John Boozman"}},
         )
 
     monkeypatch.setattr(hz, "_get", fake_get)
+    # Distinct filers still wait LOOKUP_MIN_INTERVAL. An identical second
+    # lookup is a cache hit and does not call the origin or sleep.
     assert hz._lookup_http(name="John Boozman", state="Arkansas")["id"] == "B001236"
-    assert hz._lookup_http(name="John Boozman", state="Arkansas")["id"] == "B001236"
+    assert hz._lookup_http(name="Tom Cotton", state="Arkansas")["id"] == "B001236"
     assert sleeps == [LOOKUP_MIN_INTERVAL]
+    assert len(calls) == 2
 
 
 def test_ingest_submit_retries_disconnect_then_succeeds(monkeypatch):

@@ -302,6 +302,28 @@ def test_run_is_idempotent_and_fetches_detail_by_stable_url():
     assert client.logs[0]["source"] == "senate_votes"
 
 
+def test_run_counts_submitted_from_the_response():
+    client = _Client()
+
+    def submit_votes(records):
+        client.batches.append(records)
+        return {"ok": True, "written": len(records), "submitted": 0}
+
+    client.submit_votes = submit_votes
+    result = run(
+        congress=119,
+        session=2,
+        dry_run=False,
+        fetch_details=False,
+        client=client,
+        today=date(2026, 10, 22),
+        menu_xml=MENU_XML,
+        days_back=30,
+    )
+    assert len(client.batches) == 1
+    assert result["submitted"] == 0
+
+
 def test_days_back_drops_old_rolls_without_calling_them_failures():
     result = run(
         congress=119,
@@ -400,6 +422,29 @@ def test_submit_votes_accepts_federal_senate_shape(monkeypatch):
         hz.submit_votes([{**record, "jurisdiction": "federal", "state_code": "MD"}])
     with pytest.raises(ValueError):
         hz.submit_votes([{**record, "source_url": ""}])
+
+
+def test_submit_votes_logs_batch_status_and_written(monkeypatch, caplog):
+    import logging
+
+    hz = HorizonsIngestClient("https://example.com", "key")
+
+    class _Counted(_IngestResp):
+        status_code = 201
+
+        def json(self):
+            return {"ok": True, "written": 4, "submitted": 3}
+
+    monkeypatch.setattr(hz, "_post_ingest", lambda body, path="/hcgi/api/ingest/disclosures": _Counted())
+    record = parse_detail(
+        DETAIL_XML,
+        next(v for v in parse_menu(MENU_XML) if v["roll_number"] == "256"),
+        lis_to_bioguide=LIS,
+    )
+    with caplog.at_level(logging.INFO):
+        out = hz.submit_votes([record])
+    assert out["submitted"] == 3
+    assert "Votes batch HTTP 201 written=4 submitted=3" in caplog.text
 
 
 def test_ingestion_log_keeps_senate_votes_source(monkeypatch):

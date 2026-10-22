@@ -436,8 +436,11 @@ def run(
         for start in range(0, len(records), HORIZONS_BATCH_SIZE):
             batch = records[start : start + HORIZONS_BATCH_SIZE]
             try:
-                client.submit_votes(batch)
-                submitted += len(batch)
+                result = client.submit_votes(batch) or {}
+                if isinstance(result, dict) and result.get("submitted") is not None:
+                    submitted += int(result["submitted"])
+                elif isinstance(result, dict) and result.get("written") is not None:
+                    submitted += int(result["written"])
             except Exception as e:
                 failed += len(batch)
                 logger.error("Senate vote submit failed: %s", e)

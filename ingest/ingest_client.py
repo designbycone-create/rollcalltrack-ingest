@@ -27,6 +27,7 @@ from .names import (
     normalized_lookup_names,
     parse_state_district,
     state_for_member_lookup,
+    state_from_office,
 )
 
 # Gap between member lookups. The disclosure run was tripping Horizons 429s
@@ -40,6 +41,33 @@ INGEST_BACKOFF_BASE = 5.0
 INGEST_BACKOFF_CAP = 90.0
 
 logger = logging.getLogger("rollcalltrack_ingest.ingest_client")
+
+
+class LookupRateLimited(RuntimeError):
+    """Member lookup still got HTTP 429 after retries. That is not a miss."""
+
+
+def _norm_lookup_part(value) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _member_lookup_cache_key(params: dict) -> tuple[str, str, str, str]:
+    """Normalized name, state, and chamber. Bioguide stays in the key too."""
+    state_raw = params.get("state")
+    canonical = state_for_member_lookup(str(state_raw)) if state_raw else None
+    return (
+        _norm_lookup_part(params.get("name")),
+        _norm_lookup_part(canonical or state_raw),
+        _norm_lookup_part(params.get("chamber")),
+        _norm_lookup_part(params.get("bioguide_id")),
+    )
+
+
+def _ingestion_response_body(resp, limit: int = 2000) -> str:
+    text = (getattr(resp, "text", "") or "").strip()
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text or "<empty>"
 
 
 def _map_txn_type(raw: str | None) -> str:
@@ -163,6 +191,8 @@ class HorizonsIngestClient:
         self.timeout = timeout or config.REQUEST_TIMEOUT_SECONDS
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.USER_AGENT})
+        # Name/state/chamber → member or None. Lives for this client (one run).
+        self._lookup_cache: dict[tuple[str, str, str, str], dict | None] = {}
 
     @property
     def configured(self) -> bool:
@@ -464,14 +494,30 @@ class HorizonsIngestClient:
             data = resp.json()
         except ValueError:
             data = {"raw": resp.text[:500]}
+        written = data.get("written")
+        if written is None:
+            written = data.get("count")
+        submitted = data.get("submitted")
         if resp.status_code == 404:
             logger.error(
                 "Horizons route /hcgi/api/ingest/votes is not deployed (404). "
                 "See docs/HORIZONS_LEGISCAN_BILLS.md"
             )
         if resp.status_code not in (200, 201):
-            logger.error("Votes ingest HTTP %s: %s", resp.status_code, str(data)[:500])
+            logger.error(
+                "Votes batch HTTP %s written=%s submitted=%s body=%s",
+                resp.status_code,
+                written,
+                submitted,
+                str(data)[:500],
+            )
             resp.raise_for_status()
+        logger.info(
+            "Votes batch HTTP %s written=%s submitted=%s",
+            resp.status_code,
+            written,
+            submitted,
+        )
         return data
 
     def submit_state_coverage(self, records: list[dict]) -> dict:
@@ -1163,6 +1209,11 @@ class HorizonsIngestClient:
             state = state or sc
             if district is None:
                 district = dist
+        # eFD office lines sometimes carry the state the search row omitted.
+        if not state:
+            office_state = state_from_office(office)
+            if office_state:
+                state = office_state
 
         local = match_legislator(
             name,
@@ -1201,41 +1252,75 @@ class HorizonsIngestClient:
             )
             return _with_roster_party(member, local)
 
-        for candidate in lookup_names:
+        rate_limited = False
+        bioguide_answered = False
+
+        def lookup_name(candidate: str) -> dict | None:
+            nonlocal rate_limited
             logger.info(
                 "Member lookup attempt name=%r state=%r", candidate, state_label
             )
-            hit = accept_name_hit(
-                candidate,
-                self._lookup_http(name=candidate, state=state_label),
-            )
+            try:
+                member = self._lookup_http(
+                    name=candidate, state=state_label, chamber=chamber
+                )
+            except LookupRateLimited:
+                # Stop the remaining name variants. A 429 is not a miss.
+                logger.warning(
+                    "Member lookup rate-limited name=%r state=%r; not a miss",
+                    candidate,
+                    state_label,
+                )
+                rate_limited = True
+                return None
+            return accept_name_hit(candidate, member)
+
+        for candidate in lookup_names:
+            hit = lookup_name(candidate)
             if hit:
                 return hit
+            if rate_limited:
+                break
 
-        if last_name and last_name.lower() not in {n.lower() for n in lookup_names}:
-            logger.info(
-                "Member lookup attempt name=%r state=%r", last_name, state_label
-            )
-            hit = accept_name_hit(
-                last_name,
-                self._lookup_http(name=last_name, state=state_label),
-            )
+        if (
+            not rate_limited
+            and last_name
+            and last_name.lower() not in {n.lower() for n in lookup_names}
+        ):
+            hit = lookup_name(last_name)
             if hit:
                 return hit
 
         if known_bioguide:
             logger.info("Member lookup attempt bioguide_id=%s", known_bioguide)
-            member = self._lookup_http(bioguide_id=known_bioguide)
-            returned = str((member or {}).get("bioguide_id") or "")
-            if member and returned == known_bioguide:
-                logger.info(
-                    "Member lookup bioguide_id=%s → %s (%s)",
-                    known_bioguide,
-                    member.get("id"),
-                    member.get("name"),
+            try:
+                member = self._lookup_http(
+                    bioguide_id=known_bioguide, chamber=chamber
                 )
-                return _with_roster_party(member, local)
-            logger.info("Member lookup MISS bioguide_id=%s", known_bioguide)
+            except LookupRateLimited:
+                logger.warning(
+                    "Member lookup rate-limited bioguide_id=%s; not a miss",
+                    known_bioguide,
+                )
+                rate_limited = True
+            else:
+                bioguide_answered = True
+                returned = str((member or {}).get("bioguide_id") or "")
+                if member and returned == known_bioguide:
+                    logger.info(
+                        "Member lookup bioguide_id=%s → %s (%s)",
+                        known_bioguide,
+                        member.get("id"),
+                        member.get("name"),
+                    )
+                    return _with_roster_party(member, local)
+                logger.info("Member lookup MISS bioguide_id=%s", known_bioguide)
+
+        if rate_limited and not bioguide_answered:
+            raise LookupRateLimited(
+                f"member lookup rate-limited for name={name!r} "
+                f"bioguide={known_bioguide or ''}"
+            )
 
         logger.warning(
             "Member lookup FAILED for name=%r state=%s district=%s office=%r "
@@ -1260,15 +1345,23 @@ class HorizonsIngestClient:
         self._last_lookup_at = now
 
     def _lookup_http(self, **params) -> dict | None:
-        # drop Nones
+        # drop Nones. Chamber is part of the cache key only — the lookup
+        # route does not take it as a query param.
         params = {k: v for k, v in params.items() if v is not None and v != ""}
         if not params:
+            return None
+        key = _member_lookup_cache_key(params)
+        if key in self._lookup_cache:
+            cached = self._lookup_cache[key]
+            return dict(cached) if cached else None
+        query = {k: v for k, v in params.items() if k != "chamber"}
+        if not query:
             return None
         self._throttle_lookup()
         resp = None
         for attempt in range(LOOKUP_ATTEMPTS):
             try:
-                resp = self._get("/hcgi/api/members/lookup", params)
+                resp = self._get("/hcgi/api/members/lookup", query)
             except requests.RequestException as exc:
                 if not is_connection_error(exc) or attempt == LOOKUP_ATTEMPTS - 1:
                     logger.error("lookup request failed: %s", exc)
@@ -1284,8 +1377,11 @@ class HorizonsIngestClient:
             if resp.status_code != 429:
                 break
             if attempt == LOOKUP_ATTEMPTS - 1:
-                logger.warning("lookup HTTP 429: %s", (resp.text or "")[:200])
-                break
+                body = (resp.text or "")[:200]
+                logger.warning("lookup HTTP 429: %s", body)
+                raise LookupRateLimited(
+                    f"lookup HTTP 429 after {LOOKUP_ATTEMPTS} attempts: {body}"
+                )
             delay = backoff_seconds(
                 attempt, resp, base=LOOKUP_BACKOFF_BASE, cap=LOOKUP_BACKOFF_CAP
             )
@@ -1295,17 +1391,28 @@ class HorizonsIngestClient:
             return None
         if resp.status_code != 200:
             logger.warning("lookup HTTP %s: %s", resp.status_code, resp.text[:200])
+            # 5xx and 429 are not a definitive miss. 429 already raised.
+            if resp.status_code < 500:
+                self._lookup_cache[key] = None
             return None
         try:
             data = resp.json()
         except ValueError:
             return None
-        if not data.get("found"):
+        if not isinstance(data, dict):
             return None
-        if data.get("member"):
-            return data["member"]
-        members = data.get("members") or []
-        return members[0] if members else None
+        member = None
+        if data.get("found"):
+            member = data.get("member")
+            if not member:
+                members = data.get("members") or []
+                member = members[0] if members else None
+        if not isinstance(member, dict):
+            self._lookup_cache[key] = None
+            return None
+        stored = dict(member)
+        self._lookup_cache[key] = stored
+        return dict(stored)
 
     def _bioguide_from_congress(
         self,
@@ -1522,7 +1629,20 @@ class HorizonsIngestClient:
             resp = self._post_ingest({"type": "ingestion_log", "payload": payload})
             if resp.status_code in (200, 201):
                 return resp.json()
-            logger.warning("ingestion_log submit HTTP %s: %s", resp.status_code, resp.text[:200])
+            if 500 <= resp.status_code < 600:
+                logger.warning(
+                    "ingestion_log submit HTTP %s; response body: %s; retrying once",
+                    resp.status_code,
+                    _ingestion_response_body(resp),
+                )
+                resp = self._post_ingest({"type": "ingestion_log", "payload": payload})
+                if resp.status_code in (200, 201):
+                    return resp.json()
+            logger.warning(
+                "ingestion_log submit HTTP %s; response body: %s",
+                resp.status_code,
+                _ingestion_response_body(resp),
+            )
         except Exception as e:
             logger.warning("ingestion_log submit failed: %s", e)
         return None

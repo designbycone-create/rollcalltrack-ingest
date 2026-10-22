@@ -205,6 +205,51 @@ def _middle_compatible(parsed, member: dict) -> bool:
     return filer_mid.lower() == middle.lower() or first_names_compatible(filer_mid, middle)
 
 
+def _nickname_or_middle_compatible(parsed, member: dict) -> bool:
+    """True when a middle name or nickname lines up, even if the first initial does not."""
+    tokens: list[str] = []
+    given = preferred_given_name(parsed)
+    if given and len(given.strip(".")) > 1:
+        tokens.append(given.strip("."))
+    for mid in parsed.middle_tokens:
+        text = mid.strip(".")
+        if len(text) > 1 and text not in tokens:
+            tokens.append(text)
+    options = _member_given_names(member)
+    middle = (member.get("middle") or "").strip()
+    if middle:
+        options.append(middle)
+    return any(
+        first_names_compatible(token, option)
+        for token in tokens
+        for option in options
+        if option
+    )
+
+
+def _unique_last_name_in_chamber(parsed, roster, chamber_l, state_code):
+    """One person in the chamber shares this last name and a middle/nickname.
+
+    ``A. Mitchell McConnell`` fails ``A`` vs ``Mitch``. Mitchell is the name
+    he uses, and the Senate has one McConnell.
+    """
+    pool = []
+    for member in roster:
+        if chamber_l and member.get("chamber") != chamber_l:
+            continue
+        if not _last_compatible(parsed, member):
+            continue
+        pool.append(member)
+    if len(pool) != 1:
+        return None
+    member = pool[0]
+    if state_code and member.get("state") and member["state"] != state_code:
+        return None
+    if not _nickname_or_middle_compatible(parsed, member):
+        return None
+    return member
+
+
 def match_legislator(
     name: str,
     roster: list[dict] | None = None,
@@ -267,7 +312,7 @@ def match_legislator(
     if len(hits) == 1:
         return hits[0]
     if not hits:
-        return None
+        return _unique_last_name_in_chamber(parsed, roster, chamber_l, state_code)
 
     def exact_first(rows: list[dict]) -> list[dict]:
         want = parsed.first.lower()
