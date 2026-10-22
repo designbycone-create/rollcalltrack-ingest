@@ -27,6 +27,7 @@ from . import (
     legiscan_bills,
     ca_spending,
     state_spending,
+    senate_votes,
 )
 from .ingest_client import get_client
 
@@ -56,6 +57,7 @@ def main():
             "legiscan_bills",
             "ca_spending",
             "state_spending",
+            "senate_votes",
             "all",
         ],
         default="all",
@@ -100,7 +102,7 @@ def main():
         "--session",
         type=int,
         default=None,
-        help="LegiScan session_id (legiscan_bills)",
+        help="LegiScan session_id, or Senate session 1 or 2 (senate_votes)",
     )
     parser.add_argument(
         "--agency",
@@ -166,6 +168,32 @@ def main():
                 days_back=senate_days,
                 dry_run=args.dry_run,
                 max_filings=max_f,
+                client=client,
+            )
+
+        if args.source in ("senate_votes", "all"):
+            logger.info("=== Running Senate roll-call ingest ===")
+            max_r = args.max_records
+            if args.dry_run and max_r is None:
+                max_r = 5
+            # --days-back / --congress / --session on --source all belong to
+            # the disclosure and LegiScan flags. The daily job posts the
+            # full current Senate session.
+            if args.source == "senate_votes":
+                vote_congress = args.congress
+                vote_session = args.session
+                vote_days = args.days_back
+            else:
+                vote_congress = None
+                vote_session = None
+                vote_days = None
+            results["senate_votes"] = senate_votes.run(
+                congress=vote_congress,
+                session=vote_session,
+                days_back=vote_days,
+                max_records=max_r,
+                dry_run=args.dry_run,
+                fetch_details=True,
                 client=client,
             )
 

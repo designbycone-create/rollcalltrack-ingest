@@ -118,6 +118,7 @@ rollcalltrack-ingest/
     db.py                # legacy PocketBase helpers
     house.py             # House bulk feed download + PDF parsing
     senate.py            # Senate eFD scrape + parsing
+    senate_votes.py      # Senate LIS roll calls → /ingest/votes
     usaspending.py       # USAspending.gov award search
     usaspending_agencies.json  # agency allowlist (edit to expand)
     gao.py               # GAO / PaymentAccuracy improper payments
@@ -141,7 +142,7 @@ rollcalltrack-ingest/
     congress_enrich.py   # Congress.gov member enrichment (legacy path)
     main.py              # orchestrator / CLI entry point
   .github/workflows/
-    ingest.yml           # daily disclosure cron + workflow_dispatch
+    ingest.yml           # daily disclosures + Senate roll calls
     usaspending.yml      # USAspending (schedule held)
     ca-spending.yml      # CA Open FI$Cal (schedule held, monthly)
     state-spending.yml   # 50-state spending (schedule held, monthly)
@@ -1085,6 +1086,93 @@ the Horizons route **and** `JEFS_*` secrets exist.
 `$15,001 - $50,000` is stored as that bracket. The midpoint `$32,500.50`
 is never written.
 
+## Senate roll calls (`senate_votes`)
+
+Hostinger's `GET /hcgi/api/sources/votes/senate` live-fetches senate.gov
+and returns `count: 0` (checked 2026-10-22: `source: "live"`,
+`senateCount: 0`). House roll calls on the same host succeed because
+they come from clerk.house.gov. This job fetches the Senate XML from
+the scheduled runner (GitHub Actions `ingest.yml` and the Windows daily
+task, both `python -m ingest.main --source all`) and POSTs it through
+the existing `POST /hcgi/api/ingest/votes` path.
+
+The menu URL is derived from congress and session. Session 1 and
+session 2 both work:
+
+`https://www.senate.gov/legislative/LIS/roll_call_lists/vote_menu_{congress}_{session}.xml`
+
+Per-vote detail (member positions) is optional and on by default:
+
+`https://www.senate.gov/legislative/LIS/roll_call_votes/vote{congress}{session}/vote_{congress}_{session}_{00000}.xml`
+
+Requests send a browser `User-Agent` and do not follow redirects. A 3xx
+or a non-XML body (HTML block page, JSON) fails the run instead of
+being stored as zero votes.
+
+### Payload
+
+Same body as state votes (`{"votes":[...]}`) and the same fields as a
+House row already stored on `GET /hcgi/api/votes`. House rows use
+`chamber: "House"`. These use `chamber: "Senate"`.
+
+| Field | Source |
+|-------|--------|
+| `id`, `rc_id` | `s-{congress}-{congress_year}-{roll}` e.g. `s-119-2026-256` |
+| `congress` | menu `<congress>` |
+| `chamber` | `Senate` (House rows are `House`, not `house`) |
+| `session` | menu `<session>` as a string (`"1"` or `"2"`) |
+| `roll_number` | `<vote_number>` without padding (`00256` → `256`) |
+| `bill_label` | `<issue>` (`PN1129`, `H.R. 9340`, `S. 5`) |
+| `title`, `description` | `<title>` |
+| `result` | `<result>` (`Confirmed`, `Agreed to`, `Rejected`, `Passed`, `Well Taken`). A few en-bloc rows have a title and a blank result. |
+| `vote_type` | `<question>` (`On the Nomination`, …) |
+| `date` | `<vote_date>` `30-Sep` plus `<congress_year>` → `2026-09-30`. Detail XML upgrades this to `2026-09-30T21:29:00` when the clock time is present. |
+| `tally_yea`, `tally_nay` | `<vote_tally><yeas>` / `<nays>` |
+| `tally_present`, `tally_not_voting` | `0` from the menu. Detail counts `Present` and `Not Voting`. |
+| `jurisdiction` | `federal` |
+| `state_code` | `""` (House rows store an empty string, not null) |
+| `source_url` | the detail XML URL, one per roll |
+| `member_votes[]` | only when detail was fetched. `bioguide_id` from congress-legislators `id.lis` (`S428`). `vote` is `yea` / `nay` / `present` / `not_voting`. Unmapped members are omitted. |
+
+`rc_id` is not `{congress}-{session}-{roll}`. That is the House key
+(`119-2-314`) and would collide with a Senate roll of the same number.
+`s-119-2026-256` is also what `nominations.py` and the site route
+`/congress/senate-vote/{congress}/{year}/{roll}` already expect.
+
+### Assumptions about the Hostinger endpoint
+
+`POST /hcgi/api/ingest/votes` exists (state votes already use it; a GET
+without the key is 404 because the route is POST-only). This job
+assumes that route upserts federal rows on `id` / `rc_id` / `source_url`
+the way disclosure ingest upserts on `source_url`. Re-running the job
+sends the same ids, so a second run should update rather than insert a
+duplicate. If the route only upserts `jurisdiction=state`, federal
+Senate rows will 400 until Horizons accepts `jurisdiction=federal`,
+`chamber=Senate`, and an empty `state_code` — the shape House rows
+already have in `GET /hcgi/api/votes`.
+
+`GET /hcgi/api/sources/votes/senate` is a live senate.gov fetch
+(`ingested.triggered: true`). Writing the votes collection does not, by
+itself, prove that source route will stop returning count 0. The
+collection read is `GET /hcgi/api/votes`. The public congress list is
+`GET /hcgi/api/congress/votes`.
+
+LIS ids are not bioguides. Member positions are joined through the
+public congress-legislators roster. If that roster is down, the roll
+call is still posted and `member_votes` is omitted.
+
+### CLI
+
+```bash
+python -m ingest.main --source senate_votes --dry-run --max-records 5
+python -m ingest.main --source senate_votes --congress 119 --session 1 --dry-run
+```
+
+`--source all` (the daily workflow) always uses the current congress
+and session and ignores `--days-back`, so a disclosure window cannot
+drop older rolls in the same session. `--congress` and `--session` apply
+only with `--source senate_votes`.
+
 ## Judicial nominations (`judicial-nominations-sync`)
 
 Weekly **linker**, not a new scrape. Congress.gov already publishes
@@ -1102,7 +1190,8 @@ Auth is the existing `CONGRESS_GOV_API_KEY` (same as `congress_enrich`).
 404). See `docs/HORIZONS_JUDICIAL_NOMINATIONS.md`.
 
 This is **not** folded into `.github/workflows/ingest.yml`. That
-workflow is House/Senate disclosures and does not read nominations.
+workflow is House/Senate disclosures plus Senate roll calls, and does
+not read nominations.
 
 ### How a confirmation vote is linked
 

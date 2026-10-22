@@ -356,14 +356,26 @@ class HorizonsIngestClient:
         return data
 
     def submit_votes(self, records: list[dict]) -> dict:
-        """POST a batch to /hcgi/api/ingest/votes."""
+        """POST a batch to /hcgi/api/ingest/votes.
+
+        State rows keep ``jurisdiction=state`` and a 2-letter ``state_code``.
+        Federal rows match the House roll calls already stored on
+        ``GET /hcgi/api/votes``: ``jurisdiction=federal``, ``state_code`` empty,
+        and ``chamber`` title case (``House`` or ``Senate``).
+        """
         if not records:
             return {"ok": True, "written": 0}
         for rec in records:
             if not rec.get("source_url"):
                 raise ValueError("source_url is required on every vote")
-            if rec.get("jurisdiction") != "state":
-                raise ValueError("this worker only posts jurisdiction=state")
+            jurisdiction = rec.get("jurisdiction")
+            if jurisdiction == "federal":
+                if rec.get("chamber") not in ("House", "Senate"):
+                    raise ValueError("federal vote chamber must be House or Senate")
+                if rec.get("state_code") not in (None, ""):
+                    raise ValueError("federal votes must not set state_code")
+            elif jurisdiction != "state":
+                raise ValueError("this worker only posts jurisdiction=state or federal")
             for mv in rec.get("member_votes") or []:
                 if not mv.get("bioguide_id"):
                     raise ValueError("member vote missing bioguide_id")
@@ -1338,6 +1350,7 @@ class HorizonsIngestClient:
                 "nominations",
                 "legiscan",
                 "ca_spending",
+                "senate_votes",
             )
             else (
                 "house_clerk"
