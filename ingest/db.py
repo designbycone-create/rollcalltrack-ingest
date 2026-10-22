@@ -192,7 +192,6 @@ def upsert_filing(conn: PocketBase, filing: dict) -> str:
         raise ValueError("source_url is required — refuse to store filing without origin link")
 
     body = {
-        "member_id": filing.get("member_id") or "",
         "chamber": filing.get("chamber") if filing.get("chamber") in ("house", "senate") else None,
         "filing_type": _map_filing_type(filing.get("filing_type")),
         "filing_date": filing.get("filing_date") or "",
@@ -202,9 +201,16 @@ def upsert_filing(conn: PocketBase, filing: dict) -> str:
         "ingested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "parse_status": _map_parse_status(filing.get("parse_status")),
         "member_name": filing.get("member_name") or "",
-        "member_party": filing.get("member_party") or "",
         "member_state": filing.get("member_state") or "",
     }
+    # Empty member fields must be absent. A blank string on update clears
+    # an id or party already stored from an earlier match.
+    member_id = str(filing.get("member_id") or "").strip()
+    if member_id:
+        body["member_id"] = member_id
+    member_party = str(filing.get("member_party") or "").strip()
+    if member_party:
+        body["member_party"] = member_party
     # drop Nones
     body = {k: v for k, v in body.items() if v is not None}
 
@@ -251,7 +257,6 @@ def upsert_transaction(conn: PocketBase, txn: dict) -> None:
 
     body = {
         "filing_id": str(filing_id),
-        "member_id": txn.get("member_id") or "",
         "filer_relation": _map_filer_relation(txn.get("filer_relation")),
         "asset_name": asset,
         "ticker": ticker,
@@ -272,6 +277,9 @@ def upsert_transaction(conn: PocketBase, txn: dict) -> None:
     body["ticker_confidence"] = _map_ticker_conf(txn.get("ticker_confidence"))
     if ticker:
         body["ticker"] = ticker
+    member_id = str(txn.get("member_id") or "").strip()
+    if member_id:
+        body["member_id"] = member_id
     conn.create("transactions", body)
 
 

@@ -1281,7 +1281,11 @@ class HorizonsIngestClient:
                 row["line_index"] = i
             prepared.append(row)
         txns = [clean_transaction(t) for t in prepared]
-        filing_out = dict(filing)
+        filing_out = {
+            key: value
+            for key, value in filing.items()
+            if key not in ("member_id", "member_party") or str(value or "").strip()
+        }
         body = {
             "type": "filing",
             "payload": {

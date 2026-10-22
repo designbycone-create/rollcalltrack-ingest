@@ -125,6 +125,76 @@ class _Resp:
             raise RuntimeError(self.status_code)
 
 
+def test_unmatched_reingest_keeps_member_id_and_party(monkeypatch):
+    url = "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20035588.pdf"
+    conn = _MemoryPB()
+    filing_id = db.upsert_filing(
+        conn,
+        {
+            "source_url": url,
+            "member_id": "hern-id",
+            "member_party": "R",
+            "member_name": "Kevin Hern",
+            "chamber": "house",
+            "filing_type": "ptr",
+            "filing_date": "10/13/2026",
+        },
+    )
+    again = db.upsert_filing(
+        conn,
+        {
+            "source_url": url,
+            "member_id": "",
+            "member_party": "",
+            "member_name": "Kevin Hern",
+            "chamber": "house",
+            "filing_type": "ptr",
+            "filing_date": "10/13/2026",
+        },
+    )
+    assert again == filing_id
+    stored = next(r for r in conn.records if r["_collection"] == "disclosure_filings")
+    assert stored["member_id"] == "hern-id"
+    assert stored["member_party"] == "R"
+
+    db.upsert_transaction(
+        conn,
+        {
+            "filing_id": filing_id,
+            "line_index": 0,
+            "asset_name": "Lockheed Martin Corporation Common Stock (LMT)",
+            "transaction_date": "09/17/2026",
+            "amount_range_raw": "$15,001 - $50,000",
+            "ticker": "LMT",
+            "ticker_confidence": "medium",
+            "member_id": "",
+        },
+    )
+    txn = next(r for r in conn.records if r["_collection"] == "transactions")
+    assert "member_id" not in txn
+
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    seen = {}
+
+    def fake_post(body, path="/hcgi/api/ingest/disclosures"):
+        seen["body"] = body
+        return _Resp(200, {"filing_id": filing_id, "transactions_written": 0})
+
+    monkeypatch.setattr(hz, "_post_ingest", fake_post)
+    hz.submit_filing(
+        {
+            "source_url": url,
+            "member_id": "",
+            "member_party": "",
+            "member_name": "Kevin Hern",
+        }
+    )
+    payload = seen["body"]["payload"]["filing"]
+    assert "member_id" not in payload
+    assert "member_party" not in payload
+    assert payload["member_name"] == "Kevin Hern"
+
+
 def test_horizons_payload_includes_line_index_and_ticker(monkeypatch):
     hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
     seen = {}
