@@ -147,8 +147,10 @@ and `GET /hcgi/api/transactions` are not deployed. `GET /hcgi/api/disclosures/re
 is a capped transaction feed and is not the filing index. If the members
 route does not answer, or a member disclosure stays rate-limited or
 unavailable, the command exits non-zero instead of reporting zero
-changes or a partial list. Reads are paced so the public list does not
-return HTTP 429, and they do not need `INGEST_API_KEY`.
+changes or a partial list. The public read API allows 100 requests per
+300 seconds (`ratelimit-policy: 100;w=300`). The client honors
+`ratelimit-remaining` and waits out `ratelimit-reset` before that window
+is spent. Reads do not need `INGEST_API_KEY`.
 
 ```bash
 python -m ingest.backfill_members

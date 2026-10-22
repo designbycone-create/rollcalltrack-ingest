@@ -137,6 +137,25 @@ def test_list_pages_members_and_keeps_transaction_identity():
     }
 
 
+def test_pace_waits_when_the_rate_limit_window_is_nearly_spent(monkeypatch):
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    slept = []
+    monkeypatch.setattr("ingest.ingest_client.time.sleep", lambda seconds: slept.append(seconds))
+
+    class _Response:
+        status_code = 200
+        headers = {"ratelimit-remaining": "2", "ratelimit-reset": "15"}
+
+    hz._note_rate_limit(_Response())
+    hz._pace_get()
+    assert slept == [15.0]
+    assert hz._ratelimit_remaining is None
+
+    hz._note_rate_limit(type("Plenty", (), {"headers": {"ratelimit-remaining": "40", "ratelimit-reset": "200"}})())
+    hz._pace_get()
+    assert slept == [15.0]
+
+
 def test_list_retries_429_then_reads_the_filing(monkeypatch):
     hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
     seen = {"disclosures": 0}

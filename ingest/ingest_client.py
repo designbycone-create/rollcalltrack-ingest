@@ -43,9 +43,10 @@ INGEST_BACKOFF_CAP = 90.0
 logger = logging.getLogger("rollcalltrack_ingest.ingest_client")
 
 _PB_META = ("collectionId", "collectionName", "created", "updated")
-# Public member-disclosure reads 429 after a short burst. Pace the catalog
-# and the lookups that follow it on the same client.
-_LIST_GET_INTERVAL_SECONDS = 1.0
+# Live reads advertise `ratelimit-policy: 100;w=300` (100 requests / 5 minutes).
+# When those headers are absent, stay under that budget with a fixed gap.
+_LIST_GET_INTERVAL_SECONDS = 3.1
+_RATE_LIMIT_RESERVE = 2
 _LIST_RETRY_STATUS = frozenset({403, 429, 500, 502, 503, 504})
 
 
@@ -222,6 +223,9 @@ class HorizonsIngestClient:
         self.session.headers.update({"User-Agent": config.USER_AGENT})
         self._min_get_interval = 0.0
         self._last_get_at = 0.0
+        self._ratelimit_remaining = None
+        self._ratelimit_reset = None
+        self._saw_rate_limit = False
         # Name/state/chamber → member or None. Lives for this client (one run).
         self._lookup_cache: dict[tuple[str, str, str, str], dict | None] = {}
 
@@ -229,7 +233,52 @@ class HorizonsIngestClient:
     def configured(self) -> bool:
         return bool(self.base and self.ingest_key)
 
+    def _header_value(self, resp, name: str):
+        headers = getattr(resp, "headers", None) or {}
+        getter = getattr(headers, "get", None)
+        if getter is None:
+            return None
+        for key in (name, name.lower(), name.title()):
+            value = getter(key)
+            if value is not None and str(value).strip() != "":
+                return value
+        return None
+
+    def _note_rate_limit(self, resp) -> None:
+        """Remember `ratelimit-remaining` / `ratelimit-reset` from a public GET."""
+        remaining = self._header_value(resp, "ratelimit-remaining")
+        reset = self._header_value(resp, "ratelimit-reset")
+        try:
+            self._ratelimit_remaining = int(str(remaining).strip())
+            self._saw_rate_limit = True
+        except (TypeError, ValueError):
+            self._ratelimit_remaining = None
+        try:
+            reset_s = float(str(reset).strip())
+            if reset_s > 10000:
+                reset_s = max(0.0, reset_s - time.time())
+            self._ratelimit_reset = reset_s
+            self._saw_rate_limit = True
+        except (TypeError, ValueError):
+            self._ratelimit_reset = None
+        if not self._saw_rate_limit and float(self._min_get_interval or 0) <= 0:
+            self._min_get_interval = _LIST_GET_INTERVAL_SECONDS
+
     def _pace_get(self) -> None:
+        remaining = getattr(self, "_ratelimit_remaining", None)
+        if remaining is not None and remaining <= _RATE_LIMIT_RESERVE:
+            reset = getattr(self, "_ratelimit_reset", None)
+            wait = 60.0 if reset is None else min(max(float(reset), 1.0), 300.0)
+            logger.info(
+                "public rate limit remaining=%s, pausing %.0fs",
+                remaining,
+                wait,
+            )
+            time.sleep(wait)
+            self._ratelimit_remaining = None
+            self._ratelimit_reset = None
+            self._last_get_at = time.monotonic()
+            return
         interval = float(getattr(self, "_min_get_interval", 0) or 0)
         if interval <= 0:
             return
@@ -239,17 +288,14 @@ class HorizonsIngestClient:
             time.sleep(wait)
         self._last_get_at = time.monotonic()
 
-    def _slow_list_gets(self) -> None:
-        current = float(getattr(self, "_min_get_interval", 0) or 0)
-        base = current if current > 0 else _LIST_GET_INTERVAL_SECONDS
-        self._min_get_interval = min(base * 2, 4.0)
-
     def _get(self, path: str, params: dict | None = None) -> requests.Response:
         self._pace_get()
         url = f"{self.base}{path}"
         if params:
             url = f"{url}?{urlencode(params)}"
-        return self.session.get(url, timeout=self.timeout)
+        resp = self.session.get(url, timeout=self.timeout)
+        self._note_rate_limit(resp)
+        return resp
 
     def _should_retry(self, resp: requests.Response) -> bool:
         if resp.status_code == 429:
@@ -1191,11 +1237,9 @@ class HorizonsIngestClient:
         return catalog
 
     def _fetch_disclosure_catalog(self) -> tuple[list[dict], list[dict]]:
-        # Keep this interval for later member lookups in the same process.
-        # A burst of /members/{id}/disclosures returns HTTP 429 and a partial
-        # catalog would under-count the filings the backfill is supposed to see.
-        if float(getattr(self, "_min_get_interval", 0) or 0) <= 0:
-            self._min_get_interval = _LIST_GET_INTERVAL_SECONDS
+        # The public API allows 100 reads per 300 seconds. `_get` waits out
+        # `ratelimit-reset` before the window is spent, so a 429 does not
+        # turn into a partial filing list.
         members = self._list_federal_members()
         filings_by_id: dict[str, dict] = {}
         transactions: list[dict] = []
@@ -1226,11 +1270,12 @@ class HorizonsIngestClient:
                     f"GET {path} did not return JSON. Refusing a partial filing list."
                 ) from exc
             disclosures_ok += 1
-            if disclosures_ok % 50 == 0:
+            if disclosures_ok % 50 == 0 or disclosures_ok == 1:
                 logger.info(
-                    "disclosure list progress members=%d filings=%d",
+                    "disclosure list progress members=%d filings=%d remaining=%s",
                     disclosures_ok,
                     len(filings_by_id),
+                    getattr(self, "_ratelimit_remaining", None),
                 )
             member_filings = [
                 _without_server_meta(row)
@@ -1351,7 +1396,11 @@ class HorizonsIngestClient:
         return out
 
     def _get_ok(self, path: str, params: dict | None = None, attempts: int = 8):
-        """GET, backing off on rate limits and transient gateway errors."""
+        """GET, backing off on rate limits and transient gateway errors.
+
+        HTTP 429 waits for ``ratelimit-reset`` (applied on the next ``_get``)
+        instead of sending another request into the same window.
+        """
         delay = 3.0
         last = None
         for attempt in range(attempts):
@@ -1360,16 +1409,21 @@ class HorizonsIngestClient:
             except Exception as exc:
                 if attempt == attempts - 1:
                     raise
-                self._slow_list_gets()
                 logger.warning("list %s error %s, retry in %ss", path, exc, delay)
                 time.sleep(delay)
                 delay = min(delay * 2, 30)
                 continue
             if last.status_code not in _LIST_RETRY_STATUS:
                 return last
+            # A few full windows are enough. More retries would sit here for
+            # tens of minutes and still not be a complete catalog.
+            if last.status_code == 429 and attempt >= 3:
+                break
             if attempt == attempts - 1:
                 break
-            self._slow_list_gets()
+            if last.status_code == 429 and getattr(self, "_ratelimit_reset", None):
+                logger.warning("list %s HTTP 429, waiting for ratelimit-reset", path)
+                continue
             logger.warning(
                 "list %s HTTP %s, retry in %ss", path, last.status_code, delay
             )

@@ -20,8 +20,8 @@ on:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    # Paged member disclosure reads are paced under the public rate limit.
-    timeout-minutes: 60
+    # Member disclosure reads share a 100-request / 5-minute public limit.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
