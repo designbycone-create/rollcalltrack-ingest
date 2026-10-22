@@ -451,7 +451,9 @@ def test_scanned_ptr_row_keeps_owner_asset_and_date():
     )
     txns = _transactions_from_scanned_ptr(line)
     assert len(txns) == 1
-    assert "BLACKSTONE" in txns[0]["asset_name"].upper()
+    assert txns[0]["asset_name"] == (
+        "BLACKSTONE PRIVATE EQUITY STRATEGIES FUND LP CLASS CX"
+    )
     assert txns[0]["transaction_date"] == "08/20/2026"
     assert txns[0]["filer_relation"] == "spouse"
     assert txns[0]["amount_range_raw"] == ""
@@ -543,7 +545,7 @@ def test_ocr_renders_at_300_and_corrects_osd_rotation(monkeypatch):
     assert seen["dpi"] == 300
     assert seen["rotate"] == (-270, True)
     assert seen["autocontrast"] is True
-    assert seen["config"] == "--psm 6"
+    assert seen["config"] == "--psm 6 -c preserve_interword_spaces=1"
 
 
 def test_mccaul_landscape_scan_yields_transactions():
@@ -555,7 +557,18 @@ def test_mccaul_landscape_scan_yields_transactions():
     result = resolve_ptr_transactions("", ocr=lambda: ocr_pdf_bytes(content))
     assert result["used_ocr"] is True
     assert result["parse_status"] == "parsed"
-    assert result["transactions"]
-    blob = " ".join(txn["asset_name"] for txn in result["transactions"]).upper()
-    dates = {txn["transaction_date"] for txn in result["transactions"]}
-    assert "BLACKSTONE" in blob or "08/20/2026" in dates
+    blackstone = [
+        txn
+        for txn in result["transactions"]
+        if "BLACKSTONE" in txn["asset_name"].upper()
+    ]
+    assert len(blackstone) == 1
+    row = blackstone[0]
+    assert row["asset_name"].startswith(
+        "BLACKSTONE PRIVATE EQUITY STRATEGIES FUND LP CLASS"
+    )
+    assert "BLACKSTONEPRIVATE" not in row["asset_name"]
+    assert row["transaction_date"] == "08/20/2026"
+    assert row["filer_relation"] == "spouse"
+    assert row["amount_range_raw"] == "$500,001 - $1,000,000"
+    assert row["transaction_type"] == "purchase"

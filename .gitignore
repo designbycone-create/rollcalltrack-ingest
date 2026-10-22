@@ -9,5 +9,6 @@ tmp/
 logs/
 *.pdf
 !tests/fixtures/*.pdf
+!tests/fixtures/ptr/*.pdf
 tmp_*.html
 .DS_Store
