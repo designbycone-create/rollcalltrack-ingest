@@ -308,9 +308,9 @@ def test_lookup_tries_full_name_then_last_name_then_bioguide(monkeypatch):
     )
     assert member["id"] == "pb-taylor"
     assert calls == [
-        {"name": "David Taylor", "state": "Ohio"},
-        {"name": "Taylor", "state": "Ohio"},
-        {"bioguide_id": "T000490"},
+        {"name": "David Taylor", "state": "Ohio", "chamber": "house"},
+        {"name": "Taylor", "state": "Ohio", "chamber": "house"},
+        {"bioguide_id": "T000490", "chamber": "house"},
     ]
     assert all("district" not in call for call in calls)
 
@@ -346,7 +346,7 @@ def test_lookup_stops_when_full_name_and_state_match(monkeypatch):
     )
     assert member["id"] == "pb-rich"
     assert member["party"] == "R"
-    assert calls == [{"name": "Richard McCormick", "state": "Georgia"}]
+    assert calls == [{"name": "Richard McCormick", "state": "Georgia", "chamber": "house"}]
 
 
 def test_lookup_uses_bioguide_when_state_on_the_filing_is_wrong(monkeypatch):
