@@ -4,12 +4,15 @@ Hostinger cannot fetch senate.gov, so this job pulls the menu (and optional
 per-vote detail) and posts through HorizonsIngestClient.submit_votes.
 Payload fields match the House rows already stored on GET /hcgi/api/votes.
 """
+import logging
 from datetime import date
 from pathlib import Path
 
 import pytest
+import requests
 
 from ingest.ingest_client import HorizonsIngestClient, _LIST_GET_INTERVAL_SECONDS
+from ingest.legislators import LEGISLATORS_HISTORICAL_URL, LEGISLATORS_URL
 from ingest.senate_votes import (
     BROWSER_USER_AGENT,
     HORIZONS_BATCH_SIZE,
@@ -19,6 +22,7 @@ from ingest.senate_votes import (
     current_senate_session,
     detail_url,
     fetch_xml,
+    load_lis_to_bioguide,
     menu_url,
     parse_detail,
     parse_menu,
@@ -234,9 +238,10 @@ def test_fetch_xml_returns_senate_xml():
     assert parse_menu(body)[0]["chamber"] == "Senate"
 
 
-def test_parse_detail_maps_member_positions_and_clock_time():
+def test_parse_detail_maps_member_positions_and_clock_time(caplog):
     summary = next(v for v in parse_menu(MENU_XML) if v["roll_number"] == "256")
-    enriched = parse_detail(DETAIL_XML, summary, lis_to_bioguide=LIS)
+    with caplog.at_level(logging.WARNING, logger="rollcalltrack_ingest.senate_votes"):
+        enriched = parse_detail(DETAIL_XML, summary, lis_to_bioguide=LIS)
     assert enriched["date"] == "2026-09-30T21:29:00-04:00"
     assert enriched["result"] == "Confirmed"
     assert enriched["question"] == "On the Nomination"
@@ -247,14 +252,164 @@ def test_parse_detail_maps_member_positions_and_clock_time():
     assert enriched["tally_present"] == 1
     assert enriched["tally_not_voting"] == 1
     members = enriched["member_votes"]
-    assert [m["bioguide_id"] for m in members] == ["A000000", "S000033"]
+    assert len(members) == 4
+    mapped = [m for m in members if "bioguide_id" in m]
+    assert [m["bioguide_id"] for m in mapped] == ["A000000", "S000033"]
     nay = members[0]
     assert nay["vote"] == "nay"
     assert nay["rc_id"] == "s-119-2026-256"
     assert nay["name"] == "Alsobrooks (D-MD)"
+    assert nay["party"] == "D"
+    assert nay["state"] == "MD"
+    assert nay["lis_member_id"] == "S428"
     assert nay["jurisdiction"] == "federal"
     assert nay["state_code"] == ""
+    assert "member_id" not in nay
     assert members[1]["vote"] == "present"
+    unmapped = [m for m in members if "bioguide_id" not in m]
+    assert [m["lis_member_id"] for m in unmapped] == ["S000", ""]
+    assert unmapped[0]["name"] == "Absent (D-CA)"
+    assert unmapped[0]["vote"] == "not_voting"
+    assert unmapped[1]["name"] == "No Id"
+    assert unmapped[1]["vote"] == "yea"
+    for row in unmapped:
+        assert "member_id" not in row
+        assert "bioguide_id" not in row
+        assert row["party"] == ""
+        assert row["state"] == ""
+    assert "lis_member_id=S000" in caplog.text
+    assert "name=No Id" in caplog.text
+
+
+# 2025 roll 1 (vote_119_1_00001.xml) recorded 99 positions. Graham (S293),
+# Mullin (S419), Rubio (S350), and Vance (S421) are absent from
+# legislators-current.json. The LIS ids themselves match the historical file.
+HISTORICAL_LIS = {
+    "S293": "G000359",
+    "S419": "M001190",
+    "S350": "R000595",
+    "S421": "V000137",
+}
+ROLL1_SUMMARY = {
+    "id": "s-119-2025-1",
+    "rc_id": "s-119-2025-1",
+    "chamber": "Senate",
+    "jurisdiction": "federal",
+    "state_code": "",
+}
+_ROLL1_EXPECTED = {
+    "S293": ("Graham (R-SC)", "R", "SC"),
+    "S419": ("Mullin (R-OK)", "R", "OK"),
+    "S350": ("Rubio (R-FL)", "R", "FL"),
+    "S421": ("Vance (R-OH)", "R", "OH"),
+}
+
+
+def _roll1_xml() -> bytes:
+    return (Path(__file__).parent / "fixtures" / "senate_vote_119_1_00001.xml").read_bytes()
+
+
+def test_2025_roll_1_keeps_all_99_positions(caplog):
+    raw = _roll1_xml()
+    bare = parse_detail(raw, ROLL1_SUMMARY, lis_to_bioguide={})
+    assert bare["date"] == "2025-01-09T14:54:00-05:00"
+    assert len(bare["member_votes"]) == 99
+    by_lis = {m["lis_member_id"]: m for m in bare["member_votes"]}
+    current = {
+        lis: f"C{i:06d}"
+        for i, lis in enumerate(sorted(by_lis))
+        if lis not in HISTORICAL_LIS
+    }
+    with caplog.at_level(logging.WARNING, logger="rollcalltrack_ingest.senate_votes"):
+        current_only = parse_detail(raw, ROLL1_SUMMARY, lis_to_bioguide=current)
+    assert len(current_only["member_votes"]) == 99
+    missing = {
+        m["lis_member_id"]: m
+        for m in current_only["member_votes"]
+        if "bioguide_id" not in m
+    }
+    assert set(missing) == set(HISTORICAL_LIS)
+    for lis_id, (name, party, state) in _ROLL1_EXPECTED.items():
+        row = missing[lis_id]
+        assert row["name"] == name
+        assert row["party"] == party
+        assert row["state"] == state
+        assert row["vote"] == "yea"
+        assert "member_id" not in row
+        assert "bioguide_id" not in row
+        assert f"lis_member_id={lis_id}" in caplog.text
+    mapped = [m for m in current_only["member_votes"] if "bioguide_id" in m]
+    assert len(mapped) == 95
+
+    full = parse_detail(
+        raw,
+        ROLL1_SUMMARY,
+        lis_to_bioguide={**current, **HISTORICAL_LIS},
+    )
+    assert len(full["member_votes"]) == 99
+    got = {m["lis_member_id"]: m for m in full["member_votes"]}
+    for lis_id, bioguide in HISTORICAL_LIS.items():
+        assert got[lis_id]["bioguide_id"] == bioguide
+        assert got[lis_id]["name"] == _ROLL1_EXPECTED[lis_id][0]
+    assert all("bioguide_id" in m and "member_id" not in m for m in full["member_votes"])
+
+
+class _JsonResp:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+class _JsonSession:
+    def __init__(self, by_url):
+        self.by_url = by_url
+        self.urls = []
+
+    def get(self, url, timeout=None, headers=None):
+        self.urls.append(url)
+        return self.by_url[url]
+
+
+def test_load_lis_to_bioguide_merges_historical_then_current():
+    historical = [
+        {"id": {"lis": "S293", "bioguide": "G000359"}},
+        {"id": {"lis": "S999", "bioguide": "OLD000"}},
+    ]
+    current = [
+        {"id": {"lis": "s428", "bioguide": "A000000"}},
+        {"id": {"lis": "S999", "bioguide": "NEW000"}},
+    ]
+    session = _JsonSession(
+        {
+            LEGISLATORS_HISTORICAL_URL: _JsonResp(historical),
+            LEGISLATORS_URL: _JsonResp(current),
+        }
+    )
+    mapping = load_lis_to_bioguide(session=session)
+    assert session.urls == [LEGISLATORS_HISTORICAL_URL, LEGISLATORS_URL]
+    assert mapping["S293"] == "G000359"
+    assert mapping["S428"] == "A000000"
+    assert mapping["S999"] == "NEW000"
+
+
+def test_load_lis_to_bioguide_keeps_current_when_historical_fails():
+    session = _JsonSession(
+        {
+            LEGISLATORS_HISTORICAL_URL: _JsonResp([], status=500),
+            LEGISLATORS_URL: _JsonResp(
+                [{"id": {"lis": "S419", "bioguide": "M001190"}}]
+            ),
+        }
+    )
+    mapping = load_lis_to_bioguide(session=session)
+    assert mapping == {"S419": "M001190"}
 
 
 # Roll 225 (2026-08-07) is an en-bloc confirmation. The live menu nests 74
@@ -502,6 +657,9 @@ def test_submit_votes_accepts_federal_senate_shape(monkeypatch):
     assert posted["state_code"] == ""
     assert posted["rc_id"] == "s-119-2026-256"
     assert posted["member_votes"][0]["bioguide_id"] == "A000000"
+    unmapped = [m for m in posted["member_votes"] if "bioguide_id" not in m]
+    assert [m["lis_member_id"] for m in unmapped] == ["S000", ""]
+    assert all("member_id" not in m for m in posted["member_votes"])
     assert out["written"] == 1
 
     state = {
@@ -519,6 +677,19 @@ def test_submit_votes_accepts_federal_senate_shape(monkeypatch):
     hz.submit_votes([state])
     assert seen["body"]["votes"][0]["jurisdiction"] == "state"
 
+    with pytest.raises(ValueError, match="bioguide_id"):
+        hz.submit_votes([{**state, "member_votes": [{"vote": "yea"}]}])
+    with pytest.raises(ValueError, match="member_id"):
+        hz.submit_votes(
+            [
+                {
+                    **record,
+                    "member_votes": [
+                        {"member_id": "raw-id", "vote": "yea", "lis_member_id": "S000"}
+                    ],
+                }
+            ]
+        )
     with pytest.raises(ValueError):
         hz.submit_votes([{**record, "chamber": "senate"}])
     with pytest.raises(ValueError):

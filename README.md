@@ -1226,7 +1226,7 @@ House row already stored on `GET /hcgi/api/votes`. House rows use
 | `jurisdiction` | `federal` |
 | `state_code` | `""` (House rows store an empty string, not null) |
 | `source_url` | the detail XML URL, one per roll |
-| `member_votes[]` | only when detail was fetched. `bioguide_id` from congress-legislators `id.lis` (`S428`). `vote` is `yea` / `nay` / `present` / `not_voting`. Unmapped members are omitted. |
+| `member_votes[]` | only when detail was fetched. Every recorded cast is kept. `bioguide_id` from congress-legislators `id.lis` (`S428`), joining `legislators-current.json` and `legislators-historical.json` (current wins on a shared LIS id). `vote` is `yea` / `nay` / `present` / `not_voting`. An unmapped senator is still sent with `lis_member_id`, `name`, `party`, and `state`, and without `member_id` or `bioguide_id`. |
 
 `rc_id` is not `{congress}-{session}-{roll}`. That is the House key
 (`119-2-314`) and would collide with a Senate roll of the same number.
@@ -1252,8 +1252,16 @@ collection read is `GET /hcgi/api/votes`. The public congress list is
 `GET /hcgi/api/congress/votes`.
 
 LIS ids are not bioguides. Member positions are joined through the
-public congress-legislators roster. If that roster is down, the roll
-call is still posted and `member_votes` is omitted.
+public congress-legislators current and historical rosters. Lindsey
+Graham (`S293`, `G000359`) and Markwayne Mullin (`S419`, `M001190`) are
+current senators, but this dataset has already ended their terms
+(2026-07-11 and 2026-03-23), so they are only in
+`legislators-historical.json`. The LIS id format matches; a current-only
+lookup misses them. Marco Rubio (`S350`) and J.D. Vance (`S421`) resigned
+in January 2025 and are historical too. A senator who is still unmapped
+is posted without a bioguide, and the job logs a warning. If both
+rosters are down, every position goes out that way. The roll call is
+still posted.
 
 ### CLI
 
@@ -1309,7 +1317,7 @@ are not origin requests.
 | | Session 1 (~650 rolls) | `all` (~650 + 256 session-2 rolls) |
 |--|-----------|-----------------------------------------------|
 | senate.gov menu + detail GETs | 1 + ~650 | 2 + ~906 |
-| congress-legislators GET | 1 | 1 |
+| congress-legislators GET | 2 (historical, then current) | 2 |
 | Origin POSTs | 26 batches + 1 log = **27** | 26 + 11 batches + 2 logs = **39** |
 | Share of 100 requests / 5 min | 27 | 39 |
 | Expected duration | about 15–30 min | about 25–40 min |

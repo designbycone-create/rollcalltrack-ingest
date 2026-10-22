@@ -28,6 +28,14 @@ logger = logging.getLogger("rollcalltrack_ingest.legislators")
 LEGISLATORS_URL = (
     "https://unitedstates.github.io/congress-legislators/legislators-current.json"
 )
+# Former members, including senators who left mid-Congress. Lindsey Graham
+# (S293) and Markwayne Mullin (S419) are here, not in the current file:
+# their terms in this dataset end 2026-07-11 and 2026-03-23. Rubio (S350)
+# and Vance (S421) resigned in January 2025 and are here too.
+LEGISLATORS_HISTORICAL_URL = (
+    "https://unitedstates.github.io/congress-legislators/"
+    "legislators-historical.json"
+)
 
 _CACHE: dict[str, Any] = {"roster": None, "failed": False}
 
