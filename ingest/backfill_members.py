@@ -12,8 +12,13 @@ value makes the writer return HTTP 500, and the retry stores the filing
 with no member link).
 
 Filings are read from ``GET /hcgi/api/members`` and
-``GET /hcgi/api/members/{id}/disclosures``. If that list does not answer,
-the command exits non-zero instead of reporting zero changes.
+``GET /hcgi/api/members/{id}/disclosures``. That catalog cannot see a
+filing whose member_id is blank. ``--relink-filing-ids`` loads those
+Horizons ids from a single-filing GET. No working single-filing GET was
+found: ingest paths return ``{"error":"Route not found"}``, and the
+public id paths were Cloudflare 403 from the probe network. The command
+exits non-zero and names the routes it tried. If the member catalog does
+not answer, the command exits non-zero instead of reporting zero changes.
 
 Dry run is the default. It prints every planned change and does not POST.
 Pass ``--live`` to apply. Existing non-empty fields are left as they are.
@@ -200,14 +205,27 @@ def _without_blanks(row: dict, keys: tuple[str, ...]) -> dict:
     return cleaned
 
 
-def run(client, live: bool = False) -> dict:
-    """Plan member links. POST them only when ``live`` is true."""
+def run(client, live: bool = False, relink_filing_ids: list[str] | None = None) -> dict:
+    """Plan member links. POST them only when ``live`` is true.
+
+    ``relink_filing_ids`` loads those Horizons ids directly. The member
+    catalog cannot see a filing whose member_id is blank.
+    """
     if live:
         os.environ["INGEST_LIVE"] = "1"
 
+    relink_ids = [str(item).strip() for item in (relink_filing_ids or []) if str(item).strip()]
     try:
-        filings = list(client.list_disclosure_filings() or [])
-        transactions = list(client.list_disclosure_transactions() or [])
+        if relink_ids:
+            filings = []
+            transactions = []
+            for filing_id in relink_ids:
+                filing = client.get_disclosure_filing(filing_id)
+                filings.append(filing)
+                transactions.extend(filing.get("transactions") or [])
+        else:
+            filings = list(client.list_disclosure_filings() or [])
+            transactions = list(client.list_disclosure_transactions() or [])
     except DisclosureListError as exc:
         _emit(f"backfill failed: {exc}")
         return {
@@ -371,6 +389,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="POST the planned member updates. Omit this for a dry run.",
     )
+    parser.add_argument(
+        "--relink-filing-ids",
+        default="",
+        help=(
+            "Comma-separated Horizons filing ids to fetch and relink. "
+            "Skips the member catalog, which cannot see a filing with no member_id."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.live:
         os.environ["INGEST_LIVE"] = "1"
@@ -378,7 +404,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    result = run(client=get_client(), live=args.live)
+    relink_ids = [part.strip() for part in args.relink_filing_ids.split(",") if part.strip()]
+    kwargs = {"client": get_client(), "live": args.live}
+    if relink_ids:
+        kwargs["relink_filing_ids"] = relink_ids
+    result = run(**kwargs)
     if not result.get("ok", True):
         print(result.get("error") or "backfill failed: disclosure list route did not answer")
         return 1

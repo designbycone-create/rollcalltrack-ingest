@@ -144,7 +144,24 @@ Filings are read from `GET /hcgi/api/members` (paged) and
 filings and transactions (`line_index`, `ticker`, `ticker_confidence`)
 side by side. `GET /hcgi/api/filings`, `GET /hcgi/api/disclosures/filings`,
 and `GET /hcgi/api/transactions` are not deployed. `GET /hcgi/api/disclosures/recent`
-is a capped transaction feed and is not the filing index. If the members
+is a capped transaction feed and is not the filing index. A filing with no
+`member_id` is absent from every member's disclosures list. No working
+single-filing GET was found. `GET /hcgi/api/ingest/disclosures/{id}` and
+the sibling ingest paths answer `{"error":"Route not found"}`. The public
+candidates `GET /hcgi/api/disclosures/{id}`,
+`GET /hcgi/api/disclosures/filings/{id}`,
+`GET /hcgi/api/disclosures/filing/{id}`, `GET /hcgi/api/filings/{id}`, and
+`GET /hcgi/api/filing/{id}` were not confirmed against the origin from this
+network (Cloudflare returned 403 HTML). When the origin was reachable,
+`GET /hcgi/api/filings` and `GET /hcgi/api/disclosures/filings` (no id)
+returned application 404. `--relink-filing-ids` tries the five public
+paths, prints the planned link when one returns the filing, and exits
+non-zero when every response is an application 404 ("No single-filing GET
+route is deployed") or a Cloudflare 403 ("did not reach the app"). Name
+matching is the current lookup (McConnell middle-name/nickname, and a
+state taken from the office line).
+Live mode sends the update through the existing disclosures ingest POST,
+including the filing's transactions. If the members
 route does not answer, or a member disclosure stays rate-limited or
 unavailable, the command exits non-zero instead of reporting zero
 changes or a partial list. The public read API allows 100 requests per
@@ -155,6 +172,7 @@ is spent. Reads do not need `INGEST_API_KEY`.
 ```bash
 python -m ingest.backfill_members
 python -m ingest.backfill_members --live
+python -m ingest.backfill_members --relink-filing-ids vfjvcedtqldoxxs
 ```
 
 Both commands need `HORIZONS_BASE_URL` and `INGEST_API_KEY`. The dry run
@@ -164,7 +182,9 @@ The same commands run from Actions → **Backfill members** (manual only).
 `mode` defaults to `dry-run`; `live` adds `--live`. Optional `filing_ids`
 (comma-separated House DocIDs) re-parses each one with
 `python -m ingest.main --source house --filing-id …` in that same mode.
-The job uploads `planned-changes` and writes a run summary.
+Optional `relink_filing_ids` (comma-separated Horizons filing ids) skips
+the member catalog and tries the single-filing GET routes above. The job
+uploads `planned-changes` and writes a run summary.
 
 ### Member matching
 

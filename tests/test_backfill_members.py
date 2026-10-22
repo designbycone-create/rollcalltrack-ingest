@@ -399,6 +399,154 @@ def test_cli_exits_when_the_list_route_does_not_answer(monkeypatch):
     assert mod.main([]) == 1
 
 
+def test_relink_dry_run_prints_the_member_link(capsys):
+    seen = {}
+
+    class _Client:
+        def get_disclosure_filing(self, filing_id):
+            assert filing_id == "vfjvcedtqldoxxs"
+            return {
+                "id": filing_id,
+                "member_name": "A. Mitchell McConnell, Jr.",
+                "member_id": "",
+                "member_party": "",
+                "member_state": "",
+                "office": "McConnell, A. Mitchell Jr. (Senator)",
+                "chamber": "senate",
+                "source_url": "https://efdsearch.senate.gov/search/view/ptr/mcconnell/",
+                "transactions": [
+                    {
+                        "id": "t0",
+                        "filing_id": filing_id,
+                        "line_index": 0,
+                        "ticker": "T",
+                        "ticker_confidence": "medium",
+                        "asset_name": "AT&T",
+                    }
+                ],
+            }
+
+        def lookup_member_by_name(self, name, **kwargs):
+            seen["name"] = name
+            seen["office"] = kwargs.get("office")
+            seen["state"] = kwargs.get("state")
+            seen["chamber"] = kwargs.get("chamber")
+            return {
+                "id": "pb-mitch",
+                "bioguide_id": "M000355",
+                "name": "Mitch McConnell",
+                "party": "R",
+                "state": "Kentucky",
+            }
+
+        def submit_filing(self, *args, **kwargs):
+            raise AssertionError("dry run must not POST")
+
+    result = run(client=_Client(), live=False, relink_filing_ids=["vfjvcedtqldoxxs"])
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["filings_changed"] == 1
+    assert seen["name"] == "A. Mitchell McConnell, Jr."
+    assert seen["office"] == "McConnell, A. Mitchell Jr. (Senator)"
+    assert seen["chamber"] == "senate"
+    output = capsys.readouterr().out
+    assert "vfjvcedtqldoxxs member_id: '' -> 'pb-mitch'" in output
+    assert "M000355" in output
+
+
+def test_relink_live_posts_the_existing_transactions():
+    posted = {}
+
+    class _Client:
+        def get_disclosure_filing(self, filing_id):
+            return {
+                "id": filing_id,
+                "member_name": "John Boozman",
+                "member_id": "",
+                "member_state": "",
+                "office": "Boozman, John (Senator)",
+                "chamber": "senate",
+                "source_url": "https://efdsearch.senate.gov/search/view/ptr/boozman/",
+                "filing_date": "8/20/2026",
+                "transactions": [
+                    {
+                        "id": "t0",
+                        "filing_id": filing_id,
+                        "line_index": 0,
+                        "ticker": "AAPL",
+                        "ticker_confidence": "high",
+                        "asset_name": "Apple Inc.",
+                    }
+                ],
+            }
+
+        def lookup_member_by_name(self, name, **kwargs):
+            assert kwargs.get("office") == "Boozman, John (Senator)"
+            return {
+                "id": "pb-boozman",
+                "bioguide_id": "B001236",
+                "name": "John Boozman",
+                "party": "R",
+                "state": "Arkansas",
+            }
+
+        def submit_filing(self, payload, transactions=None, ignore_stale_date=False):
+            posted["payload"] = payload
+            posted["transactions"] = transactions
+            posted["ignore_stale_date"] = ignore_stale_date
+
+    result = run(client=_Client(), live=True, relink_filing_ids=["boozman820"])
+    assert result["filings_changed"] == 1
+    assert posted["ignore_stale_date"] is True
+    assert posted["payload"]["member_id"] == "pb-boozman"
+    assert posted["payload"]["source_url"].endswith("/boozman/")
+    assert posted["transactions"][0]["line_index"] == 0
+    assert posted["transactions"][0]["ticker"] == "AAPL"
+    assert posted["transactions"][0]["ticker_confidence"] == "high"
+    assert posted["transactions"][0]["member_id"] == "pb-boozman"
+
+
+def test_relink_fails_when_no_single_filing_route_exists():
+    from ingest.ingest_client import DisclosureListError
+
+    class _Client:
+        def get_disclosure_filing(self, filing_id):
+            raise DisclosureListError(
+                "No single-filing GET route is deployed on /hcgi/api. "
+                "Tried: GET /hcgi/api/disclosures/vfjvcedtqldoxxs HTTP 404"
+            )
+
+    result = run(client=_Client(), live=False, relink_filing_ids=["vfjvcedtqldoxxs"])
+    assert result["ok"] is False
+    assert result["filings_changed"] == 0
+    assert "No single-filing GET route" in result["error"]
+
+
+def test_cli_passes_relink_filing_ids(monkeypatch):
+    import ingest.backfill_members as mod
+
+    seen = {}
+
+    def fake_run(client=None, live=False, relink_filing_ids=None):
+        seen["live"] = live
+        seen["ids"] = relink_filing_ids
+        return {
+            "ok": True,
+            "dry_run": not live,
+            "filings_seen": 1,
+            "transactions_seen": 1,
+            "filings_changed": 1,
+            "transactions_changed": 1,
+            "unresolved": 0,
+        }
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    monkeypatch.setattr(mod, "get_client", lambda: object())
+    assert mod.main(["--relink-filing-ids", "vfjvcedtqldoxxs, boozman820"]) == 0
+    assert seen["live"] is False
+    assert seen["ids"] == ["vfjvcedtqldoxxs", "boozman820"]
+
+
 def test_cli_defaults_to_dry_run(monkeypatch):
     import ingest.backfill_members as mod
 

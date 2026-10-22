@@ -10,7 +10,6 @@ Submit body shape:
 from __future__ import annotations
 
 import logging
-import re
 import time
 from typing import Any
 from urllib.parse import quote, urlencode
@@ -48,6 +47,21 @@ _PB_META = ("collectionId", "collectionName", "created", "updated")
 _LIST_GET_INTERVAL_SECONDS = 3.1
 _RATE_LIMIT_RESERVE = 2
 _LIST_RETRY_STATUS = frozenset({403, 429, 500, 502, 503, 504})
+# Per-member disclosures omit filings whose member_id is blank. These are the
+# public GET shapes that would return one Horizons filing id. Probed
+# 2026-10-22: /hcgi/api/ingest/disclosures/{id} and sibling ingest paths
+# return {"error":"Route not found"}. The five public paths below were
+# Cloudflare 403 HTML from this network, so they were not confirmed against
+# the origin. Collection routes without an id (/hcgi/api/filings,
+# /hcgi/api/disclosures/filings) returned application 404 when the origin
+# was reachable. No working single-filing GET was found.
+_SINGLE_FILING_GETS = (
+    "/hcgi/api/disclosures/{filing_id}",
+    "/hcgi/api/disclosures/filings/{filing_id}",
+    "/hcgi/api/disclosures/filing/{filing_id}",
+    "/hcgi/api/filings/{filing_id}",
+    "/hcgi/api/filing/{filing_id}",
+)
 
 
 class DisclosureListError(RuntimeError):
@@ -62,15 +76,43 @@ def _without_server_meta(row: dict) -> dict:
     return {key: value for key, value in row.items() if key not in _PB_META}
 
 
-def _row_id_is_bioguide(member: dict) -> bool:
-    """True when this row's id is a congressional bioguide, not a database id."""
-    member_id = str(member.get("id") or "").strip()
-    bioguide = str(member.get("bioguide_id") or "").strip()
-    if not member_id:
-        return False
-    if bioguide and member_id.upper() == bioguide.upper():
-        return True
-    return bool(re.fullmatch(r"[A-Za-z]\d{6}", member_id))
+def _filing_from_single_payload(data, filing_id: str) -> dict | None:
+    """Pick the filing object out of a single-record JSON body."""
+    if not isinstance(data, dict):
+        return None
+    filing = None
+    if isinstance(data.get("filing"), dict):
+        filing = data["filing"]
+    elif isinstance(data.get("filings"), list):
+        rows = [row for row in data["filings"] if isinstance(row, dict)]
+        filing = next(
+            (row for row in rows if str(row.get("id") or "") == filing_id),
+            None,
+        )
+        if filing is None and len(rows) == 1 and str(rows[0].get("id") or filing_id) == filing_id:
+            filing = rows[0]
+    elif str(data.get("id") or "") == filing_id:
+        filing = data
+    if not isinstance(filing, dict):
+        return None
+    if str(filing.get("id") or filing_id) != filing_id:
+        return None
+    filing = _without_server_meta(dict(filing))
+    raw_txns = filing.get("transactions")
+    if not isinstance(raw_txns, list):
+        raw_txns = data.get("transactions") if isinstance(data.get("transactions"), list) else []
+    owned = []
+    for txn in raw_txns:
+        if not isinstance(txn, dict):
+            continue
+        txn_filing = str(txn.get("filing_id") or filing_id)
+        if txn_filing != filing_id:
+            continue
+        owned.append(_without_server_meta(txn))
+    owned.sort(key=lambda row: (row.get("line_index") is None, row.get("line_index") or 0))
+    filing["transactions"] = owned
+    filing["id"] = filing_id
+    return filing
 
 
 class LookupRateLimited(RuntimeError):
@@ -1228,6 +1270,70 @@ class HorizonsIngestClient:
         _filings, transactions = self._disclosure_catalog()
         return transactions
 
+    def get_disclosure_filing(self, filing_id: str) -> dict:
+        """Load one stored filing by its Horizons id, with its transactions.
+
+        ``GET /hcgi/api/members/{id}/disclosures`` cannot see a filing that
+        has no member id. This tries the single-record routes. When every
+        one answers 404, it raises ``DisclosureListError`` instead of
+        inventing an empty filing.
+        """
+        filing_id = str(filing_id or "").strip()
+        if not filing_id:
+            raise DisclosureListError("A Horizons filing id is required")
+        tried: list[str] = []
+        blocked: list[str] = []
+        for template in _SINGLE_FILING_GETS:
+            path = template.format(filing_id=quote(filing_id, safe=""))
+            try:
+                resp = self._get(path)
+            except requests.RequestException as exc:
+                raise DisclosureListError(f"GET {path} failed: {exc}") from exc
+            if resp.status_code in (429, 500, 502, 503, 504):
+                resp = self._get_ok(path)
+            status = resp.status_code
+            tried.append(f"GET {path} HTTP {status}")
+            if status == 404:
+                continue
+            content_type = ""
+            headers = getattr(resp, "headers", None) or {}
+            getter = getattr(headers, "get", None)
+            if getter:
+                content_type = str(
+                    getter("content-type") or getter("Content-Type") or ""
+                )
+            if status == 403 and "json" not in content_type.lower():
+                blocked.append(path)
+                continue
+            if status != 200:
+                continue
+            try:
+                data = resp.json()
+            except ValueError:
+                blocked.append(path)
+                continue
+            filing = _filing_from_single_payload(data, filing_id)
+            if filing is None:
+                continue
+            logger.info(
+                "Loaded filing %s via %s (%d transactions)",
+                filing_id,
+                path,
+                len(filing.get("transactions") or []),
+            )
+            return filing
+        if blocked and len(blocked) == len(_SINGLE_FILING_GETS):
+            raise DisclosureListError(
+                "Single-filing reads did not reach the app (HTTP 403). "
+                "Tried: " + "; ".join(tried)
+            )
+        raise DisclosureListError(
+            "No single-filing GET route is deployed on /hcgi/api. "
+            "GET /hcgi/api/members/{id}/disclosures only lists filings already "
+            "linked to a member, so a filing with no member_id cannot be "
+            "loaded that way. Tried: " + "; ".join(tried)
+        )
+
     def _disclosure_catalog(self) -> tuple[list[dict], list[dict]]:
         cached = getattr(self, "_disclosure_catalog_cache", None)
         if cached is not None:
@@ -1519,16 +1625,10 @@ class HorizonsIngestClient:
                 )
                 rate_limited = True
                 return None
-            hit = accept_name_hit(candidate, member)
-            if hit and _row_id_is_bioguide(hit):
-                logger.info(
-                    "Member lookup name=%r id=%s is a bioguide; "
-                    "continuing to the database id",
-                    candidate,
-                    hit.get("id"),
-                )
-                return None
-            return hit
+            # Return the name hit even when its id is the bioguide.
+            # A follow-up bioguide query after a 429 dropped Boozman.
+            # Backfill omits a bioguide-shaped member_id before POST.
+            return accept_name_hit(candidate, member)
 
         for candidate in lookup_names:
             hit = lookup_name(candidate)

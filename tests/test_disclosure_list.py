@@ -281,3 +281,65 @@ def test_list_fails_when_a_member_stays_rate_limited(monkeypatch):
     hz._get = fake_get
     with pytest.raises(DisclosureListError, match="429"):
         hz.list_disclosure_filings()
+
+
+def test_single_filing_get_keeps_transactions_from_the_first_live_route():
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    seen = []
+
+    def fake_get(path, params=None):
+        seen.append(path)
+        if path == "/hcgi/api/disclosures/vfjvcedtqldoxxs":
+            return _Resp(404, {"error": "Route not found"})
+        if path == "/hcgi/api/disclosures/filings/vfjvcedtqldoxxs":
+            return _Resp(404, {"error": "Route not found"})
+        if path == "/hcgi/api/disclosures/filing/vfjvcedtqldoxxs":
+            return _Resp(
+                200,
+                {
+                    "filing": {
+                        "id": "vfjvcedtqldoxxs",
+                        "member_name": "A. Mitchell McConnell, Jr.",
+                        "member_id": "",
+                        "office": "McConnell, A. Mitchell Jr. (Senator)",
+                        "source_url": "https://efdsearch.senate.gov/search/view/ptr/mcconnell/",
+                        "collectionId": "pbc_filings",
+                    },
+                    "transactions": [
+                        {
+                            "id": "t1",
+                            "filing_id": "vfjvcedtqldoxxs",
+                            "line_index": 1,
+                            "ticker": "T",
+                            "ticker_confidence": "medium",
+                        },
+                        {
+                            "id": "t0",
+                            "filing_id": "vfjvcedtqldoxxs",
+                            "line_index": 0,
+                            "ticker": "KO",
+                            "ticker_confidence": "high",
+                        },
+                    ],
+                },
+            )
+        raise AssertionError(path)
+
+    hz._get = fake_get
+    filing = hz.get_disclosure_filing("vfjvcedtqldoxxs")
+    assert seen[:3] == [
+        "/hcgi/api/disclosures/vfjvcedtqldoxxs",
+        "/hcgi/api/disclosures/filings/vfjvcedtqldoxxs",
+        "/hcgi/api/disclosures/filing/vfjvcedtqldoxxs",
+    ]
+    assert "collectionId" not in filing
+    assert filing["office"] == "McConnell, A. Mitchell Jr. (Senator)"
+    assert [row["line_index"] for row in filing["transactions"]] == [0, 1]
+    assert filing["transactions"][0]["ticker"] == "KO"
+
+
+def test_single_filing_get_fails_when_no_route_is_deployed():
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    hz._get = lambda path, params=None: _Resp(404, {"error": "Route not found"})
+    with pytest.raises(DisclosureListError, match="No single-filing GET route is deployed"):
+        hz.get_disclosure_filing("vfjvcedtqldoxxs")
