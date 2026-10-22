@@ -1284,13 +1284,15 @@ Actions → **Disclosure Ingest** → **Run workflow**:
 | Input | Values |
 |-------|--------|
 | `senate_session` | `current` (default; same as the cron), `1`, `2`, or `all` |
-| `dry_run` | `true` parses and does not POST. `false` posts. The cron ignores this and posts. |
+| `dry_run` | `dry-run` (default) parses and does not POST. `live` posts. `true`, `false`, empty, or any other value does not POST. The cron ignores this and posts. |
 
-Run `senate_session=1` with `dry_run=true` first, then the same choice
-with `dry_run=false`. `all` posts session 1 and then session 2. A
+Run `senate_session=1` with `dry_run=dry-run` first, then the same session
+with `dry_run=live`. `all` posts session 1 and then session 2. A
 dispatch that is not `current` runs Senate roll calls only, so it does
-not also re-ingest House and Senate disclosures. Leave the inputs at
-`current` / `false` to repeat the daily job by hand.
+not also re-ingest House and Senate disclosures. The words `true` and
+`false` are not choices: GitHub coerces those strings to booleans, and a
+selected `true` was stored as the default `false` (run 39839118977),
+which then took `--live`. Only the token `live` posts.
 
 Vote POSTs go out in batches of 25 (one request each) with 3.1s between
 batches. That is the same gap as the public list reads. The origin

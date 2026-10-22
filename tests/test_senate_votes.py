@@ -1113,6 +1113,31 @@ def test_senate_session_current_dry_run_stays_capped(monkeypatch):
     assert seen["max_records"] == 5
 
 
+def _dispatch_plan(event, session, dry_run, *, ingest_live=""):
+    import os
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["DISPATCH_EVENT"] = event
+    env["DISPATCH_SESSION"] = session
+    env["DISPATCH_DRY_RUN"] = dry_run
+    env["DISPATCH_PRINT_ONLY"] = "1"
+    env["INGEST_LIVE"] = ingest_live
+    out = subprocess.check_output(
+        ["bash", str(root / "scripts" / "dispatch_ingest.sh")],
+        cwd=root,
+        env=env,
+        text=True,
+    )
+    lines = {}
+    for line in out.splitlines():
+        if line.startswith(("ingest_live=", "argv=")):
+            key, value = line.split("=", 1)
+            lines[key] = value
+    return lines
+
+
 def test_scheduled_ingest_workflow_stays_on_current_session():
     root = Path(__file__).resolve().parents[1]
     workflow = (root / ".github/workflows/ingest.yml").read_text(encoding="utf-8")
@@ -1122,15 +1147,55 @@ def test_scheduled_ingest_workflow_stays_on_current_session():
     assert "dry_run:" in workflow
     assert '- "1"' in workflow
     assert "\n          - all\n" in workflow
-    marker = 'github.event_name }}" = "schedule"'
-    assert marker in workflow
-    schedule, rest = workflow.split(marker, 1)[1].split("fi", 1)
-    assert "python -m ingest.main --source all --live" in schedule
-    assert "--senate-session" not in schedule
-    assert "--session" not in schedule
-    assert "--source senate_votes --senate-session" in rest
+    # The schedule path is the script's event check, not a dispatch input.
+    script = (root / "scripts" / "dispatch_ingest.sh").read_text(encoding="utf-8")
+    assert 'event" = "schedule"' in script or '[ "$event" = "schedule" ]' in script
+    plan = _dispatch_plan("schedule", "1", "true", ingest_live="")
+    assert plan["argv"] == "python -m ingest.main --source all --live"
+    assert plan["ingest_live"] == "1"
+    assert "--senate-session" not in plan["argv"]
     ps1 = (root / "scripts/run_daily_ingest.ps1").read_text(encoding="utf-8")
     assert "--source all --live" in ps1
     assert '"-m", "ingest.main", "--source", "all", "--live"' in ps1
     assert "senate-session" not in ps1
     assert "senate_session" not in ps1
+
+
+def test_dry_run_true_never_posts_and_ambiguous_values_stay_safe():
+    """Run 39839118977: choice true/false was stored as false and posted.
+
+    The workflow must pass the raw event string, and only the token live
+    may add --live. true, false, empty, and any other value stay dry-run
+    even if the step environment already has INGEST_LIVE=1.
+    """
+    root = Path(__file__).resolve().parents[1]
+    workflow = (root / ".github/workflows/ingest.yml").read_text(encoding="utf-8")
+    dry = workflow.split("dry_run:", 1)[1].split("jobs:", 1)[0]
+    assert "type: choice" in dry
+    assert "default: dry-run" in dry
+    assert "- dry-run" in dry
+    assert "- live" in dry
+    for banned in ("- true", "- false", '- "true"', '- "false"', "- 'true'", "- 'false'"):
+        assert banned not in dry
+    assert "${{ inputs.dry_run }}" not in workflow
+    assert "${{ github.event.inputs.dry_run }}" in workflow
+    assert "INGEST_LIVE:" not in workflow
+    assert "bash scripts/dispatch_ingest.sh" in workflow
+
+    session_one = "python -m ingest.main --source senate_votes --senate-session 1 --dry-run"
+    for raw in ("true", "false", "True", "FALSE", "", "dry-run", "yes", "no", "1", "0", "live "):
+        plan = _dispatch_plan("workflow_dispatch", "1", raw, ingest_live="1")
+        assert plan["argv"] == session_one, raw
+        assert plan["ingest_live"] == "", raw
+        assert "--live" not in plan["argv"]
+
+    live = _dispatch_plan("workflow_dispatch", "1", "live", ingest_live="")
+    assert live["argv"] == (
+        "python -m ingest.main --source senate_votes --senate-session 1 --live"
+    )
+    assert live["ingest_live"] == "1"
+    assert "--dry-run" not in live["argv"]
+
+    missing = _dispatch_plan("workflow_dispatch", "", "", ingest_live="1")
+    assert missing["argv"] == "python -m ingest.main --source all --dry-run"
+    assert missing["ingest_live"] == ""
