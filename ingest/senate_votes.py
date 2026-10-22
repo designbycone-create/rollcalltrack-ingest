@@ -38,7 +38,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 from . import config
-from .legislators import LEGISLATORS_URL
+from .legislators import LEGISLATORS_HISTORICAL_URL, LEGISLATORS_URL
 from .nominations import current_congress
 
 logger = logging.getLogger("rollcalltrack_ingest.senate_votes")
@@ -314,15 +314,54 @@ def _apply_detail_question(out: dict, root) -> None:
         out["bill_label"] = f"En bloc ({len(matters)})"
 
 
+def _member_position(node, summary: dict, lis_to_bioguide: dict) -> dict | None:
+    """One recorded position. ``None`` only when the XML has no vote cast.
+
+    A missing bioguide does not drop the row. The position then carries
+    ``lis_member_id``, name, party, and state, and no ``member_id`` or
+    ``bioguide_id``.
+    """
+    choice = _normalize_cast(node.findtext("vote_cast"))
+    if choice is None:
+        return None
+    lis_id = _collapse(node.findtext("lis_member_id")).upper()
+    name = _collapse(node.findtext("member_full"))
+    party = _collapse(node.findtext("party"))
+    state = _collapse(node.findtext("state")).upper()
+    bioguide = lis_to_bioguide.get(lis_id) if lis_id else None
+    position = {
+        "rc_id": summary["rc_id"],
+        "vote": choice,
+        "name": name,
+        "party": party,
+        "state": state,
+        "lis_member_id": lis_id,
+        "jurisdiction": "federal",
+        "state_code": "",
+    }
+    if bioguide:
+        position["bioguide_id"] = bioguide
+        return position
+    logger.warning(
+        "Senate vote member unmapped rc_id=%s lis_member_id=%s name=%s state=%s",
+        summary.get("rc_id"),
+        lis_id,
+        name,
+        state,
+    )
+    return position
+
+
 def parse_detail(raw: bytes, summary: dict, lis_to_bioguide: dict | None = None) -> dict:
     """Add member positions and the recorded clock time.
 
     Yea/nay totals stay the menu ``vote_tally``. Present and not-voting are
-    counted from every ``<member>``, including ones we cannot map to a
-    bioguide. Unmapped members are omitted from ``member_votes`` rather than
-    sent with a guessed id. A direct menu ``result`` is kept (the detail
-    text is a longer gloss, such as "Nomination Confirmed"). An en-bloc
-    menu has no direct result, so the detail ``<vote_result>`` and
+    counted from every ``<member>``. Every recorded cast is kept. A mapped
+    senator gets ``bioguide_id`` from the LIS roster. An unmapped senator is
+    still sent, with ``lis_member_id``, name, party, and state, and without
+    ``member_id`` or ``bioguide_id``. A direct menu ``result`` is kept (the
+    detail text is a longer gloss, such as "Nomination Confirmed"). An
+    en-bloc menu has no direct result, so the detail ``<vote_result>`` and
     ``<question>`` fill those fields. ``description`` stays the title.
     """
     lis_to_bioguide = lis_to_bioguide or {}
@@ -348,22 +387,9 @@ def parse_detail(raw: bytes, summary: dict, lis_to_bioguide: dict | None = None)
             present += 1
         elif choice == "not_voting":
             not_voting += 1
-        if choice is None:
-            continue
-        lis_id = _collapse(node.findtext("lis_member_id")).upper()
-        bioguide = lis_to_bioguide.get(lis_id) if lis_id else None
-        if not bioguide:
-            continue
-        members.append(
-            {
-                "rc_id": summary["rc_id"],
-                "bioguide_id": bioguide,
-                "vote": choice,
-                "name": _collapse(node.findtext("member_full")),
-                "jurisdiction": "federal",
-                "state_code": "",
-            }
-        )
+        position = _member_position(node, summary, lis_to_bioguide)
+        if position is not None:
+            members.append(position)
     out["tally_present"] = present
     out["tally_not_voting"] = not_voting
     out["member_votes"] = members
@@ -413,24 +439,8 @@ def fetch_xml(url: str, session: requests.Session | None = None) -> bytes:
     return body
 
 
-def load_lis_to_bioguide(session: requests.Session | None = None) -> dict[str, str]:
-    """Map Senate LIS member ids (``S428``) to bioguide ids.
-
-    The detail XML does not carry bioguide. congress-legislators does, on
-    ``id.lis``. An empty map means member positions are skipped, not guessed.
-    """
-    try:
-        http = session or requests.Session()
-        resp = http.get(
-            LEGISLATORS_URL,
-            timeout=config.REQUEST_TIMEOUT_SECONDS,
-            headers={"User-Agent": BROWSER_USER_AGENT},
-        )
-        resp.raise_for_status()
-        roster = resp.json()
-    except (requests.RequestException, ValueError) as e:
-        logger.warning("LIS bioguide roster unavailable: %s", e)
-        return {}
+def _lis_ids(roster) -> dict[str, str]:
+    """``id.lis`` → ``id.bioguide`` from one congress-legislators file."""
     out: dict[str, str] = {}
     if not isinstance(roster, list):
         return out
@@ -441,6 +451,43 @@ def load_lis_to_bioguide(session: requests.Session | None = None) -> dict[str, s
         if lis_id and bioguide:
             out[lis_id] = bioguide
     return out
+
+
+def _fetch_legislator_roster(http: requests.Session, url: str):
+    try:
+        resp = http.get(
+            url,
+            timeout=config.REQUEST_TIMEOUT_SECONDS,
+            headers={"User-Agent": BROWSER_USER_AGENT},
+        )
+        resp.raise_for_status()
+        roster = resp.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.warning("LIS bioguide roster unavailable %s: %s", url, e)
+        return []
+    if not isinstance(roster, list):
+        logger.warning("LIS bioguide roster is not a list: %s", url)
+        return []
+    return roster
+
+
+def load_lis_to_bioguide(session: requests.Session | None = None) -> dict[str, str]:
+    """Map Senate LIS member ids (``S293``) to bioguide ids.
+
+    The detail XML does not carry bioguide. congress-legislators does, on
+    ``id.lis``, split across the current file and legislators-historical.
+    Graham (``S293``) and Mullin (``S419``) are current enough to have voted
+    in 2025, but this dataset has already moved them to historical (terms
+    ending 2026-07-11 and 2026-03-23). Rubio and Vance are historical too.
+    Current ids overwrite historical ones when a LIS id is in both.
+    An empty map does not drop positions; those rows go out without a
+    bioguide.
+    """
+    http = session or requests.Session()
+    # Historical first so a current bioguide wins on a shared LIS id.
+    merged = _lis_ids(_fetch_legislator_roster(http, LEGISLATORS_HISTORICAL_URL))
+    merged.update(_lis_ids(_fetch_legislator_roster(http, LEGISLATORS_URL)))
+    return merged
 
 
 def _select(

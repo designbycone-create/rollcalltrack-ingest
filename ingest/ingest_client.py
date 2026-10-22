@@ -620,7 +620,14 @@ class HorizonsIngestClient:
             elif jurisdiction != "state":
                 raise ValueError("this worker only posts jurisdiction=state or federal")
             for mv in rec.get("member_votes") or []:
-                if not mv.get("bioguide_id"):
+                if jurisdiction == "federal":
+                    # Unmapped Senate positions are still posted. They carry
+                    # lis_member_id, name, party, and state, and no member_id.
+                    if not mv.get("bioguide_id") and mv.get("member_id"):
+                        raise ValueError(
+                            "unmapped federal vote must not set member_id"
+                        )
+                elif not mv.get("bioguide_id"):
                     raise ValueError("member vote missing bioguide_id")
         body = {"votes": records}
         logger.info("Submitting %d votes", len(records))
