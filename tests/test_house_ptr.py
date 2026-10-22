@@ -314,3 +314,201 @@ def test_ocr_failure_is_empty_text():
             raise RuntimeError("no rasterizer")
 
     assert _ocr_page(BrokenPage()) == ""
+
+
+def _pdf_session(content: bytes = b"%PDF-1.4 scanned"):
+    class _PdfResp:
+        def __init__(self):
+            self.content = content
+
+        def raise_for_status(self):
+            return None
+
+    class _Sess:
+        def get(self, url, timeout=None):
+            return _PdfResp()
+
+    return _Sess()
+
+
+def test_text_with_no_transactions_runs_ocr_fallback(monkeypatch):
+    from ingest import house
+
+    class _Page:
+        def extract_text(self):
+            return "Clerk of the House of Representatives\nFiling ID 9116378\n"
+
+        def to_image(self, resolution=200):
+            raise AssertionError("page OCR is not the scanned-PDF fallback")
+
+    class _Doc:
+        pages = [_Page()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(house.pdfplumber, "open", lambda *_a, **_k: _Doc())
+
+    def fake_ocr(content):
+        assert content.startswith(b"%PDF")
+        return (
+            "Apple Inc. (AAPL) P 01/02/2026 01/05/2026 $1,001 - $15,000\n",
+            "",
+        )
+
+    monkeypatch.setattr(house, "_ocr_pdf_bytes", fake_ocr)
+    result = house.parse_pdf(
+        "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/9116378.pdf",
+        session=_pdf_session(),
+    )
+    assert result["used_ocr"] is True
+    assert result["ocr_error"] == ""
+    assert "AAPL" in result["text"]
+    assert parse_ptr_transactions(result["text"])[0]["ticker"] == "AAPL"
+
+
+def test_readable_transactions_do_not_ocr_again(monkeypatch):
+    from ingest import house
+
+    line = "Apple Inc. (AAPL) P 01/02/2026 01/05/2026 $1,001 - $15,000\n"
+
+    class _Page:
+        def extract_text(self):
+            return line
+
+        def to_image(self, resolution=200):
+            raise AssertionError("text layer already has a transaction")
+
+    class _Doc:
+        pages = [_Page()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(house.pdfplumber, "open", lambda *_a, **_k: _Doc())
+
+    def fail_ocr(_content):
+        raise AssertionError("OCR fallback must not run when text has transactions")
+
+    monkeypatch.setattr(house, "_ocr_pdf_bytes", fail_ocr)
+    result = house.parse_pdf(
+        "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/20035588.pdf",
+        session=_pdf_session(),
+    )
+    assert result["used_ocr"] is False
+    assert result["ocr_error"] == ""
+    assert parse_ptr_transactions(result["text"])
+
+
+def test_pdfplumber_failure_still_ocrs(monkeypatch):
+    from ingest import house
+
+    def boom(*_args, **_kwargs):
+        raise ValueError("not a readable pdf")
+
+    monkeypatch.setattr(house.pdfplumber, "open", boom)
+    monkeypatch.setattr(
+        house,
+        "_ocr_pdf_bytes",
+        lambda _content: (
+            "Apple Inc. (AAPL) P 01/02/2026 01/05/2026 $1,001 - $15,000\n",
+            "",
+        ),
+    )
+    result = house.parse_pdf(
+        "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/9116378.pdf",
+        session=_pdf_session(),
+    )
+    assert result["used_ocr"] is True
+    assert result["ocr_error"] == ""
+    assert parse_ptr_transactions(result["text"])[0]["ticker"] == "AAPL"
+
+
+def test_ocr_miss_keeps_a_failure_reason(monkeypatch):
+    from ingest import house
+
+    class _Page:
+        def extract_text(self):
+            return "image-only scan"
+
+        def to_image(self, resolution=200):
+            return None
+
+    class _Doc:
+        pages = [_Page()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(house.pdfplumber, "open", lambda *_a, **_k: _Doc())
+    monkeypatch.setattr(
+        house,
+        "_ocr_pdf_bytes",
+        lambda _content: ("", "ocr_produced_no_text"),
+    )
+    result = house.parse_pdf(
+        "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/9116378.pdf",
+        session=_pdf_session(),
+    )
+    assert result["used_ocr"] is True
+    assert result["ocr_error"] == "ocr_produced_no_text"
+    assert parse_ptr_transactions(result["text"]) == []
+
+
+def test_filing_id_reparse_stores_failed_status_when_ocr_misses(monkeypatch):
+    from datetime import date
+
+    from ingest import house
+
+    records = [
+        {
+            "name": "Richard Dean Dr McCormick",
+            "state_district": "GA06",
+            "filing_type_code": "P",
+            "filing_type": "Periodic Transaction Report",
+            "filing_date": date.today().strftime("%m/%d/%Y"),
+            "year": "2026",
+            "doc_id": "9116378",
+            "pdf_url": "https://disclosures-clerk.house.gov/public_disc/ptr-pdfs/2026/9116378.pdf",
+        }
+    ]
+    monkeypatch.setattr(house, "download_bulk_index", lambda year, session=None: records)
+    monkeypatch.setattr(house.config, "REQUEST_DELAY_SECONDS", 0)
+    monkeypatch.setattr(
+        house,
+        "parse_pdf",
+        lambda url, session=None: {
+            "text": "",
+            "used_ocr": True,
+            "page_count": 1,
+            "empty_pages": 1,
+            "ocr_error": "ocr_produced_no_text",
+        },
+    )
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    seen = []
+
+    def fake_post(body, path="/hcgi/api/ingest/disclosures"):
+        seen.append(body)
+        return _Resp(200, {"filing_id": "scan-1", "transactions_written": 0, "updated": True})
+
+    monkeypatch.setattr(hz, "_post_ingest", fake_post)
+    monkeypatch.setattr(hz, "lookup_member_by_name", lambda *_a, **_k: None)
+    result = house.run(year=2026, dry_run=False, client=hz, filing_id="9116378")
+    assert result["parsed"] == 1
+    filing_posts = [body for body in seen if body.get("type") == "filing"]
+    assert len(filing_posts) == 1
+    filing = filing_posts[0]["payload"]["filing"]
+    assert filing["parse_status"] == "failed"
+    assert filing["parse_failure_reason"] == "ocr_produced_no_text"
+    assert filing["raw_document_type"] == "pdf"
+    assert filing_posts[0]["payload"]["transactions"] == []

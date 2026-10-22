@@ -115,6 +115,85 @@ class _Resp:
             raise RuntimeError(self.status_code)
 
 
+def test_horizons_lookup_tries_full_name_state_then_last_then_bioguide(monkeypatch):
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    calls = []
+
+    def fake_lookup(**params):
+        calls.append(params)
+        if params.get("bioguide_id") == "T000490":
+            return {
+                "id": "taylor-row",
+                "bioguide_id": "T000490",
+                "name": "David Taylor",
+                "state": "Ohio",
+                "party": "R",
+            }
+        return None
+
+    monkeypatch.setattr(hz, "_lookup_http", fake_lookup)
+    monkeypatch.setattr(
+        "ingest.ingest_client.match_legislator", lambda *_a, **_k: None
+    )
+    missed = hz.lookup_member_by_name(
+        "David J. Taylor",
+        state="OH",
+        bioguide_id="T000490",
+        chamber="house",
+    )
+    assert calls == [
+        {"name": "David Taylor", "state": "Ohio"},
+        {"name": "Taylor", "state": "Ohio"},
+        {"bioguide_id": "T000490"},
+    ]
+    assert missed["id"] == "taylor-row"
+    assert missed["party"] == "R"
+
+    calls.clear()
+
+    def fake_hit_on_full_name(**params):
+        calls.append(params)
+        if params.get("name") == "Scott Peters" and params.get("state") == "Michigan":
+            return {
+                "id": "peters-row",
+                "member_id": "peters-row",
+                "bioguide_id": "P000608",
+                "name": "Scott Peters",
+                "state": "Michigan",
+                "party": "D",
+            }
+        return None
+
+    monkeypatch.setattr(hz, "_lookup_http", fake_hit_on_full_name)
+    hit = hz.lookup_member_by_name(
+        "Scott H. Peters",
+        state="MI",
+        bioguide_id="P000608",
+    )
+    assert calls == [{"name": "Scott Peters", "state": "Michigan"}]
+    assert hit["id"] == "peters-row"
+
+    calls.clear()
+
+    def fake_lee(**params):
+        calls.append(params)
+        if params.get("bioguide_id") == "L000597":
+            return {
+                "id": "lee-row",
+                "bioguide_id": "L000597",
+                "name": "Barbara Lee",
+                "state": "California",
+                "party": "D",
+            }
+        return None
+
+    monkeypatch.setattr(hz, "_lookup_http", fake_lee)
+    # Stored state can disagree with the roster. Bioguide is still authoritative.
+    lee = hz.lookup_member_by_name("Barbara Lee", state="MI", bioguide_id="L000597")
+    assert calls[-1] == {"bioguide_id": "L000597"}
+    assert lee["id"] == "lee-row"
+
+
 def test_filing_500_retries_without_member_id(monkeypatch):
     hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
     seen = []

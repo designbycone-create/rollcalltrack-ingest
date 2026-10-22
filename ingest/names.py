@@ -318,15 +318,88 @@ def first_names_compatible(a: str, b: str) -> bool:
 
 
 def state_display_name(code: str | None) -> str:
-    """'NJ' → 'New Jersey'. Empty string when the code is unknown."""
-    key = (code or "").strip().upper()
-    raw = STATE_CODES.get(key)
+    """'NJ' or 'New Jersey' → 'New Jersey'.
+
+    Horizons ``/members/lookup`` compares state to the full name stored on
+    the member row. Filings often keep the 2-letter USPS code, including
+    DC and the territories. Empty string when the value is unknown.
+    """
+    normalized = normalize_state(code)
+    if not normalized:
+        return ""
+    raw = STATE_CODES.get(normalized)
     if not raw:
         return ""
     parts = []
     for i, word in enumerate(raw.split()):
         parts.append(word if i and word in {"of"} else word.capitalize())
     return " ".join(parts)
+
+
+def state_from_office(office: str | None) -> str | None:
+    """Pull a USPS code out of a Senate office string, if one is present."""
+    text = office or ""
+    party_state = re.search(r"\(([DRIN])-([A-Z]{2})\)", text.upper())
+    if party_state and party_state.group(2) in STATE_CODES:
+        return party_state.group(2)
+    lowered = text.lower()
+    for name, code in sorted(STATE_NAME_TO_CODE.items(), key=lambda item: -len(item[0])):
+        if re.search(rf"\b{re.escape(name)}\b", lowered):
+            return code
+    for token in re.findall(r"\b([A-Z]{2})\b", text.upper()):
+        if token in STATE_CODES:
+            return token
+    return None
+
+
+def member_lookup_attempts(
+    name: str,
+    *,
+    state: str | None = None,
+    office: str | None = None,
+    state_district: str | None = None,
+    bioguide_id: str | None = None,
+    district: int | None = None,
+) -> list[dict]:
+    """Ordered ``/members/lookup`` queries.
+
+    Full name (titles, suffixes, and middle names removed) plus the full
+    state name, then last name plus that state, then bioguide when we
+    have one. District is accepted and ignored: a stale StateDst must not
+    hide the member.
+    """
+    del district  # callers still pass House district; the API must not filter on it
+    if not state and state_district:
+        state, _district = parse_state_district(state_district)
+    if not state and office:
+        state = state_from_office(office)
+    label = state_display_name(state)
+    parsed = parse_filer_name(name, office=office)
+    attempts: list[dict] = []
+
+    def add(params: dict) -> None:
+        if params not in attempts:
+            attempts.append(params)
+
+    if parsed.first and parsed.last and parsed.first.lower() != parsed.last.lower():
+        full = f"{parsed.first} {parsed.last}"
+    else:
+        full = parsed.full or parsed.last or ""
+    if full:
+        params = {"name": full}
+        if label:
+            params["state"] = label
+        add(params)
+    last = parsed.last
+    if last and last.lower() != full.lower():
+        params = {"name": last}
+        if label:
+            params["state"] = label
+        add(params)
+    bioguide = (bioguide_id or "").strip()
+    if bioguide:
+        add({"bioguide_id": bioguide})
+    return attempts
 
 
 def member_record_compatible(

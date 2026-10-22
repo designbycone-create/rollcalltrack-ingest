@@ -120,9 +120,51 @@ including two identical Lockheed Martin partial sales (source lines 47 and
 ### Member matching
 
 Under Horizons API mode, member resolution hits
-`GET /hcgi/api/members/lookup` (bioguide first, then multi-format name match:
-raw → `Last, First` → compound last names). House passes state + district;
-Senate passes state.
+`GET /hcgi/api/members/lookup`. Filings store a 2-letter USPS code
+(`MI`, `CA`, plus DC and the territories) and the House Clerk sometimes
+sends `Richard Dean Dr McCormick`. The lookup only matches a full state
+name (`Michigan`, `California`, `Ohio`). Each attempt therefore:
+
+1. strips titles and suffixes (`Dr`, `Hon`, `Jr`, `III`) and middle names
+2. queries that full name plus the full state name
+3. queries the last name plus the full state name
+4. queries `bioguide_id` when the filing or the congress roster has one
+
+A name hit has to be the same person. The bioguide query is exact, so a
+stale state code does not reject Taylor `T000490` (OH), Peters `P000608`
+(MI), or Lee `L000597` (CA).
+
+### Backfill member links
+
+Rows already stored without `member_id` or party are not rewritten by the
+daily scrape until that filing shows up again. The backfill lists those
+filings and their transactions, resolves them the same way, and prints
+every field it would set. It does not blank a value that is already
+stored. Posting uses the same disclosures write as ingest, and that write
+replaces a filing's transactions, so the command sends the transactions
+it listed back with the new member id.
+
+```bash
+# print the plan; no writes
+python -m ingest.backfill_members
+
+# apply. Requires HORIZONS_BASE_URL, INGEST_API_KEY, and --live
+python -m ingest.backfill_members --live
+```
+
+### Re-parse a scanned House PDF
+
+A PTR whose text layer has no transaction rows is rasterized with
+poppler (`pdf2image`) and read with tesseract. If that also finds nothing,
+the filing stays `parse_status=failed` and `parse_failure_reason` says why
+(`ocr_produced_no_text`, `ocr_raster_failed`, `ocr_unavailable`). Re-parse
+one DocID with `--filing-id` (add `--year` when it is not in the current
+calendar year). The workflow installs `tesseract-ocr` and `poppler-utils`.
+
+```bash
+python -m ingest.main --source house --dry-run --filing-id 9116378 --year 2026
+python -m ingest.main --source house --live --filing-id 9116378 --year 2026
+```
 
 ```bash
 # offline unit tests for name variants

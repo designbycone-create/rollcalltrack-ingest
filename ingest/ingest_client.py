@@ -21,10 +21,10 @@ from . import config
 from .guards import assert_remote_post_allowed, skip_reason
 from .legislators import match_legislator
 from .names import (
+    member_lookup_attempts,
     member_record_compatible,
     parse_filer_name,
     parse_state_district,
-    state_display_name,
 )
 
 logger = logging.getLogger("rollcalltrack_ingest.ingest_client")
@@ -88,7 +88,46 @@ def clean_transaction(txn: dict) -> dict:
         out["amount_range_low"] = txn["amount_range_low"]
     if txn.get("amount_range_high") is not None:
         out["amount_range_high"] = txn["amount_range_high"]
+    member_id = str(txn.get("member_id") or "").strip()
+    if member_id:
+        out["member_id"] = member_id
+    member_party = str(txn.get("member_party") or txn.get("party") or "").strip()
+    if member_party:
+        out["member_party"] = member_party
     return out
+
+
+def _coerce_member(member: dict) -> dict:
+    """Accept either ``id`` or ``member_id`` as the Horizons row id."""
+    out = dict(member)
+    if not str(out.get("id") or "").strip():
+        alt = str(out.get("member_id") or "").strip()
+        if alt:
+            out["id"] = alt
+    return out
+
+
+def _bioguide_hit_ok(wanted: str, member: dict) -> bool:
+    """A bioguide query is exact. Reject LegiScan ids and a different id."""
+    bioguide = str(member.get("bioguide_id") or "")
+    member_id = str(member.get("id") or "")
+    if bioguide.upper().startswith("LS") or member_id.upper().startswith("LS"):
+        return False
+    if bioguide and bioguide.upper() != wanted.strip().upper():
+        return False
+    return bool(str(member.get("id") or "").strip())
+
+
+def _rows_from_payload(data: Any, keys: tuple[str, ...]) -> list[dict] | None:
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        rows = data.get(key)
+        if isinstance(rows, list):
+            return rows
+    return None
 
 
 class HorizonsIngestClient:
@@ -110,11 +149,20 @@ class HorizonsIngestClient:
     def configured(self) -> bool:
         return bool(self.base and self.ingest_key)
 
-    def _get(self, path: str, params: dict | None = None) -> requests.Response:
+    def _get(
+        self,
+        path: str,
+        params: dict | None = None,
+        *,
+        auth: bool = False,
+    ) -> requests.Response:
         url = f"{self.base}{path}"
         if params:
             url = f"{url}?{urlencode(params)}"
-        return self.session.get(url, timeout=self.timeout)
+        headers = None
+        if auth and self.ingest_key:
+            headers = {"X-Ingest-Key": self.ingest_key}
+        return self.session.get(url, headers=headers, timeout=self.timeout)
 
     def _should_retry(self, resp: requests.Response) -> bool:
         if resp.status_code == 429:
@@ -1010,10 +1058,13 @@ class HorizonsIngestClient:
     ) -> dict | None:
         """Resolve a filer to a Horizons members row.
 
-        Order: explicit bioguide, local congress-legislators match, then
-        name search. Name hits are rejected unless the last name and given
-        name agree (the API has returned a different member, and a 2-letter
-        state code does not match the stored full state name).
+        The live lookup matches full state names ("Ohio"), not USPS codes.
+        Try the normalized full name plus that state, then the last name
+        plus that state, then a bioguide id when we know one. A name hit
+        must be the same person. A bioguide hit is exact, so a stale
+        two-letter state on the filing does not reject it. The congress
+        roster only supplies a bioguide when the filing does not already
+        have one — it is never used as ``member_id``.
         """
         if state_district and (state is None or district is None):
             sc, dist = parse_state_district(state_district)
@@ -1021,22 +1072,6 @@ class HorizonsIngestClient:
             if district is None:
                 district = dist
 
-        # 1) bioguide exact
-        if bioguide_id:
-            member = self._lookup_http(bioguide_id=bioguide_id)
-            if member and member_record_compatible(
-                name, member, state=state, office=office
-            ):
-                logger.info(
-                    "Member lookup bioguide_id=%s → %s (%s)",
-                    bioguide_id,
-                    member.get("id"),
-                    member.get("name"),
-                )
-                return member
-
-        # 2) Official roster → bioguide. Avoids state=NJ vs "New Jersey"
-        # and nickname gaps (Rohit/Ro, Thomas/Tommy) before any fuzzy search.
         local = match_legislator(
             name,
             state=state,
@@ -1045,133 +1080,139 @@ class HorizonsIngestClient:
             office=office,
             state_district=state_district,
         )
-        if local:
-            member = self._accept_bioguide(name, local, state=state, office=office)
-            if member:
-                return member
-
-        parsed = parse_filer_name(name, office=office)
-        candidates: list[str] = []
-
-        def add(n: str | None) -> None:
-            n = (n or "").strip()
-            if n and n not in candidates:
-                candidates.append(n)
-
-        add(name)
-        add(parsed.full)
-        if parsed.first and parsed.last:
-            add(f"{parsed.first} {parsed.last}")
-            add(f"{parsed.last}, {parsed.first}")
-            if parsed.middle_tokens:
-                mid = " ".join(parsed.middle_tokens)
-                add(f"{parsed.last}, {parsed.first} {mid}")
-                add(f"{parsed.first} {mid} {parsed.last}")
-            # compound last (McClain Delaney)
-            tokens = (parsed.full or name).split()
-            if len(tokens) >= 3:
-                add(f"{tokens[-2]} {tokens[-1]}, {tokens[0]}")
-                add(f"{tokens[-1]}, {' '.join(tokens[:-1])}")
-
-        # Live lookup compares state to the full name ("New Jersey"), not "NJ".
-        state_label = state_display_name(state) or None
-        state_attempts: list[str | None] = []
-        for candidate_state in (state_label, None):
-            if candidate_state not in state_attempts:
-                state_attempts.append(candidate_state)
-
-        for cand in candidates:
-            for try_state in state_attempts:
-                district_attempts: list[int | None] = [district]
-                if district is not None:
-                    district_attempts.append(None)
-                for try_district in district_attempts:
+        bioguide = (bioguide_id or "").strip() or str((local or {}).get("bioguide") or "")
+        attempts = member_lookup_attempts(
+            name,
+            state=state,
+            office=office,
+            state_district=state_district,
+            bioguide_id=bioguide or None,
+            district=district,
+        )
+        for attempt in attempts:
+            logger.info("Member lookup attempt %s", attempt)
+            member = self._lookup_http(**attempt)
+            if not member:
+                logger.info("Member lookup MISS %s", attempt)
+                continue
+            member = _coerce_member(member)
+            if attempt.get("bioguide_id"):
+                if not _bioguide_hit_ok(str(attempt["bioguide_id"]), member):
                     logger.info(
-                        "Member lookup attempt name=%r state=%r district=%r",
-                        cand,
-                        try_state,
-                        try_district,
-                    )
-                    member = self._lookup_http(
-                        name=cand, state=try_state, district=try_district
-                    )
-                    if not member:
-                        logger.info("Member lookup MISS name=%r", cand)
-                        continue
-                    if not member_record_compatible(
-                        name, member, state=state, office=office
-                    ):
-                        logger.info(
-                            "Member lookup REJECT name=%r hit=%r bioguide=%s",
-                            cand,
-                            member.get("name"),
-                            member.get("bioguide_id"),
-                        )
-                        continue
-                    logger.info(
-                        "Member lookup HIT name=%r → id=%s bioguide=%s stored_name=%r",
-                        cand,
-                        member.get("id"),
-                        member.get("bioguide_id"),
+                        "Member lookup REJECT bioguide=%s hit=%r id=%s",
+                        attempt["bioguide_id"],
                         member.get("name"),
+                        member.get("id"),
                     )
-                    return member
+                    continue
+            elif not member_record_compatible(
+                name, member, state=state, office=office
+            ):
+                logger.info(
+                    "Member lookup REJECT name=%r hit=%r bioguide=%s",
+                    attempt.get("name"),
+                    member.get("name"),
+                    member.get("bioguide_id"),
+                )
+                continue
+            if local and not str(member.get("party") or "").strip() and local.get("party"):
+                member = dict(member)
+                member["party"] = local["party"]
+            # The disclosures writer 500s when member_id is the bioguide, then
+            # retries without it and the filing stays unlinked.
+            bioguide_value = str(member.get("bioguide_id") or "").strip()
+            if (
+                bioguide_value
+                and str(member.get("id") or "").strip().upper() == bioguide_value.upper()
+            ):
+                member = dict(member)
+                member["id"] = ""
+            logger.info(
+                "Member lookup HIT attempt=%s → id=%s bioguide=%s stored_name=%r",
+                attempt,
+                member.get("id"),
+                member.get("bioguide_id"),
+                member.get("name"),
+            )
+            return member
 
         logger.warning(
             "Member lookup FAILED for name=%r state=%s district=%s office=%r "
-            "candidates_tried=%s",
+            "bioguide=%s attempts=%s",
             name,
             state,
             district,
             office,
-            candidates,
+            bioguide,
+            attempts,
         )
         return None
 
-    def _accept_bioguide(
-        self,
-        name: str,
-        local: dict,
-        *,
-        state: str | None,
-        office: str | None,
-    ) -> dict | None:
-        """Prefer the Horizons row for this bioguide; fall back to the roster."""
-        bioguide = local.get("bioguide") or ""
-        member = self._lookup_http(bioguide_id=bioguide) if bioguide else None
-        if member and member_record_compatible(name, member, state=state, office=office):
-            logger.info(
-                "Member lookup via legislator bioguide=%s → %s (%s)",
-                bioguide,
-                member.get("id"),
-                member.get("name"),
-            )
-            if not member.get("party") and local.get("party"):
-                member = dict(member)
-                member["party"] = local["party"]
-            return member
-        if member:
-            logger.info(
-                "Horizons bioguide %s returned %r — using roster name %r",
-                bioguide,
-                member.get("name"),
-                local.get("official_full"),
-            )
-        else:
-            logger.info(
-                "Horizons has no row for bioguide %s; submitting roster identity",
-                bioguide,
-            )
-        display_state = state_display_name(local.get("state")) or local.get("state") or ""
-        return {
-            "id": bioguide,
-            "bioguide_id": bioguide,
-            "name": local.get("official_full") or name,
-            "party": local.get("party") or "",
-            "state": display_state,
-            "district": local.get("district"),
-            "chamber": (local.get("chamber") or "").title(),
-        }
+    def list_disclosure_filings(self) -> list[dict]:
+        """Page filings already stored by Horizons."""
+        return self._page_collection(
+            (
+                "/hcgi/api/disclosures",
+                "/hcgi/api/disclosure-filings",
+                "/hcgi/api/filings",
+            ),
+            ("items", "filings", "disclosure_filings", "results"),
+        )
+
+    def list_disclosure_transactions(self) -> list[dict]:
+        """Page transactions already stored by Horizons."""
+        return self._page_collection(
+            (
+                "/hcgi/api/transactions",
+                "/hcgi/api/disclosure-transactions",
+            ),
+            ("items", "transactions", "results"),
+        )
+
+    def _page_collection(self, paths: tuple[str, ...], keys: tuple[str, ...]) -> list[dict]:
+        last_status = None
+        for path in paths:
+            rows, status = self._collect_pages(path, keys)
+            if status == 200 and rows is not None:
+                logger.info("Listed %d rows from %s", len(rows), path)
+                return rows
+            last_status = status
+        raise RuntimeError(
+            f"Could not list Horizons rows (last HTTP {last_status}) from {paths}"
+        )
+
+    def _collect_pages(
+        self, path: str, keys: tuple[str, ...]
+    ) -> tuple[list[dict] | None, int | None]:
+        out: list[dict] = []
+        page = 1
+        status = None
+        while page <= 200:
+            try:
+                resp = self._get(path, {"page": page, "limit": 100}, auth=True)
+            except requests.RequestException as exc:
+                logger.warning("list %s failed: %s", path, exc)
+                return None, None
+            status = resp.status_code
+            if status != 200:
+                return None, status
+            try:
+                data = resp.json()
+            except ValueError:
+                return None, status
+            rows = _rows_from_payload(data, keys)
+            if rows is None:
+                return None, status
+            if not rows:
+                break
+            out.extend(rows)
+            total = data.get("total") if isinstance(data, dict) else None
+            if total is not None and len(out) >= int(total):
+                break
+            if len(rows) < 100:
+                break
+            page += 1
+        return out, 200
 
     def _lookup_http(self, **params) -> dict | None:
         # drop Nones
@@ -1269,11 +1310,22 @@ class HorizonsIngestClient:
         filing: dict,
         transactions: list[dict] | None = None,
         annual_assets: list[dict] | None = None,
+        *,
+        ignore_date: bool = False,
     ) -> dict:
-        """POST type=filing with nested payload. Returns API JSON body."""
+        """POST type=filing with nested payload. Returns API JSON body.
+
+        ``ignore_date`` is only for backfill of filings already stored.
+        New scrapes still refuse dates more than a year from the run.
+        """
         if not filing.get("source_url"):
             raise ValueError("source_url is required on every filing")
-        if skip_reason(filing, kind="filing", require_name=True):
+        if skip_reason(
+            filing,
+            kind="filing",
+            require_name=True,
+            check_date=not ignore_date,
+        ):
             return {
                 "ok": False,
                 "skipped": True,
@@ -1287,7 +1339,12 @@ class HorizonsIngestClient:
             # can tell identical trades apart.
             if row.get("line_index") is None:
                 row["line_index"] = i
-            if skip_reason(row, kind="transaction", require_name=False):
+            if skip_reason(
+                row,
+                kind="transaction",
+                require_name=False,
+                check_date=not ignore_date,
+            ):
                 continue
             prepared.append(row)
         txns = [clean_transaction(t) for t in prepared]

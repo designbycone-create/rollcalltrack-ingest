@@ -84,6 +84,7 @@ def rejection_reason(
     *,
     require_name: bool,
     today: date | None = None,
+    check_date: bool = True,
 ) -> str | None:
     """Why this filing or transaction must not be posted. None when it is ok."""
     reasons: list[str] = []
@@ -95,7 +96,7 @@ def rejection_reason(
     member_id = str(record.get("member_id") or "").strip()
     if member_id_is_placeholder(member_id):
         reasons.append(f"placeholder member_id {member_id}")
-    if filing_date_too_far(record.get("filing_date"), today=today):
+    if check_date and filing_date_too_far(record.get("filing_date"), today=today):
         reasons.append("filing_date more than 1 year from the run date")
     if not reasons:
         return None
@@ -108,8 +109,14 @@ def skip_reason(
     kind: str,
     require_name: bool,
     today: date | None = None,
+    check_date: bool = True,
 ) -> str | None:
-    reason = rejection_reason(record, require_name=require_name, today=today)
+    reason = rejection_reason(
+        record,
+        require_name=require_name,
+        today=today,
+        check_date=check_date,
+    )
     if not reason:
         return None
     logger.warning(

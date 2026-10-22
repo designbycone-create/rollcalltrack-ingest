@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 
 from . import config
 from .ingest_client import HorizonsIngestClient, get_client
+from .names import state_display_name, state_from_office
 
 logger = logging.getLogger("rollcalltrack_ingest.senate")
 
@@ -372,8 +373,10 @@ def run(
                 continue
 
             if use_hz:
+                state_code = state_from_office(rec.get("office"))
                 member = hz.lookup_member_by_name(
                     rec["name"],
+                    state=state_code,
                     office=rec.get("office"),
                     chamber="senate",
                 )
@@ -393,7 +396,9 @@ def run(
                     "parse_status": parse_status,
                     "member_name": (member or {}).get("name") or rec["name"],
                     "member_party": (member or {}).get("party") or "",
-                    "member_state": (member or {}).get("state") or "",
+                    "member_state": (member or {}).get("state")
+                    or state_display_name(state_code)
+                    or "",
                 }
                 if member and member.get("id"):
                     filing["member_id"] = member["id"]

@@ -22,6 +22,7 @@ import requests
 
 from . import config
 from .ingest_client import HorizonsIngestClient, get_client
+from .names import state_display_name
 
 logger = logging.getLogger("rollcalltrack_ingest.house")
 
@@ -213,41 +214,95 @@ def _parse_index_file(raw_text: str) -> list[dict]:
     return _parse_index_txt(raw_text, year=date.today().year)
 
 
+def _ocr_pdf_bytes(content: bytes) -> tuple[str, str]:
+    """OCR a scanned PDF with poppler + tesseract.
+
+    Returns ``(text, error)``. ``error`` is empty when text was produced.
+    A text layer that is only a header still counts as no transactions, so
+    the caller runs this after pdfplumber yields zero PTR rows.
+    """
+    try:
+        import pytesseract
+        from pdf2image import convert_from_bytes
+    except Exception as exc:
+        return "", f"ocr_unavailable: {exc}"
+    try:
+        images = convert_from_bytes(content, dpi=200)
+    except Exception as exc:
+        return "", f"ocr_raster_failed: {exc}"
+    parts: list[str] = []
+    errors: list[str] = []
+    for image in images:
+        try:
+            parts.append(pytesseract.image_to_string(image) or "")
+        except Exception as exc:
+            errors.append(str(exc))
+    text = "\n".join(part for part in parts if part.strip())
+    if text.strip():
+        return text, ""
+    if errors:
+        return "", "ocr_failed: " + "; ".join(errors)
+    return "", "ocr_produced_no_text"
+
+
 def parse_pdf(pdf_url: str, session: requests.Session | None = None) -> dict:
     """Download a filing PDF and extract text.
 
-    Returns {text, used_ocr: bool, page_count, empty_pages}.
-    Pages with no text layer are OCR'd with tesseract (installed in CI).
-    Scanned paper PTRs such as 9116378.pdf otherwise parse to zero rows.
+    Returns {text, used_ocr, page_count, empty_pages, ocr_error}.
+    Pages with no text layer are OCR'd per page. When the combined text
+    still has no PTR transactions (a scanned filing whose text layer is
+    only a header), the whole PDF is rasterized with pdf2image and read
+    with tesseract. ``ocr_error`` explains a miss; it is empty when the
+    text already had transactions or OCR recovered some.
     """
     session = session or _session()
     resp = session.get(pdf_url, timeout=config.REQUEST_TIMEOUT_SECONDS)
     resp.raise_for_status()
+    content = resp.content
 
     text_parts = []
     used_ocr = False
     empty_pages = 0
     page_count = 0
-    with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-        page_count = len(pdf.pages)
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            if page_text.strip():
-                text_parts.append(page_text)
-                continue
-            empty_pages += 1
-            ocr_text = _ocr_page(page)
-            if ocr_text.strip():
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            page_count = len(pdf.pages)
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    text_parts.append(page_text)
+                    continue
+                empty_pages += 1
+                ocr_text = _ocr_page(page)
+                if ocr_text.strip():
+                    used_ocr = True
+                    text_parts.append(ocr_text)
+                    continue
                 used_ocr = True
-                text_parts.append(ocr_text)
-                continue
-            used_ocr = True
+    except Exception as exc:
+        # A scanned PDF can fail to open as text. OCR still gets the bytes.
+        logger.warning("House PDF text extraction failed: %s", exc)
+        text_parts = []
+
+    text = "\n".join(text_parts)
+    ocr_error = ""
+    if not parse_ptr_transactions(text):
+        ocr_text, ocr_error = _ocr_pdf_bytes(content)
+        used_ocr = True
+        if parse_ptr_transactions(ocr_text):
+            text = ocr_text
+            ocr_error = ""
+        elif not text.strip() and ocr_text.strip():
+            text = ocr_text
+        if not parse_ptr_transactions(text) and not ocr_error:
+            ocr_error = "no_transactions_after_ocr"
 
     return {
-        "text": "\n".join(text_parts),
+        "text": text,
         "used_ocr": used_ocr,
         "page_count": page_count,
         "empty_pages": empty_pages,
+        "ocr_error": ocr_error,
     }
 
 
@@ -437,13 +492,16 @@ def _flag_unreadable(hz, result: dict, rec: dict, pdf_result: dict, txns: list) 
     daily job does not pile duplicate review items. The warning is logged
     every run so a still-blank scan stays visible.
     """
-    if txns or not pdf_result.get("empty_pages"):
+    if txns:
+        return
+    if not pdf_result.get("empty_pages") and not pdf_result.get("ocr_error"):
         return
     logger.warning(
-        "House PTR parsed 0 transactions after text/OCR name=%r url=%s empty_pages=%s",
+        "House PTR parsed 0 transactions after text/OCR name=%r url=%s empty_pages=%s reason=%s",
         rec.get("name"),
         rec.get("pdf_url"),
         pdf_result.get("empty_pages"),
+        pdf_result.get("ocr_error") or "",
     )
     if result.get("updated"):
         return
@@ -577,10 +635,17 @@ def run(
             )
             state_code = (rec.get("state_district") or "")[:2] or None
             # OCR that recovered transactions is a successful parse. Zero
-            # transactions on a PTR stays failed so the run is visible.
-            parse_status = (
-                "failed" if (not txns and pb_filing_type == "ptr") else "parsed"
-            )
+            # transactions on a PTR stays failed, with the OCR reason, so
+            # a scanned PDF that tesseract also could not read stays visible.
+            if not txns and pb_filing_type == "ptr":
+                parse_status = "failed"
+                failure_reason = (
+                    (pdf_result.get("ocr_error") or "").strip()
+                    or "no_transactions_after_ocr"
+                )
+            else:
+                parse_status = "parsed"
+                failure_reason = ""
 
             if dry_run:
                 logger.info(
@@ -626,8 +691,13 @@ def run(
                     "parse_status": parse_status,
                     "member_name": (member or {}).get("name") or rec["name"],
                     "member_party": (member or {}).get("party") or "",
-                    "member_state": (member or {}).get("state") or state_code or "",
+                    "member_state": (member or {}).get("state")
+                    or state_display_name(state_code)
+                    or state_code
+                    or "",
                 }
+                if failure_reason:
+                    filing["parse_failure_reason"] = failure_reason
                 if member and member.get("id"):
                     filing["member_id"] = member["id"]
                 bioguide = (member or {}).get("bioguide_id") or ""
