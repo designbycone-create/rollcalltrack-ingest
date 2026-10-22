@@ -8,5 +8,6 @@ __pycache__/
 tmp/
 logs/
 *.pdf
+!tests/fixtures/*.pdf
 tmp_*.html
 .DS_Store

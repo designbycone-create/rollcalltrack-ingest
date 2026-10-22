@@ -1183,11 +1183,11 @@ House row already stored on `GET /hcgi/api/votes`. House rows use
 | `chamber` | `Senate` (House rows are `House`, not `house`) |
 | `session` | menu `<session>` as a string (`"1"` or `"2"`) |
 | `roll_number` | `<vote_number>` without padding (`00256` → `256`) |
-| `bill_label` | `<issue>` (`PN1129`, `H.R. 9340`, `S. 5`) |
-| `title`, `description` | `<title>` |
-| `result` | `<result>` (`Confirmed`, `Agreed to`, `Rejected`, `Passed`, `Well Taken`). A few en-bloc rows have a title and a blank result. |
-| `vote_type` | `<question>` (`On the Nomination`, …) |
-| `date` | `<vote_date>` `30-Sep` plus `<congress_year>` → `2026-09-30`. Detail XML upgrades this to `2026-09-30T21:29:00` when the clock time is present. |
+| `bill_label` | `<issue>` (`PN1129`, `H.R. 9340`, `S. 5`). En-bloc rolls nest the issues under `<en_bloc><matter>` and are stored as `En bloc (N)`. |
+| `title`, `description` | `<title>`. Description stays the title. |
+| `result` | `<result>` (`Confirmed`, `Agreed to`, `Rejected`, `Passed`, `Well Taken`). En-bloc menus have no direct result; the detail `<vote_result>` is used, or the first `<matter>` when there is no detail. |
+| `vote_type`, `question` | `<question>` (`On the Nomination`, …). Both are sent. En-bloc questions come from the detail `<question>` or the first `<matter>`. |
+| `date` | `<vote_date>` `30-Sep` plus `<congress_year>` → `2026-09-30`. Detail XML upgrades this to an Eastern Time offset, e.g. `2026-09-30T21:29:00-04:00` (EDT) or `2026-01-07T13:23:00-05:00` (EST). |
 | `tally_yea`, `tally_nay` | `<vote_tally><yeas>` / `<nays>` |
 | `tally_present`, `tally_not_voting` | `0` from the menu. Detail counts `Present` and `Not Voting`. |
 | `jurisdiction` | `federal` |

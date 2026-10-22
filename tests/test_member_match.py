@@ -211,6 +211,48 @@ def test_senate_failures_match_congress_legislators():
     assert boozman["state"] == "AR"
 
 
+def test_unique_chamber_last_name_accepts_middle_or_nickname():
+    """'Robert Mitchell' fails a first-name check against 'Mitch'.
+
+    Mitchell is the middle name, Mitch is the nickname, and the Senate
+    roster has one McConnell.
+    """
+    roster = roster_from_records(
+        [
+            _person(
+                "M000355",
+                "Mitch",
+                "McConnell",
+                "KY",
+                "senate",
+                official_full="Mitch McConnell",
+            )
+        ]
+    )
+    hit = match_legislator(
+        "Robert Mitchell McConnell",
+        roster,
+        chamber="senate",
+    )
+    assert hit["bioguide"] == "M000355"
+    # A different given name, with no middle/nickname overlap, stays unmatched.
+    assert match_legislator("Susan McConnell", roster, chamber="senate") is None
+    # State on the filing still has to agree.
+    assert (
+        match_legislator(
+            "Robert Mitchell McConnell", roster, state="TX", chamber="senate"
+        )
+        is None
+    )
+    two = roster_from_records(
+        [
+            _person("M000355", "Mitch", "McConnell", "KY", "senate"),
+            _person("M000999", "Addison", "McConnell", "TX", "senate"),
+        ]
+    )
+    assert match_legislator("Robert Mitchell McConnell", two, chamber="senate") is None
+
+
 def test_ambiguous_same_name_returns_none():
     assert match_legislator("John Smith", ROSTER, state="TX", chamber="house") is None
     assert match_legislator("John Smith", ROSTER, state="TX", district=2, chamber="house")["bioguide"] == "S000002"
@@ -266,9 +308,9 @@ def test_lookup_tries_full_name_then_last_name_then_bioguide(monkeypatch):
     )
     assert member["id"] == "pb-taylor"
     assert calls == [
-        {"name": "David Taylor", "state": "Ohio"},
-        {"name": "Taylor", "state": "Ohio"},
-        {"bioguide_id": "T000490"},
+        {"name": "David Taylor", "state": "Ohio", "chamber": "house"},
+        {"name": "Taylor", "state": "Ohio", "chamber": "house"},
+        {"bioguide_id": "T000490", "chamber": "house"},
     ]
     assert all("district" not in call for call in calls)
 
@@ -304,7 +346,7 @@ def test_lookup_stops_when_full_name_and_state_match(monkeypatch):
     )
     assert member["id"] == "pb-rich"
     assert member["party"] == "R"
-    assert calls == [{"name": "Richard McCormick", "state": "Georgia"}]
+    assert calls == [{"name": "Richard McCormick", "state": "Georgia", "chamber": "house"}]
 
 
 def test_lookup_uses_bioguide_when_state_on_the_filing_is_wrong(monkeypatch):

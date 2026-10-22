@@ -26,6 +26,7 @@ import re
 import time
 from datetime import date, datetime, timedelta
 from xml.etree import ElementTree as ET
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -69,6 +70,10 @@ _MONTHS = {
     "nov": 11,
     "dec": 12,
 }
+
+# senate.gov and clerk.house.gov both print the chamber clock with no
+# offset. That clock is America/New_York, including daylight time.
+_EASTERN = ZoneInfo("America/New_York")
 
 _CAST = {
     "yea": "yea",
@@ -126,6 +131,14 @@ def _menu_date(vote_date: str, year: str) -> str:
 
 
 def _detail_datetime(vote_date: str) -> str | None:
+    """ISO 8601 for a senate.gov clock time, with the Eastern offset.
+
+    ``August 7, 2026, 01:23 PM`` is ``2026-08-07T13:23:00-04:00``. January
+    is ``-05:00``. ``zoneinfo`` applies the daylight-saving transition.
+    House clerk XML (``action-date`` + ``action-time``, e.g. ``16-Sep-2026``
+    / ``7:05 PM``) is the same naive Eastern clock, but this repo does not
+    parse House roll calls — Hostinger fetches those.
+    """
     text = _collapse(vote_date)
     if not text:
         return None
@@ -133,7 +146,32 @@ def _detail_datetime(vote_date: str) -> str | None:
         parsed = datetime.strptime(text, "%B %d, %Y, %I:%M %p")
     except ValueError:
         return None
-    return parsed.strftime("%Y-%m-%dT%H:%M:%S")
+    return parsed.replace(tzinfo=_EASTERN).isoformat(timespec="seconds")
+
+
+def _en_bloc_matters(node) -> list:
+    return node.findall("./en_bloc/matter")
+
+
+def _question_result_issue(node) -> tuple[str, str, str]:
+    """Question, result, and issue from a menu ``<vote>``.
+
+    En-bloc rolls (225, 221, 125, 124, …) nest those three under
+    ``<en_bloc><matter>`` instead of on the vote. The roll's issue is
+    then ``En bloc (N)``, not the first nomination number.
+    """
+    question = _collapse(node.findtext("question"))
+    result = _collapse(node.findtext("result"))
+    issue = _collapse(node.findtext("issue"))
+    matters = _en_bloc_matters(node)
+    if not matters:
+        return question, result, issue
+    first = matters[0]
+    if not question:
+        question = _collapse(first.findtext("question"))
+    if not result:
+        result = _collapse(first.findtext("result"))
+    return question, result, f"En bloc ({len(matters)})"
 
 
 def _tally(text: str | None) -> int:
@@ -173,6 +211,7 @@ def parse_menu(raw: bytes) -> list[dict]:
             continue
         seen.add(rc_id)
         title = _collapse(node.findtext("title"))
+        question, result, issue = _question_result_issue(node)
         tally = node.find("vote_tally")
         votes.append(
             {
@@ -182,11 +221,12 @@ def parse_menu(raw: bytes) -> list[dict]:
                 "chamber": "Senate",
                 "session": str(session),
                 "roll_number": roll,
-                "bill_label": _collapse(node.findtext("issue")),
+                "bill_label": issue,
                 "title": title,
                 "description": title,
-                "result": _collapse(node.findtext("result")),
-                "vote_type": _collapse(node.findtext("question")),
+                "result": result,
+                "vote_type": question,
+                "question": question,
                 "date": _menu_date(node.findtext("vote_date") or "", year),
                 "tally_yea": _tally(tally.findtext("yeas") if tally is not None else None),
                 "tally_nay": _tally(tally.findtext("nays") if tally is not None else None),
@@ -204,14 +244,45 @@ def _normalize_cast(raw: str | None) -> str | None:
     return _CAST.get(_collapse(raw).lower())
 
 
+def _apply_detail_question(out: dict, root) -> None:
+    """Fill question and result from the detail XML when the menu had none.
+
+    En-bloc menus only carry them on the first ``<matter>``. The detail
+    document's ``<question>`` and ``<vote_result>`` are the roll's own
+    values and replace that fallback. A normal roll already has both, so
+    its menu result stays. Description is left as the title.
+    """
+    en_bloc = str(out.get("bill_label") or "").startswith("En bloc (")
+    detail_question = _collapse(root.findtext("question"))
+    detail_result = _collapse(root.findtext("vote_result"))
+    matters = _en_bloc_matters(root)
+    if en_bloc or not out.get("question"):
+        question = detail_question
+        if not question and matters:
+            question = _collapse(matters[0].findtext("question"))
+        if question:
+            out["question"] = question
+            out["vote_type"] = question
+    if en_bloc or not out.get("result"):
+        result = detail_result
+        if not result and matters:
+            result = _collapse(matters[0].findtext("result"))
+        if result:
+            out["result"] = result
+    if matters and not en_bloc:
+        out["bill_label"] = f"En bloc ({len(matters)})"
+
+
 def parse_detail(raw: bytes, summary: dict, lis_to_bioguide: dict | None = None) -> dict:
     """Add member positions and the recorded clock time.
 
     Yea/nay totals stay the menu ``vote_tally``. Present and not-voting are
     counted from every ``<member>``, including ones we cannot map to a
     bioguide. Unmapped members are omitted from ``member_votes`` rather than
-    sent with a guessed id. Menu ``result`` is kept (the detail text is a
-    longer gloss, such as "Nomination Confirmed").
+    sent with a guessed id. A direct menu ``result`` is kept (the detail
+    text is a longer gloss, such as "Nomination Confirmed"). An en-bloc
+    menu has no direct result, so the detail ``<vote_result>`` and
+    ``<question>`` fill those fields. ``description`` stays the title.
     """
     lis_to_bioguide = lis_to_bioguide or {}
     try:
@@ -225,6 +296,7 @@ def parse_detail(raw: bytes, summary: dict, lis_to_bioguide: dict | None = None)
     clock = _detail_datetime(root.findtext("vote_date") or "")
     if clock:
         out["date"] = clock
+    _apply_detail_question(out, root)
 
     present = 0
     not_voting = 0
@@ -436,8 +508,11 @@ def run(
         for start in range(0, len(records), HORIZONS_BATCH_SIZE):
             batch = records[start : start + HORIZONS_BATCH_SIZE]
             try:
-                client.submit_votes(batch)
-                submitted += len(batch)
+                result = client.submit_votes(batch) or {}
+                if isinstance(result, dict) and result.get("submitted") is not None:
+                    submitted += int(result["submitted"])
+                elif isinstance(result, dict) and result.get("written") is not None:
+                    submitted += int(result["written"])
             except Exception as e:
                 failed += len(batch)
                 logger.error("Senate vote submit failed: %s", e)

@@ -12,6 +12,7 @@ from ingest.ingest_client import HorizonsIngestClient
 from ingest.senate_votes import (
     BROWSER_USER_AGENT,
     SenateVoteFetchError,
+    _detail_datetime,
     current_senate_session,
     detail_url,
     fetch_xml,
@@ -176,6 +177,8 @@ def test_parse_menu_uses_congress_year_and_house_payload_shape():
     assert vote["description"] == vote["title"]
     assert vote["result"] == "Confirmed"
     assert vote["vote_type"] == "On the Nomination"
+    assert vote["question"] == "On the Nomination"
+    assert vote["description"] == vote["title"]
     assert vote["date"] == "2026-09-30"
     assert vote["tally_yea"] == 47
     assert vote["tally_nay"] == 41
@@ -229,8 +232,11 @@ def test_fetch_xml_returns_senate_xml():
 def test_parse_detail_maps_member_positions_and_clock_time():
     summary = next(v for v in parse_menu(MENU_XML) if v["roll_number"] == "256")
     enriched = parse_detail(DETAIL_XML, summary, lis_to_bioguide=LIS)
-    assert enriched["date"] == "2026-09-30T21:29:00"
+    assert enriched["date"] == "2026-09-30T21:29:00-04:00"
     assert enriched["result"] == "Confirmed"
+    assert enriched["question"] == "On the Nomination"
+    assert enriched["vote_type"] == "On the Nomination"
+    assert enriched["description"] == enriched["title"]
     assert enriched["tally_yea"] == 47
     assert enriched["tally_nay"] == 41
     assert enriched["tally_present"] == 1
@@ -244,6 +250,98 @@ def test_parse_detail_maps_member_positions_and_clock_time():
     assert nay["jurisdiction"] == "federal"
     assert nay["state_code"] == ""
     assert members[1]["vote"] == "present"
+
+
+# Roll 225 (2026-08-07) is an en-bloc confirmation. The live menu nests 74
+# matters under <en_bloc>; this fixture keeps the first two. The live detail
+# clock is "August 7, 2026, 01:23 PM".
+EN_BLOC_MENU = b"""<?xml version="1.0" encoding="UTF-8"?>
+<vote_summary>
+  <congress>119</congress>
+  <session>2</session>
+  <congress_year>2026</congress_year>
+  <votes>
+    <vote>
+      <vote_number>00225</vote_number>
+      <vote_date>07-Aug</vote_date>
+      <en_bloc>
+        <matter>
+          <issue>PN961-1</issue>
+          <question>On the Nomination</question>
+          <result>Confirmed</result>
+        </matter>
+        <matter>
+          <issue>PN937-5</issue>
+          <question>On the Nomination</question>
+          <result>Confirmed</result>
+        </matter>
+      </en_bloc>
+      <vote_tally>
+        <yeas>51</yeas>
+        <nays>47</nays>
+      </vote_tally>
+      <title>Confirmation: En Bloc nominations provided for under the provisions of S. Res. 817</title>
+    </vote>
+  </votes>
+</vote_summary>
+"""
+
+EN_BLOC_DETAIL = b"""<?xml version="1.0" encoding="UTF-8"?>
+<roll_call_vote>
+  <congress>119</congress>
+  <session>2</session>
+  <congress_year>2026</congress_year>
+  <vote_number>225</vote_number>
+  <vote_date>August 7, 2026,  01:23 PM</vote_date>
+  <question>On the Nomination</question>
+  <vote_result>Nomination Confirmed</vote_result>
+  <vote_title>Confirmation: En Bloc nominations provided for under the provisions of S. Res. 817</vote_title>
+  <members>
+    <member>
+      <member_full>Alsobrooks (D-MD)</member_full>
+      <vote_cast>Nay</vote_cast>
+      <lis_member_id>S428</lis_member_id>
+    </member>
+  </members>
+</roll_call_vote>
+"""
+
+
+def test_en_bloc_menu_uses_first_matter_and_counts_the_issue():
+    vote = parse_menu(EN_BLOC_MENU)[0]
+    assert vote["roll_number"] == "225"
+    assert vote["rc_id"] == "s-119-2026-225"
+    assert vote["bill_label"] == "En bloc (2)"
+    assert vote["question"] == "On the Nomination"
+    assert vote["vote_type"] == "On the Nomination"
+    assert vote["result"] == "Confirmed"
+    assert vote["description"] == vote["title"]
+    assert vote["title"].startswith("Confirmation: En Bloc nominations")
+    assert vote["date"] == "2026-08-07"
+    assert vote["tally_yea"] == 51
+    assert vote["tally_nay"] == 47
+
+
+def test_en_bloc_detail_prefers_vote_result_and_eastern_offset():
+    summary = parse_menu(EN_BLOC_MENU)[0]
+    enriched = parse_detail(EN_BLOC_DETAIL, summary, lis_to_bioguide=LIS)
+    assert enriched["question"] == "On the Nomination"
+    assert enriched["vote_type"] == "On the Nomination"
+    assert enriched["result"] == "Nomination Confirmed"
+    assert enriched["bill_label"] == "En bloc (2)"
+    assert enriched["description"] == enriched["title"]
+    assert enriched["description"].startswith("Confirmation: En Bloc nominations")
+    assert enriched["date"] == "2026-08-07T13:23:00-04:00"
+    assert enriched["member_votes"][0]["vote"] == "nay"
+
+
+def test_detail_datetime_uses_eastern_offset_across_dst():
+    assert _detail_datetime("August 7, 2026, 01:23 PM") == "2026-08-07T13:23:00-04:00"
+    assert _detail_datetime("September 30, 2026, 09:29 PM") == "2026-09-30T21:29:00-04:00"
+    assert _detail_datetime("January 7, 2026, 01:23 PM") == "2026-01-07T13:23:00-05:00"
+    assert _detail_datetime("November 3, 2026, 01:23 PM") == "2026-11-03T13:23:00-05:00"
+    assert _detail_datetime("") is None
+    assert _detail_datetime("not a date") is None
 
 
 class _Client:
@@ -300,6 +398,28 @@ def test_run_is_idempotent_and_fetches_detail_by_stable_url():
     assert fetched.count(detail_url(119, 2, 256)) == 2
     assert all(not u.endswith("vote_119_2_00001.xml") for u in fetched)
     assert client.logs[0]["source"] == "senate_votes"
+
+
+def test_run_counts_submitted_from_the_response():
+    client = _Client()
+
+    def submit_votes(records):
+        client.batches.append(records)
+        return {"ok": True, "written": len(records), "submitted": 0}
+
+    client.submit_votes = submit_votes
+    result = run(
+        congress=119,
+        session=2,
+        dry_run=False,
+        fetch_details=False,
+        client=client,
+        today=date(2026, 10, 22),
+        menu_xml=MENU_XML,
+        days_back=30,
+    )
+    assert len(client.batches) == 1
+    assert result["submitted"] == 0
 
 
 def test_days_back_drops_old_rolls_without_calling_them_failures():
@@ -400,6 +520,29 @@ def test_submit_votes_accepts_federal_senate_shape(monkeypatch):
         hz.submit_votes([{**record, "jurisdiction": "federal", "state_code": "MD"}])
     with pytest.raises(ValueError):
         hz.submit_votes([{**record, "source_url": ""}])
+
+
+def test_submit_votes_logs_batch_status_and_written(monkeypatch, caplog):
+    import logging
+
+    hz = HorizonsIngestClient("https://example.com", "key")
+
+    class _Counted(_IngestResp):
+        status_code = 201
+
+        def json(self):
+            return {"ok": True, "written": 4, "submitted": 3}
+
+    monkeypatch.setattr(hz, "_post_ingest", lambda body, path="/hcgi/api/ingest/disclosures": _Counted())
+    record = parse_detail(
+        DETAIL_XML,
+        next(v for v in parse_menu(MENU_XML) if v["roll_number"] == "256"),
+        lis_to_bioguide=LIS,
+    )
+    with caplog.at_level(logging.INFO):
+        out = hz.submit_votes([record])
+    assert out["submitted"] == 3
+    assert "Votes batch HTTP 201 written=4 submitted=3" in caplog.text
 
 
 def test_ingestion_log_keeps_senate_votes_source(monkeypatch):

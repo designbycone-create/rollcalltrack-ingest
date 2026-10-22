@@ -248,25 +248,141 @@ def extract_pdf_text(content: bytes) -> dict:
     }
 
 
+def _upright_page(image, image_to_osd):
+    """Rotate one rendered page using tesseract OSD.
+
+    OSD ``Rotate`` is degrees clockwise to make the page upright. PIL
+    rotates counter-clockwise, so the correction is the negative angle.
+    """
+    try:
+        osd = image_to_osd(image) or ""
+    except Exception as e:
+        logger.warning("House PTR OSD failed: %s", e)
+        return image
+    match = re.search(r"Rotate:\s*(\d+)", osd)
+    if not match:
+        return image
+    angle = int(match.group(1)) % 360
+    if not angle:
+        return image
+    logger.info("House PTR page rotate %s degrees clockwise", angle)
+    return image.rotate(-angle, expand=True)
+
+
 def _ocr_with_pdf2image(content: bytes) -> str:
     try:
         import pytesseract
         from pdf2image import convert_from_bytes
+        from PIL import ImageOps
     except ImportError as e:
         logger.warning("OCR libraries unavailable: %s", e)
         return ""
     try:
-        images = convert_from_bytes(content, dpi=200)
+        images = convert_from_bytes(content, dpi=300)
     except Exception as e:
         logger.warning("pdf2image failed: %s", e)
         return ""
     parts = []
     for image in images:
         try:
-            parts.append(pytesseract.image_to_string(image) or "")
+            image = _upright_page(image, pytesseract.image_to_osd)
+            gray = ImageOps.autocontrast(image.convert("L"))
+            parts.append(pytesseract.image_to_string(gray, config="--psm 6") or "")
         except Exception as e:
             logger.warning("House PTR OCR failed: %s", e)
     return "\n".join(parts)
+
+
+_SCAN_OWNER_RE = re.compile(r"\b(SP|JT|DC)\b", re.IGNORECASE)
+_SCAN_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+_SCAN_HEADER_SNIPS = (
+    "FULL ASSET",
+    "TICKER",
+    "MICHAEL MCCAUL",
+    "PROVIDE FULL",
+    "AMOUNT OF TRANSACTION",
+    "TYPE OF TRANSACTION",
+    "CLERK OF THE",
+)
+
+
+def _pad_scan_date(month: str, day: str, year: str) -> str | None:
+    try:
+        month_n = int(month)
+        day_n = int(day)
+    except ValueError:
+        return None
+    if not (1 <= month_n <= 12 and 1 <= day_n <= 31 and len(year) == 4):
+        return None
+    return f"{month_n:02d}/{day_n:02d}/{year}"
+
+
+def _transactions_from_scanned_ptr(text: str) -> list[dict]:
+    """Rows from a checkbox PTR scan.
+
+    The printed amount is a checked column, not ``$low - $high`` on the
+    asset line, so the normal row regex never matches. Keep the owner,
+    asset, and date. Leave the amount blank rather than invent a range.
+    """
+    transactions: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if len(line) < 12:
+            continue
+        owner_m = _SCAN_OWNER_RE.search(line)
+        if not owner_m:
+            continue
+        date_m = _SCAN_DATE_RE.search(line, owner_m.end())
+        if not date_m:
+            continue
+        txn_date = _pad_scan_date(*date_m.groups())
+        if not txn_date:
+            continue
+        body = line[owner_m.end() : date_m.start()]
+        cleaned = re.sub(r"[^A-Za-z0-9&.() ]+", " ", body)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,&")
+        type_in_body = re.search(r"(?:^|\s)([PSE])\s*$", cleaned)
+        if type_in_body:
+            cleaned = cleaned[: type_in_body.start()].strip(" .,&")
+        letters = re.sub(r"[^A-Za-z]", "", cleaned)
+        if len(letters) < 8:
+            continue
+        upper = cleaned.upper()
+        if any(snip in upper for snip in _SCAN_HEADER_SNIPS):
+            continue
+        tail = line[date_m.end() :]
+        if type_in_body:
+            type_token = type_in_body.group(1).upper()
+        else:
+            type_m = re.search(r"\b([PSE])\b", tail)
+            type_token = type_m.group(1).upper() if type_m else ""
+        if type_token == "S" and "partial" in tail.lower():
+            ttype = "sale_partial"
+        else:
+            ttype = _TYPE_MAP.get(type_token, "other")
+        owner = owner_m.group(1).upper()
+        key = (upper, txn_date, owner)
+        if key in seen:
+            continue
+        seen.add(key)
+        notify = _SCAN_DATE_RE.search(tail)
+        notification = _pad_scan_date(*notify.groups()) if notify else None
+        ticker, ticker_confidence = extract_ticker(cleaned)
+        row = {
+            "asset_name": cleaned,
+            "filer_relation": _OWNER_MAP.get(owner, "self"),
+            "transaction_type": ttype,
+            "transaction_date": txn_date,
+            "amount_range_raw": "",
+            "ticker": ticker,
+            "ticker_confidence": ticker_confidence,
+            "line_index": len(transactions),
+        }
+        if notification:
+            row["notification_date"] = notification
+        transactions.append(row)
+    return transactions
 
 
 def _ocr_with_pdfplumber(content: bytes) -> str:
@@ -314,6 +430,8 @@ def resolve_ptr_transactions(text: str, ocr=None) -> dict:
             logger.warning("House PTR OCR failed: %s", e)
             ocr_text = ""
     ocr_txns = parse_ptr_transactions(ocr_text) if ocr_text.strip() else []
+    if not ocr_txns and ocr_text.strip():
+        ocr_txns = _transactions_from_scanned_ptr(ocr_text)
     if ocr_txns:
         return {
             "transactions": ocr_txns,
@@ -325,7 +443,14 @@ def resolve_ptr_transactions(text: str, ocr=None) -> dict:
         reason = "ocr_failed: no text extracted"
     else:
         reason = "ocr_failed: no transactions recognized"
-    logger.warning("House PTR parse_status=failed reason=%s", reason)
+    sample = re.sub(r"\s+", " ", str(ocr_text or "")).strip()
+    if len(sample) > 160:
+        sample = sample[:160]
+    logger.warning(
+        "House PTR parse_status=failed reason=%s ocr_sample=%r",
+        reason,
+        sample,
+    )
     return {
         "transactions": [],
         "used_ocr": True,

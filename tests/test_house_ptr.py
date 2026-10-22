@@ -440,3 +440,122 @@ def test_filing_id_reparse_records_ocr_failure(monkeypatch, caplog):
     assert hz.filing["member_id"] == "pb-taylor"
     assert hz.flagged["reason"] == "low_ocr_confidence"
     assert "ocr" in caplog.text.lower()
+
+
+def test_scanned_ptr_row_keeps_owner_asset_and_date():
+    from ingest.house import _transactions_from_scanned_ptr, resolve_ptr_transactions
+
+    line = (
+        "| SP] BLACKSTONEPRIVATEEQUITYSTRATEGIESFUNDLPCLASS!, CX | | "
+        "8/20/2026 | o/sjzoze | | [x]"
+    )
+    txns = _transactions_from_scanned_ptr(line)
+    assert len(txns) == 1
+    assert "BLACKSTONE" in txns[0]["asset_name"].upper()
+    assert txns[0]["transaction_date"] == "08/20/2026"
+    assert txns[0]["filer_relation"] == "spouse"
+    assert txns[0]["amount_range_raw"] == ""
+    assert txns[0]["transaction_type"] == "other"
+
+    typed = _transactions_from_scanned_ptr("SP Apple Inc (AAPL) P 9/1/2026")
+    assert typed[0]["transaction_type"] == "purchase"
+    assert typed[0]["ticker"] == "AAPL"
+    assert typed[0]["transaction_date"] == "09/01/2026"
+
+    assert _transactions_from_scanned_ptr("not a transaction table") == []
+    result = resolve_ptr_transactions("no text layer", ocr=lambda: line)
+    assert result["parse_status"] == "parsed"
+    assert result["used_ocr"] is True
+    assert "BLACKSTONE" in result["transactions"][0]["asset_name"].upper()
+
+
+def test_ocr_failure_logs_a_text_sample(caplog):
+    import logging
+
+    from ingest.house import resolve_ptr_transactions
+
+    with caplog.at_level(logging.WARNING):
+        result = resolve_ptr_transactions(
+            "no rows", ocr=lambda: "not a transaction table"
+        )
+    assert result["parse_status"] == "failed"
+    assert "ocr_sample=" in caplog.text
+    assert "not a transaction table" in caplog.text
+
+
+def test_ocr_renders_at_300_and_corrects_osd_rotation(monkeypatch):
+    import sys
+    import types
+
+    from ingest.house import _ocr_with_pdf2image
+
+    seen = {}
+
+    class FakeImage:
+        def convert(self, mode):
+            seen["mode"] = mode
+            return self
+
+        def rotate(self, angle, expand=False):
+            seen["rotate"] = (angle, expand)
+            return self
+
+    image = FakeImage()
+
+    pdf2image = types.ModuleType("pdf2image")
+
+    def convert_from_bytes(content, dpi=200):
+        seen["dpi"] = dpi
+        seen["content"] = content
+        return [image]
+
+    pdf2image.convert_from_bytes = convert_from_bytes
+
+    pytesseract = types.ModuleType("pytesseract")
+
+    def image_to_osd(_image):
+        return "Orientation in degrees: 90\nRotate: 270\nOrientation confidence: 5.10"
+
+    def image_to_string(_image, config=""):
+        seen["config"] = config
+        return "NAME MICHAEL MCCAUL"
+
+    pytesseract.image_to_osd = image_to_osd
+    pytesseract.image_to_string = image_to_string
+
+    pil_imageops = types.ModuleType("ImageOps")
+
+    def autocontrast(img):
+        seen["autocontrast"] = True
+        return img
+
+    pil_imageops.autocontrast = autocontrast
+    pil = types.ModuleType("PIL")
+    pil.ImageOps = pil_imageops
+
+    monkeypatch.setitem(sys.modules, "pdf2image", pdf2image)
+    monkeypatch.setitem(sys.modules, "pytesseract", pytesseract)
+    monkeypatch.setitem(sys.modules, "PIL", pil)
+    monkeypatch.setitem(sys.modules, "PIL.ImageOps", pil_imageops)
+
+    text = _ocr_with_pdf2image(b"%PDF")
+    assert "MICHAEL MCCAUL" in text
+    assert seen["dpi"] == 300
+    assert seen["rotate"] == (-270, True)
+    assert seen["autocontrast"] is True
+    assert seen["config"] == "--psm 6"
+
+
+def test_mccaul_landscape_scan_yields_transactions():
+    from pathlib import Path
+
+    from ingest.house import ocr_pdf_bytes, resolve_ptr_transactions
+
+    content = (Path(__file__).parent / "fixtures" / "9116378.pdf").read_bytes()
+    result = resolve_ptr_transactions("", ocr=lambda: ocr_pdf_bytes(content))
+    assert result["used_ocr"] is True
+    assert result["parse_status"] == "parsed"
+    assert result["transactions"]
+    blob = " ".join(txn["asset_name"] for txn in result["transactions"]).upper()
+    dates = {txn["transaction_date"] for txn in result["transactions"]}
+    assert "BLACKSTONE" in blob or "08/20/2026" in dates
