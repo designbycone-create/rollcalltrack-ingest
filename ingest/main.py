@@ -415,14 +415,22 @@ def main():
         logger.info("%s: %s", source, r)
     _write_step_summary(results)
     failed = 0
+    details: list[str] = []
     for r in results.values():
-        if isinstance(r, dict):
-            failed += int(r.get("failed") or 0)
+        if not isinstance(r, dict):
+            continue
+        failed += int(r.get("failed") or 0)
+        for item in r.get("failures") or []:
+            url = item.get("source_url") or "(no source url)"
+            reason = item.get("reason") or "unknown"
+            details.append(f"{url}: {reason}")
     if failed:
+        # Retries that succeed never increment `failed`. A count that is
+        # still above zero means the last attempt failed too.
         logger.error(
-            "Ingest finished with %s failed record(s). "
-            "See the log above for source_url and HTTP status.",
+            "Ingest finished with %s failed record(s). %s",
             failed,
+            "; ".join(details) or "See the log above for source_url and HTTP status.",
         )
         sys.exit(1)
 

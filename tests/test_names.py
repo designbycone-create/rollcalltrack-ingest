@@ -102,6 +102,86 @@ def test_embedded_title_and_nickname_quotes():
     assert not first_names_compatible("Josh", "John")
 
 
+def test_senate_office_title_is_not_a_name():
+    # Paper rows use office "Senator" and an all-caps filer with a double space.
+    # The office title must not become the lookup name.
+    assert normalized_lookup_names("RICHARD  BLUMENTHAL", office="Senator") == (
+        "Richard Blumenthal",
+        "Blumenthal",
+    )
+    parsed = parse_filer_name("RICHARD  BLUMENTHAL", office="Senator")
+    assert parsed.full == "Richard Blumenthal"
+    assert parsed.first == "Richard"
+    assert parsed.last == "Blumenthal"
+    assert "senator" not in parsed.full.lower()
+
+
+def test_mcconnell_initial_and_middle_name():
+    assert normalized_lookup_names(
+        "A. Mitchell McConnell, Jr.",
+        office="McConnell, A. Mitchell Jr. (Senator)",
+    ) == ("Mitchell McConnell", "McConnell")
+    parsed = parse_filer_name(
+        "A. Mitchell McConnell, Jr.",
+        office="McConnell, A. Mitchell Jr. (Senator)",
+    )
+    assert parsed.last == "McConnell"
+    assert "Mitchell" in parsed.full
+
+
+def test_moreno_legal_name_from_office():
+    assert normalized_lookup_names(
+        "Bernie Moreno",
+        office="Moreno, Bernardo (Senator)",
+    ) == ("Bernardo Moreno", "Moreno")
+    assert first_names_compatible("Bernardo", "Bernie")
+    assert first_names_compatible("Bernie", "Bernardo")
+
+
+def test_lookup_accepts_senate_name_variants():
+    assert member_record_compatible(
+        "A. Mitchell McConnell, Jr.",
+        {
+            "id": "M000355",
+            "bioguide_id": "M000355",
+            "name": "Mitch McConnell",
+            "state": "Kentucky",
+        },
+        office="McConnell, A. Mitchell Jr. (Senator)",
+    )
+    assert member_record_compatible(
+        "Bernie Moreno",
+        {
+            "id": "M001242",
+            "bioguide_id": "M001242",
+            "name": "Bernie Moreno",
+            "state": "Ohio",
+        },
+        office="Moreno, Bernardo (Senator)",
+    )
+    assert member_record_compatible(
+        "RICHARD  BLUMENTHAL",
+        {
+            "id": "B001277",
+            "bioguide_id": "B001277",
+            "name": "Richard Blumenthal",
+            "state": "Connecticut",
+        },
+        office="Senator",
+    )
+    assert member_record_compatible(
+        "John Boozman",
+        {
+            "id": "B001236",
+            "bioguide_id": "B001236",
+            "name": "John Boozman",
+            "state": "Arkansas",
+        },
+        state="Arkansas",
+        office="Boozman, John (Senator)",
+    )
+
+
 def test_lookup_hit_must_be_the_same_person():
     assert not member_record_compatible(
         "Richard W. Allen",
