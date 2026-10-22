@@ -141,6 +141,12 @@ python -m ingest.backfill_members --live
 Both commands need `HORIZONS_BASE_URL` and `INGEST_API_KEY`. The dry run
 only reads. `--live` also sets the write opt-in for that process.
 
+The same commands run from Actions → **Backfill members** (manual only).
+`mode` defaults to `dry-run`; `live` adds `--live`. Optional `filing_ids`
+(comma-separated House DocIDs) re-parses each one with
+`python -m ingest.main --source house --filing-id …` in that same mode.
+The job uploads `planned-changes` and writes a run summary.
+
 ### Member matching
 
 Under Horizons API mode, member resolution hits

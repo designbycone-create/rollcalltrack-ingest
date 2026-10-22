@@ -1,0 +1,132 @@
+name: Backfill members
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run prints planned changes and does not POST. live writes them."
+        required: true
+        type: choice
+        default: dry-run
+        options:
+          - dry-run
+          - live
+      filing_ids:
+        description: "Optional comma-separated House DocIDs to re-parse (ingest.main --filing-id) in the same mode."
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install OCR dependencies
+        # Re-parse of a scanned House PTR uses the same OCR fallback as Disclosure Ingest.
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr poppler-utils
+
+      - name: Backfill members
+        env:
+          # Horizons HTTP ingest API. Auth is X-Ingest-Key from INGEST_API_KEY.
+          # Same secrets as Disclosure Ingest. INGEST_LIVE is set only for mode=live
+          # so a dry run cannot POST.
+          HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          INGEST_LIVE: ${{ inputs.mode == 'live' && '1' || '0' }}
+          MODE: ${{ inputs.mode }}
+          FILING_IDS: ${{ inputs.filing_ids }}
+        run: |
+          set -euo pipefail
+          mkdir -p backfill-output
+          LOG=backfill-output/planned-changes.txt
+          : > "$LOG"
+          MODE="${MODE:-dry-run}"
+
+          write_summary() {
+            local reparse_note="$1"
+            local outcome="$2"
+            {
+              echo "## Backfill members"
+              echo ""
+              echo "- Mode: \`$MODE\`"
+              echo "- Outcome: $outcome"
+              echo "- Re-parsed House filing ids: $reparse_note"
+              echo "- Planned changes: artifact \`planned-changes\`"
+              echo ""
+              echo '```'
+              grep -E '^backfill dry_run=' "$LOG" | tail -n 5 || true
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          case "$MODE" in
+            dry-run|live) ;;
+            *)
+              echo "mode must be dry-run or live (got: $MODE)" | tee -a "$LOG"
+              write_summary "none" "failed: invalid mode"
+              exit 1
+              ;;
+          esac
+
+          if [ "$MODE" = "live" ]; then
+            BACKFILL=(python -m ingest.backfill_members --live)
+          else
+            BACKFILL=(python -m ingest.backfill_members)
+          fi
+          echo "Running: ${BACKFILL[*]}" | tee -a "$LOG"
+          "${BACKFILL[@]}" 2>&1 | tee -a "$LOG" || status=$?
+          status=${status:-0}
+          if [ "$status" -ne 0 ]; then
+            write_summary "not started" "failed: backfill exit $status"
+            exit "$status"
+          fi
+
+          reparse_note="none"
+          if [ -n "${FILING_IDS//[[:space:]]/}" ]; then
+            reparse_note=""
+            IFS=',' read -ra IDS <<< "$FILING_IDS"
+            for raw in "${IDS[@]}"; do
+              id="${raw//[[:space:]]/}"
+              if [ -z "$id" ]; then
+                continue
+              fi
+              if ! [[ "$id" =~ ^[0-9]+$ ]]; then
+                echo "Invalid House filing id: $id" | tee -a "$LOG"
+                write_summary "${reparse_note:-none}" "failed: invalid filing id $id"
+                exit 1
+              fi
+              if [ "$MODE" = "live" ]; then
+                CMD=(python -m ingest.main --source house --live --filing-id "$id")
+              else
+                CMD=(python -m ingest.main --source house --dry-run --filing-id "$id")
+              fi
+              echo "Running: ${CMD[*]}" | tee -a "$LOG"
+              if ! "${CMD[@]}" 2>&1 | tee -a "$LOG"; then
+                write_summary "${reparse_note:-none} $id" "failed: re-parse $id"
+                exit 1
+              fi
+              reparse_note+="$id "
+            done
+            reparse_note="${reparse_note:-none}"
+          fi
+
+          write_summary "$reparse_note" "ok"
+
+      - name: Upload planned changes
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: planned-changes
+          path: backfill-output/planned-changes.txt
+          if-no-files-found: error
