@@ -20,7 +20,7 @@ from datetime import date, timedelta
 import requests
 from bs4 import BeautifulSoup
 
-from . import config, db
+from . import config
 from .ingest_client import HorizonsIngestClient, get_client
 
 logger = logging.getLogger("rollcalltrack_ingest.senate")
@@ -295,13 +295,24 @@ def run(
     max_filings: int | None = None,
     client: HorizonsIngestClient | None = None,
 ) -> dict:
-    """days_back defaults to 90 so filings stored without a member are rematched."""
+    """days_back defaults to 90 so filings stored without a member are rematched.
+
+    conn is ignored. Direct PocketBase writes have been removed.
+    """
     found, parsed, failed = 0, 0, 0
     since = date.today() - timedelta(days=days_back)
     hz = client if client is not None else (
         get_client() if config.use_horizons_api() and not dry_run else None
     )
     use_hz = hz is not None and hz.configured and not dry_run
+    if not dry_run and not use_hz:
+        logger.error("HORIZONS_BASE_URL and INGEST_API_KEY are required")
+        return {
+            "found": 0,
+            "parsed": 0,
+            "failed": 1,
+            "error": "INGEST_API_KEY required",
+        }
 
     session = _new_session()
     try:
@@ -313,10 +324,6 @@ def run(
         if use_hz:
             hz.submit_ingestion_log(
                 "senate_efd", 0, 0, 1, note=f"search failed: {e}"
-            )
-        elif conn is not None and not dry_run:
-            db.log_ingestion_run(
-                conn, "senate", 0, 0, 1, note=f"search failed: {e}"
             )
         return {"found": 0, "parsed": 0, "failed": 1, "error": "search failed"}
 
@@ -404,56 +411,11 @@ def run(
                 parsed += 1
                 continue
 
-            member_id = None
-            member_meta = {}
-            if conn is not None:
-                member_id = db.find_member_id(
-                    conn,
-                    rec["name"],
-                    chamber="senate",
-                    office=rec.get("office"),
-                )
-                if member_id is None:
-                    logger.warning(
-                        "No member match for filer name: %s (%s) — skipping",
-                        rec["name"],
-                        rec.get("office"),
-                    )
-                    failed += 1
-                    continue
-                member_meta = db.get_member(conn, member_id) or {}
-
-            filing = {
-                "member_id": member_id,
-                "chamber": "senate",
-                "filing_type": "ptr",
-                "filing_date": rec["filing_date"],
-                "source_url": rec["detail_url"],
-                "raw_document_type": "html" if not detail.get("paper") else "pdf",
-                "parse_status": parse_status,
-                "member_name": member_meta.get("name") or rec["name"],
-                "member_party": member_meta.get("party") or "",
-                "member_state": member_meta.get("state") or "",
-            }
-            filing_id = db.upsert_filing(conn, filing)
-            for txn in detail["transactions"]:
-                txn.update(
-                    {
-                        "filing_id": filing_id,
-                        "member_id": member_id,
-                        "amount_range_low": None,
-                        "amount_range_high": None,
-                    }
-                )
-                if "ticker" not in txn:
-                    txn["ticker"] = None
-                if "ticker_confidence" not in txn:
-                    txn["ticker_confidence"] = "none"
-                if "asset_category" not in txn:
-                    txn["asset_category"] = None
-                db.upsert_transaction(conn, txn)
-
-            parsed += 1
+            logger.error(
+                "Senate filing %s not submitted: INGEST_API_KEY is required",
+                rec.get("detail_url"),
+            )
+            failed += 1
         except Exception as e:
             logger.error(
                 "Failed to process Senate filing %s: %s",
@@ -464,7 +426,5 @@ def run(
 
     if use_hz:
         hz.submit_ingestion_log("senate_efd", found, parsed, failed)
-    elif conn is not None and not dry_run:
-        db.log_ingestion_run(conn, "senate_efd", found, parsed, failed)
 
     return {"found": found, "parsed": parsed, "failed": failed}

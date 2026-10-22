@@ -44,7 +44,7 @@ This feature is split on purpose. The ingest repo can ship almost all of the bra
 
 - New modules under `ingest/`: `courtlistener_events.py`, `scotus_stays.py`, `jcs_scores.py`, `judicial_score.py`
 - New workflows, same shape as `fjc-judges.yml`: `workflow_dispatch` first, `--dry-run` default **true** until the Horizons route returns non-404, then a daily cron
-- Secrets already present and reused: `HORIZONS_BASE_URL`, `INGEST_API_KEY` / `INGEST_KEY`. Add `COURTLISTENER_TOKEN` only if the public API rate-limits us
+- Secrets already present and reused: `HORIZONS_BASE_URL` and `INGEST_API_KEY` (`INGEST_KEY` is still read for one release when `INGEST_API_KEY` is unset). Add `COURTLISTENER_TOKEN` only if the public API rate-limits us
 - Tests under `tests/test_judicial_events.py` and `tests/test_judicial_score.py`. No live CourtListener in CI
 - Dry-run writes a JSON summary to the Actions log. No POST
 

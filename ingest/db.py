@@ -1,18 +1,15 @@
-"""PocketBase client + upsert helpers for Horizons rollcalltrack.
+"""PocketBase collection helpers for Horizons rollcalltrack.
 
 Live schema (2026-08) collections used here:
   members, disclosure_filings, transactions, annual_assets,
   ingestion_log, manual_review_queue
 
-Auth: superuser via /api/collections/_superusers/auth-with-password
-Base URL: config.POCKETBASE_URL  (…/hcgi/platform)
+This module does not authenticate. Superuser and admin password login
+have been removed. Ingest writes use the Horizons API key.
 """
 from __future__ import annotations
 
 import logging
-import os
-import re
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,52 +30,12 @@ _SOURCES = {"house_clerk", "senate_efd", "congress_gov"}
 
 
 class PocketBase:
-    """Minimal PocketBase REST client (superuser session)."""
+    """Minimal PocketBase REST client. Does not log in."""
 
-    def __init__(
-        self,
-        base_url: str,
-        email: str = "",
-        password: str = "",
-        token: str | None = None,
-    ):
+    def __init__(self, base_url: str):
         self.base = base_url.rstrip("/")
-        self.email = email
-        self.password = password
         self.session = requests.Session()
         self.session.headers["User-Agent"] = config.USER_AGENT
-        self.token: str | None = token
-
-    def auth(self) -> None:
-        # Optional bearer token (local smoke tests / short-lived Edge session)
-        if self.token:
-            self.session.headers["Authorization"] = self.token
-            logger.info("Using provided PocketBase auth token")
-            return
-        if not self.email or not self.password:
-            raise RuntimeError(
-                "POCKETBASE_ADMIN_EMAIL and POCKETBASE_ADMIN_PASSWORD are required"
-            )
-        url = f"{self.base}/api/collections/_superusers/auth-with-password"
-        resp = self.session.post(
-            url,
-            json={"identity": self.email, "password": self.password},
-            timeout=config.REQUEST_TIMEOUT_SECONDS,
-        )
-        if resp.status_code == 404:
-            url = f"{self.base}/api/admins/auth-with-password"
-            resp = self.session.post(
-                url,
-                json={"identity": self.email, "password": self.password},
-                timeout=config.REQUEST_TIMEOUT_SECONDS,
-            )
-        resp.raise_for_status()
-        data = resp.json()
-        self.token = data.get("token")
-        if not self.token:
-            raise RuntimeError("PocketBase auth succeeded but no token returned")
-        self.session.headers["Authorization"] = self.token
-        logger.info("Authenticated to PocketBase as superuser")
 
     def _url(self, collection: str, record_id: str | None = None) -> str:
         path = f"{self.base}/api/collections/{collection}/records"
@@ -140,31 +97,6 @@ class PocketBase:
         data = self.list(collection, filter=filter, per_page=1)
         items = data.get("items") or []
         return items[0] if items else None
-
-
-# Module-level connection used inside get_conn context
-_pb: PocketBase | None = None
-
-
-@contextmanager
-def get_conn():
-    """Yield an authenticated PocketBase client (named get_conn for parity)."""
-    global _pb
-    if not config.POCKETBASE_URL:
-        raise RuntimeError("POCKETBASE_URL / DATABASE_URL is not set")
-    token = os.environ.get("POCKETBASE_AUTH_TOKEN")
-    client = PocketBase(
-        config.POCKETBASE_URL,
-        email=config.POCKETBASE_ADMIN_EMAIL or "",
-        password=config.POCKETBASE_ADMIN_PASSWORD or "",
-        token=token,
-    )
-    client.auth()
-    _pb = client
-    try:
-        yield client
-    finally:
-        _pb = None
 
 
 def _escape_filter(value: str) -> str:

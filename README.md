@@ -60,6 +60,9 @@ Requires the PC to be **on** (or wake) at schedule time.
 | `HORIZONS_BASE_URL` | `https://…app-preview.com` |
 | `INGEST_API_KEY` | Horizons ingest key |
 
+`INGEST_KEY` is still read for one release when `INGEST_API_KEY` is unset.
+Workflows set `INGEST_API_KEY` only.
+
 ```bash
 gh workflow run "Disclosure Ingest"
 ```
@@ -99,8 +102,7 @@ python -m ingest.main --source house --dry-run --days-back 60 --max-filings 10
 Under Horizons API mode, member resolution hits
 `GET /hcgi/api/members/lookup` (bioguide first, then multi-format name match:
 raw → `Last, First` → compound last names). House passes state + district;
-Senate passes state. Client-side name variants remain for the legacy
-PocketBase path only.
+Senate passes state.
 
 ```bash
 # offline unit tests for name variants
@@ -115,7 +117,7 @@ rollcalltrack-ingest/
     __init__.py
     config.py            # env var loading
     ingest_client.py     # Horizons HTTP API (lookup + filing upsert)
-    db.py                # legacy PocketBase helpers
+    db.py                # PocketBase helpers; ingest auth is the API key
     house.py             # House bulk feed download + PDF parsing
     senate.py            # Senate eFD scrape + parsing
     senate_votes.py      # Senate LIS roll calls → /ingest/votes
@@ -234,8 +236,7 @@ Actions workflow (`.github/workflows/usaspending.yml`) is **manual only**
 until Horizons deploys `/hcgi/api/ingest/spending/awards`. Cron is commented
 in the file; re-enable `schedule: cron: "0 9 * * *"` after that route exists.
 `workflow_dispatch` still accepts FY / agency / days-back / max-records.
-Same secrets as disclosures: `HORIZONS_BASE_URL` + `INGEST_API_KEY`
-(`INGEST_KEY` also accepted).
+Same secrets as disclosures: `HORIZONS_BASE_URL` + `INGEST_API_KEY`.
 
 Requests are paced (~1.5s between pages) with retry/backoff on 429/5xx.
 
@@ -892,7 +893,7 @@ Workflow: `.github/workflows/fjc-judges.yml` — **dispatch is primary**
 (`dry_run` defaults to true). Quarterly cron (Jan/Apr/Jul/Oct 15 12:00
 UTC) is a backup and also dry-runs until you dispatch with
 `dry_run=false` after the Horizons route exists. Same secrets:
-`HORIZONS_BASE_URL` + `INGEST_API_KEY` (`INGEST_KEY` also accepted).
+`HORIZONS_BASE_URL` + `INGEST_API_KEY`.
 
 ### Sample payload
 

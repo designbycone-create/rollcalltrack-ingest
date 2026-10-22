@@ -20,7 +20,7 @@ from xml.etree import ElementTree as ET
 import pdfplumber
 import requests
 
-from . import config, db
+from . import config
 from .ingest_client import HorizonsIngestClient, get_client
 
 logger = logging.getLogger("rollcalltrack_ingest.house")
@@ -480,7 +480,8 @@ def run(
       so the daily job rematches filings stored without a member.
     max_filings: optional hard cap (useful for dry-run smoke tests).
     ptr_only: this pass only handles PTRs (FilingType P).
-    client: Horizons HTTP client (preferred). Falls back to PocketBase conn.
+    client: Horizons HTTP client. Live runs require INGEST_API_KEY.
+    conn: ignored. Direct PocketBase writes have been removed.
     """
     year = year or date.today().year
     found, parsed, failed = 0, 0, 0
@@ -489,6 +490,14 @@ def run(
         get_client() if config.use_horizons_api() and not dry_run else None
     )
     use_hz = hz is not None and hz.configured and not dry_run
+    if not dry_run and not use_hz:
+        logger.error("HORIZONS_BASE_URL and INGEST_API_KEY are required")
+        return {
+            "found": 0,
+            "parsed": 0,
+            "failed": 1,
+            "error": "INGEST_API_KEY required",
+        }
 
     try:
         index_records = download_bulk_index(year, session=session)
@@ -497,10 +506,6 @@ def run(
         if use_hz:
             hz.submit_ingestion_log(
                 "house_clerk", 0, 0, 1, note=f"index fetch failed: {e}"
-            )
-        elif conn is not None and not dry_run:
-            db.log_ingestion_run(
-                conn, "house", 0, 0, 1, note=f"index fetch failed: {e}"
             )
         return {"found": 0, "parsed": 0, "failed": 1, "error": "index fetch failed"}
 
@@ -617,55 +622,11 @@ def run(
                 parsed += 1
                 continue
 
-            # --- Legacy PocketBase direct path ---
-            member_id = None
-            member_meta = {}
-            if conn is not None:
-                member_id = db.find_member_id(
-                    conn,
-                    rec["name"],
-                    state_district=rec.get("state_district"),
-                    chamber="house",
-                )
-                if member_id is None:
-                    logger.warning(
-                        "No member match for filer name: %s (state_district=%s) — "
-                        "skipping, needs manual review",
-                        rec["name"],
-                        rec.get("state_district"),
-                    )
-                    failed += 1
-                    continue
-                member_meta = db.get_member(conn, member_id) or {}
-
-            filing = {
-                "member_id": member_id,
-                "chamber": "house",
-                "filing_type": pb_filing_type,
-                "filing_date": rec["filing_date"],
-                "source_url": rec["pdf_url"],
-                "raw_document_type": "pdf",
-                "parse_status": parse_status,
-                "member_name": member_meta.get("name") or rec["name"],
-                "member_party": member_meta.get("party") or "",
-                "member_state": member_meta.get("state") or state_code or "",
-            }
-            filing_id = db.upsert_filing(conn, filing)
-            for txn in txns:
-                txn.update(
-                    {
-                        "filing_id": filing_id,
-                        "member_id": member_id,
-                        "ticker": txn.get("ticker"),
-                        "ticker_confidence": txn.get("ticker_confidence") or "unconfirmed",
-                        "amount_range_low": None,
-                        "amount_range_high": None,
-                        "asset_category": None,
-                    }
-                )
-                db.upsert_transaction(conn, txn)
-
-            parsed += 1
+            logger.error(
+                "House filing %s not submitted: INGEST_API_KEY is required",
+                rec.get("pdf_url"),
+            )
+            failed += 1
         except Exception as e:
             logger.error(
                 "Failed to process House filing %s: %s", rec.get("pdf_url"), e
@@ -674,7 +635,5 @@ def run(
 
     if use_hz:
         hz.submit_ingestion_log("house_clerk", found, parsed, failed)
-    elif conn is not None and not dry_run:
-        db.log_ingestion_run(conn, "house_clerk", found, parsed, failed)
 
     return {"found": found, "parsed": parsed, "failed": failed}

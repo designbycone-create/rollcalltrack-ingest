@@ -12,10 +12,8 @@ from contextlib import nullcontext
 
 from . import (
     config,
-    db,
     house,
     senate,
-    congress_enrich,
     usaspending,
     gao,
     oversight,
@@ -123,25 +121,11 @@ def main():
             "Using Horizons API at %s (X-Ingest-Key configured)",
             config.HORIZONS_BASE_URL,
         )
-    elif not args.dry_run:
-        logger.info("Using legacy PocketBase direct writes")
 
     client = get_client() if use_hz else None
 
-    # PocketBase conn only for legacy path or congress_enrich
-    needs_pb = (
-        not args.dry_run
-        and not use_hz
-        and args.source in ("house", "senate", "all", "congress_enrich")
-    ) or (
-        not args.dry_run
-        and args.source == "congress_enrich"
-    )
-
-    cm = db.get_conn() if needs_pb else nullcontext(None)
-
     results = {}
-    with cm as conn:
+    with nullcontext(None) as conn:
         if args.source in ("house", "all"):
             logger.info("=== Running House ingest ===")
             house_days = args.days_back if args.days_back is not None else 90
@@ -206,12 +190,11 @@ def main():
                     "Skipping congress_enrich under Horizons API mode "
                     "(roster/members owned by Horizons)"
                 )
-            elif conn is not None:
-                results["congress_enrich"] = congress_enrich.run(
-                    conn, dry_run=args.dry_run
-                )
             else:
-                logger.warning("congress_enrich skipped — no PocketBase connection")
+                logger.warning(
+                    "congress_enrich skipped — PocketBase superuser login "
+                    "has been removed"
+                )
 
         if args.source == "usaspending":
             logger.info("=== Running USAspending ingest ===")
