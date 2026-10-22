@@ -315,6 +315,40 @@ def test_lookup_tries_full_name_then_last_name_then_bioguide(monkeypatch):
     assert all("district" not in call for call in calls)
 
 
+def test_lookup_returns_a_bioguide_name_hit_without_another_query(monkeypatch):
+    """A name hit is returned even when its id is the bioguide.
+
+    Continuing past that hit to a bioguide query re-requests after a 429
+    and drops members such as Boozman. Backfill omits a bioguide-shaped
+    member_id before POST.
+    """
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    calls = []
+
+    def fake_lookup(**params):
+        calls.append(params)
+        return {
+            "id": "T000490",
+            "bioguide_id": "T000490",
+            "name": "David J. Taylor",
+            "state": "Ohio",
+            "party": "R",
+        }
+
+    monkeypatch.setattr(hz, "_lookup_http", fake_lookup)
+    monkeypatch.setattr("ingest.ingest_client.match_legislator", lambda *a, **k: None)
+    member = hz.lookup_member_by_name(
+        "David J. Taylor",
+        state="OH",
+        bioguide_id="T000490",
+        chamber="house",
+    )
+    assert member["id"] == "T000490"
+    assert calls == [
+        {"name": "David Taylor", "state": "Ohio", "chamber": "house"},
+    ]
+
+
 def test_lookup_stops_when_full_name_and_state_match(monkeypatch):
     hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
     calls = []
@@ -423,3 +457,31 @@ def test_filing_500_retries_without_member_id(monkeypatch):
     )
     assert seen == ["G000583", None]
     assert result["filing_id"] == "abc"
+
+
+def test_lookup_retries_403_then_returns_the_member(monkeypatch):
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    monkeypatch.setattr("ingest.ingest_client.time.sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def fake_get(path, params=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _Resp(403, "<html>Just a moment")
+        return _Resp(
+            200,
+            {
+                "found": True,
+                "member": {
+                    "id": "j43grpn4xtl9mip",
+                    "bioguide_id": "T000490",
+                    "name": "David J. Taylor",
+                    "party": "R",
+                },
+            },
+        )
+
+    hz._get = fake_get
+    hit = hz._lookup_http(name="David Taylor", state="Ohio")
+    assert calls["n"] == 2
+    assert hit["id"] == "j43grpn4xtl9mip"

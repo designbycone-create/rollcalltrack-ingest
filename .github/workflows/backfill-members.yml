@@ -16,11 +16,17 @@ on:
         required: false
         type: string
         default: ""
+      relink_filing_ids:
+        description: "Optional comma-separated Horizons filing ids with no member_id. Fetches each filing and prints or applies the member link. Skips the member catalog."
+        required: false
+        type: string
+        default: ""
 
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Member disclosure reads share a 100-request / 5-minute public limit.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -46,6 +52,7 @@ jobs:
           INGEST_LIVE: ${{ inputs.mode == 'live' && '1' || '0' }}
           MODE: ${{ inputs.mode }}
           FILING_IDS: ${{ inputs.filing_ids }}
+          RELINK_FILING_IDS: ${{ inputs.relink_filing_ids }}
         run: |
           set -euo pipefail
           mkdir -p backfill-output
@@ -62,6 +69,7 @@ jobs:
               echo "- Mode: \`$MODE\`"
               echo "- Outcome: $outcome"
               echo "- Re-parsed House filing ids: $reparse_note"
+              echo "- Relink Horizons filing ids: \`${RELINK_FILING_IDS:-none}\`"
               echo "- Planned changes: artifact \`planned-changes\`"
               echo ""
               echo '```'
@@ -79,7 +87,25 @@ jobs:
               ;;
           esac
 
-          if [ "$MODE" = "live" ]; then
+          if [ -n "${RELINK_FILING_IDS//[[:space:]]/}" ]; then
+            IFS=',' read -ra RELINK <<< "$RELINK_FILING_IDS"
+            for raw in "${RELINK[@]}"; do
+              id="${raw//[[:space:]]/}"
+              if [ -z "$id" ]; then
+                continue
+              fi
+              if ! [[ "$id" =~ ^[A-Za-z0-9]+$ ]]; then
+                echo "Invalid Horizons filing id: $id" | tee -a "$LOG"
+                write_summary "not started" "failed: invalid relink filing id $id"
+                exit 1
+              fi
+            done
+            if [ "$MODE" = "live" ]; then
+              BACKFILL=(python -m ingest.backfill_members --live --relink-filing-ids "$RELINK_FILING_IDS")
+            else
+              BACKFILL=(python -m ingest.backfill_members --relink-filing-ids "$RELINK_FILING_IDS")
+            fi
+          elif [ "$MODE" = "live" ]; then
             BACKFILL=(python -m ingest.backfill_members --live)
           else
             BACKFILL=(python -m ingest.backfill_members)

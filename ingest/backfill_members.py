@@ -11,6 +11,15 @@ when that list is empty. A bioguide is never sent as ``member_id`` (that
 value makes the writer return HTTP 500, and the retry stores the filing
 with no member link).
 
+Filings are read from ``GET /hcgi/api/members`` and
+``GET /hcgi/api/members/{id}/disclosures``. That catalog cannot see a
+filing whose member_id is blank. ``--relink-filing-ids`` loads those
+Horizons ids from a single-filing GET. No working single-filing GET was
+found: ingest paths return ``{"error":"Route not found"}``, and the
+public id paths were Cloudflare 403 from the probe network. The command
+exits non-zero and names the routes it tried. If the member catalog does
+not answer, the command exits non-zero instead of reporting zero changes.
+
 Dry run is the default. It prints every planned change and does not POST.
 Pass ``--live`` to apply. Existing non-empty fields are left as they are.
 
@@ -25,7 +34,7 @@ import os
 import re
 from collections import defaultdict
 
-from .ingest_client import get_client
+from .ingest_client import DisclosureListError, get_client
 
 logger = logging.getLogger("rollcalltrack_ingest.backfill_members")
 
@@ -196,13 +205,39 @@ def _without_blanks(row: dict, keys: tuple[str, ...]) -> dict:
     return cleaned
 
 
-def run(client, live: bool = False) -> dict:
-    """Plan member links. POST them only when ``live`` is true."""
+def run(client, live: bool = False, relink_filing_ids: list[str] | None = None) -> dict:
+    """Plan member links. POST them only when ``live`` is true.
+
+    ``relink_filing_ids`` loads those Horizons ids directly. The member
+    catalog cannot see a filing whose member_id is blank.
+    """
     if live:
         os.environ["INGEST_LIVE"] = "1"
 
-    filings = list(client.list_disclosure_filings() or [])
-    transactions = list(client.list_disclosure_transactions() or [])
+    relink_ids = [str(item).strip() for item in (relink_filing_ids or []) if str(item).strip()]
+    try:
+        if relink_ids:
+            filings = []
+            transactions = []
+            for filing_id in relink_ids:
+                filing = client.get_disclosure_filing(filing_id)
+                filings.append(filing)
+                transactions.extend(filing.get("transactions") or [])
+        else:
+            filings = list(client.list_disclosure_filings() or [])
+            transactions = list(client.list_disclosure_transactions() or [])
+    except DisclosureListError as exc:
+        _emit(f"backfill failed: {exc}")
+        return {
+            "ok": False,
+            "error": str(exc),
+            "dry_run": not live,
+            "filings_seen": 0,
+            "transactions_seen": 0,
+            "filings_changed": 0,
+            "transactions_changed": 0,
+            "unresolved": 0,
+        }
     grouped = _group_transactions(filings, transactions)
     known_ids = {_filing_key(filing) for filing in filings}
 
@@ -232,10 +267,13 @@ def run(client, live: bool = False) -> dict:
 
         resolved = None
         if _blank(_usable_member_id(filing)) or _blank(_party(filing)):
+            bioguide_hint = _bioguide(filing)
+            if not bioguide_hint and _is_bioguide_id(_member_id(filing)):
+                bioguide_hint = _member_id(filing)
             resolved = client.lookup_member_by_name(
                 filing.get("member_name") or filing.get("name") or "",
                 state=filing.get("member_state") or filing.get("state"),
-                bioguide_id=_bioguide(filing) or None,
+                bioguide_id=bioguide_hint or None,
                 chamber=filing.get("chamber"),
                 office=filing.get("office"),
                 state_district=filing.get("state_district"),
@@ -320,6 +358,7 @@ def run(client, live: bool = False) -> dict:
         )
 
     summary = {
+        "ok": True,
         "dry_run": not live,
         "filings_seen": len(filings),
         "transactions_seen": len(transactions),
@@ -329,7 +368,10 @@ def run(client, live: bool = False) -> dict:
     }
     _emit(
         "backfill "
-        f"dry_run={summary['dry_run']} filings_changed={filings_changed} "
+        f"dry_run={summary['dry_run']} "
+        f"filings_seen={summary['filings_seen']} "
+        f"transactions_seen={summary['transactions_seen']} "
+        f"filings_changed={filings_changed} "
         f"transactions_changed={transactions_changed} unresolved={unresolved}"
     )
     return summary
@@ -347,6 +389,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="POST the planned member updates. Omit this for a dry run.",
     )
+    parser.add_argument(
+        "--relink-filing-ids",
+        default="",
+        help=(
+            "Comma-separated Horizons filing ids to fetch and relink. "
+            "Skips the member catalog, which cannot see a filing with no member_id."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.live:
         os.environ["INGEST_LIVE"] = "1"
@@ -354,10 +404,19 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    result = run(client=get_client(), live=args.live)
+    relink_ids = [part.strip() for part in args.relink_filing_ids.split(",") if part.strip()]
+    kwargs = {"client": get_client(), "live": args.live}
+    if relink_ids:
+        kwargs["relink_filing_ids"] = relink_ids
+    result = run(**kwargs)
+    if not result.get("ok", True):
+        print(result.get("error") or "backfill failed: disclosure list route did not answer")
+        return 1
     print(
         "backfill "
         f"dry_run={result['dry_run']} "
+        f"filings_seen={result.get('filings_seen', 0)} "
+        f"transactions_seen={result.get('transactions_seen', 0)} "
         f"filings_changed={result['filings_changed']} "
         f"transactions_changed={result['transactions_changed']} "
         f"unresolved={result['unresolved']}"

@@ -10,10 +10,9 @@ Submit body shape:
 from __future__ import annotations
 
 import logging
-import re
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import requests
 
@@ -41,6 +40,79 @@ INGEST_BACKOFF_BASE = 5.0
 INGEST_BACKOFF_CAP = 90.0
 
 logger = logging.getLogger("rollcalltrack_ingest.ingest_client")
+
+_PB_META = ("collectionId", "collectionName", "created", "updated")
+# Live reads advertise `ratelimit-policy: 100;w=300` (100 requests / 5 minutes).
+# When those headers are absent, stay under that budget with a fixed gap.
+_LIST_GET_INTERVAL_SECONDS = 3.1
+_RATE_LIMIT_RESERVE = 2
+_LIST_RETRY_STATUS = frozenset({403, 429, 500, 502, 503, 504})
+# Per-member disclosures omit filings whose member_id is blank. These are the
+# public GET shapes that would return one Horizons filing id. Probed
+# 2026-10-22: /hcgi/api/ingest/disclosures/{id} and sibling ingest paths
+# return {"error":"Route not found"}. The five public paths below were
+# Cloudflare 403 HTML from this network, so they were not confirmed against
+# the origin. Collection routes without an id (/hcgi/api/filings,
+# /hcgi/api/disclosures/filings) returned application 404 when the origin
+# was reachable. No working single-filing GET was found.
+_SINGLE_FILING_GETS = (
+    "/hcgi/api/disclosures/{filing_id}",
+    "/hcgi/api/disclosures/filings/{filing_id}",
+    "/hcgi/api/disclosures/filing/{filing_id}",
+    "/hcgi/api/filings/{filing_id}",
+    "/hcgi/api/filing/{filing_id}",
+)
+
+
+class DisclosureListError(RuntimeError):
+    """Raised when no disclosure list route returns filings.
+
+    A missing route must not look like an empty catalog. An empty catalog
+    makes the backfill report zero changes and exit 0.
+    """
+
+
+def _without_server_meta(row: dict) -> dict:
+    return {key: value for key, value in row.items() if key not in _PB_META}
+
+
+def _filing_from_single_payload(data, filing_id: str) -> dict | None:
+    """Pick the filing object out of a single-record JSON body."""
+    if not isinstance(data, dict):
+        return None
+    filing = None
+    if isinstance(data.get("filing"), dict):
+        filing = data["filing"]
+    elif isinstance(data.get("filings"), list):
+        rows = [row for row in data["filings"] if isinstance(row, dict)]
+        filing = next(
+            (row for row in rows if str(row.get("id") or "") == filing_id),
+            None,
+        )
+        if filing is None and len(rows) == 1 and str(rows[0].get("id") or filing_id) == filing_id:
+            filing = rows[0]
+    elif str(data.get("id") or "") == filing_id:
+        filing = data
+    if not isinstance(filing, dict):
+        return None
+    if str(filing.get("id") or filing_id) != filing_id:
+        return None
+    filing = _without_server_meta(dict(filing))
+    raw_txns = filing.get("transactions")
+    if not isinstance(raw_txns, list):
+        raw_txns = data.get("transactions") if isinstance(data.get("transactions"), list) else []
+    owned = []
+    for txn in raw_txns:
+        if not isinstance(txn, dict):
+            continue
+        txn_filing = str(txn.get("filing_id") or filing_id)
+        if txn_filing != filing_id:
+            continue
+        owned.append(_without_server_meta(txn))
+    owned.sort(key=lambda row: (row.get("line_index") is None, row.get("line_index") or 0))
+    filing["transactions"] = owned
+    filing["id"] = filing_id
+    return filing
 
 
 class LookupRateLimited(RuntimeError):
@@ -191,6 +263,11 @@ class HorizonsIngestClient:
         self.timeout = timeout or config.REQUEST_TIMEOUT_SECONDS
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": config.USER_AGENT})
+        self._min_get_interval = 0.0
+        self._last_get_at = 0.0
+        self._ratelimit_remaining = None
+        self._ratelimit_reset = None
+        self._saw_rate_limit = False
         # Name/state/chamber → member or None. Lives for this client (one run).
         self._lookup_cache: dict[tuple[str, str, str, str], dict | None] = {}
 
@@ -198,11 +275,69 @@ class HorizonsIngestClient:
     def configured(self) -> bool:
         return bool(self.base and self.ingest_key)
 
+    def _header_value(self, resp, name: str):
+        headers = getattr(resp, "headers", None) or {}
+        getter = getattr(headers, "get", None)
+        if getter is None:
+            return None
+        for key in (name, name.lower(), name.title()):
+            value = getter(key)
+            if value is not None and str(value).strip() != "":
+                return value
+        return None
+
+    def _note_rate_limit(self, resp) -> None:
+        """Remember `ratelimit-remaining` / `ratelimit-reset` from a public GET."""
+        remaining = self._header_value(resp, "ratelimit-remaining")
+        reset = self._header_value(resp, "ratelimit-reset")
+        try:
+            self._ratelimit_remaining = int(str(remaining).strip())
+            self._saw_rate_limit = True
+        except (TypeError, ValueError):
+            self._ratelimit_remaining = None
+        try:
+            reset_s = float(str(reset).strip())
+            if reset_s > 10000:
+                reset_s = max(0.0, reset_s - time.time())
+            self._ratelimit_reset = reset_s
+            self._saw_rate_limit = True
+        except (TypeError, ValueError):
+            self._ratelimit_reset = None
+        if not self._saw_rate_limit and float(self._min_get_interval or 0) <= 0:
+            self._min_get_interval = _LIST_GET_INTERVAL_SECONDS
+
+    def _pace_get(self) -> None:
+        remaining = getattr(self, "_ratelimit_remaining", None)
+        if remaining is not None and remaining <= _RATE_LIMIT_RESERVE:
+            reset = getattr(self, "_ratelimit_reset", None)
+            wait = 60.0 if reset is None else min(max(float(reset), 1.0), 300.0)
+            logger.info(
+                "public rate limit remaining=%s, pausing %.0fs",
+                remaining,
+                wait,
+            )
+            time.sleep(wait)
+            self._ratelimit_remaining = None
+            self._ratelimit_reset = None
+            self._last_get_at = time.monotonic()
+            return
+        interval = float(getattr(self, "_min_get_interval", 0) or 0)
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        wait = self._last_get_at + interval - now
+        if wait > 0:
+            time.sleep(wait)
+        self._last_get_at = time.monotonic()
+
     def _get(self, path: str, params: dict | None = None) -> requests.Response:
+        self._pace_get()
         url = f"{self.base}{path}"
         if params:
             url = f"{url}?{urlencode(params)}"
-        return self.session.get(url, timeout=self.timeout)
+        resp = self.session.get(url, timeout=self.timeout)
+        self._note_rate_limit(resp)
+        return resp
 
     def _should_retry(self, resp: requests.Response) -> bool:
         if resp.status_code == 429:
@@ -1120,70 +1255,287 @@ class HorizonsIngestClient:
         return data
 
     def list_disclosure_filings(self) -> list[dict]:
-        """Page through stored disclosure filings. Empty list when no route answers."""
-        return self._list_first(
-            (
-                "/hcgi/api/filings",
-                "/hcgi/api/disclosures",
-                "/hcgi/api/disclosures/filings",
-            ),
-            ("items", "filings", "disclosure_filings"),
-        )
+        """Every stored disclosure filing, with that filing's transactions nested.
+
+        Public reads are ``GET /hcgi/api/members`` (paged) and
+        ``GET /hcgi/api/members/{id}/disclosures``. ``/hcgi/api/filings`` and
+        ``/hcgi/api/disclosures/filings`` are not deployed. Raises
+        ``DisclosureListError`` when those reads do not answer.
+        """
+        filings, _transactions = self._disclosure_catalog()
+        return filings
 
     def list_disclosure_transactions(self) -> list[dict]:
-        """Page through stored disclosure transactions."""
-        return self._list_first(
-            (
-                "/hcgi/api/transactions",
-                "/hcgi/api/disclosures/transactions",
-            ),
-            ("items", "transactions"),
-        )
+        """Transactions belonging to the filings from ``list_disclosure_filings``."""
+        _filings, transactions = self._disclosure_catalog()
+        return transactions
 
-    def _list_first(self, paths: tuple[str, ...], item_keys: tuple[str, ...]) -> list[dict]:
-        for path in paths:
-            rows = self._list_pages(path, item_keys)
-            if rows is not None:
-                logger.info("Listed %d rows from %s", len(rows), path)
-                return rows
-        logger.warning("No list route responded for %s", ", ".join(paths))
-        return []
+    def get_disclosure_filing(self, filing_id: str) -> dict:
+        """Load one stored filing by its Horizons id, with its transactions.
 
-    def _list_pages(self, path: str, item_keys: tuple[str, ...]) -> list[dict] | None:
-        """Return rows, or None when this path is not deployed (404)."""
-        out: list[dict] = []
-        page = 1
-        while page <= 200:
+        ``GET /hcgi/api/members/{id}/disclosures`` cannot see a filing that
+        has no member id. This tries the single-record routes. When every
+        one answers 404, it raises ``DisclosureListError`` instead of
+        inventing an empty filing.
+        """
+        filing_id = str(filing_id or "").strip()
+        if not filing_id:
+            raise DisclosureListError("A Horizons filing id is required")
+        tried: list[str] = []
+        blocked: list[str] = []
+        for template in _SINGLE_FILING_GETS:
+            path = template.format(filing_id=quote(filing_id, safe=""))
             try:
-                resp = self._get(path, {"page": page, "limit": 100})
-            except requests.RequestException as e:
-                logger.warning("list %s failed: %s", path, e)
-                return []
-            if resp.status_code == 404:
-                return None
-            if resp.status_code != 200:
-                logger.warning("list %s HTTP %s", path, resp.status_code)
-                return []
+                resp = self._get(path)
+            except requests.RequestException as exc:
+                raise DisclosureListError(f"GET {path} failed: {exc}") from exc
+            if resp.status_code in (429, 500, 502, 503, 504):
+                resp = self._get_ok(path)
+            status = resp.status_code
+            tried.append(f"GET {path} HTTP {status}")
+            if status == 404:
+                continue
+            content_type = ""
+            headers = getattr(resp, "headers", None) or {}
+            getter = getattr(headers, "get", None)
+            if getter:
+                content_type = str(
+                    getter("content-type") or getter("Content-Type") or ""
+                )
+            if status == 403 and "json" not in content_type.lower():
+                blocked.append(path)
+                continue
+            if status != 200:
+                continue
             try:
                 data = resp.json()
             except ValueError:
-                return []
-            rows: list[dict] = []
-            for key in item_keys:
-                candidate = data.get(key)
-                if candidate:
-                    rows = candidate
-                    break
+                blocked.append(path)
+                continue
+            filing = _filing_from_single_payload(data, filing_id)
+            if filing is None:
+                continue
+            logger.info(
+                "Loaded filing %s via %s (%d transactions)",
+                filing_id,
+                path,
+                len(filing.get("transactions") or []),
+            )
+            return filing
+        if blocked and len(blocked) == len(_SINGLE_FILING_GETS):
+            raise DisclosureListError(
+                "Single-filing reads did not reach the app (HTTP 403). "
+                "Tried: " + "; ".join(tried)
+            )
+        raise DisclosureListError(
+            "No single-filing GET route is deployed on /hcgi/api. "
+            "GET /hcgi/api/members/{id}/disclosures only lists filings already "
+            "linked to a member, so a filing with no member_id cannot be "
+            "loaded that way. Tried: " + "; ".join(tried)
+        )
+
+    def _disclosure_catalog(self) -> tuple[list[dict], list[dict]]:
+        cached = getattr(self, "_disclosure_catalog_cache", None)
+        if cached is not None:
+            return cached
+        catalog = self._fetch_disclosure_catalog()
+        self._disclosure_catalog_cache = catalog
+        return catalog
+
+    def _fetch_disclosure_catalog(self) -> tuple[list[dict], list[dict]]:
+        # The public API allows 100 reads per 300 seconds. `_get` waits out
+        # `ratelimit-reset` before the window is spent, so a 429 does not
+        # turn into a partial filing list.
+        members = self._list_federal_members()
+        filings_by_id: dict[str, dict] = {}
+        transactions: list[dict] = []
+        seen_tx: set[tuple[str, str, str]] = set()
+        disclosures_ok = 0
+        for member in members:
+            member_key = str(member.get("id") or member.get("bioguide_id") or "").strip()
+            if not member_key:
+                continue
+            path = f"/hcgi/api/members/{quote(member_key, safe='')}/disclosures"
+            try:
+                resp = self._get_ok(path)
+            except Exception as exc:
+                raise DisclosureListError(
+                    f"GET {path} failed: {exc}. Refusing a partial filing list."
+                ) from exc
+            if resp.status_code == 404:
+                continue
+            if resp.status_code != 200:
+                raise DisclosureListError(
+                    f"GET {path} HTTP {resp.status_code}. "
+                    "Refusing a partial filing list."
+                )
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise DisclosureListError(
+                    f"GET {path} did not return JSON. Refusing a partial filing list."
+                ) from exc
+            disclosures_ok += 1
+            if disclosures_ok % 50 == 0 or disclosures_ok == 1:
+                logger.info(
+                    "disclosure list progress members=%d filings=%d remaining=%s",
+                    disclosures_ok,
+                    len(filings_by_id),
+                    getattr(self, "_ratelimit_remaining", None),
+                )
+            member_filings = [
+                _without_server_meta(row)
+                for row in (data.get("filings") or [])
+                if isinstance(row, dict)
+            ]
+            member_txns = [
+                _without_server_meta(row)
+                for row in (data.get("transactions") or [])
+                if isinstance(row, dict)
+            ]
+            grouped: dict[str, list[dict]] = {}
+            for txn in member_txns:
+                filing_id = str(txn.get("filing_id") or "").strip()
+                identity = (
+                    filing_id,
+                    str(txn.get("id") or ""),
+                    str(txn.get("line_index")),
+                )
+                if identity in seen_tx:
+                    continue
+                seen_tx.add(identity)
+                transactions.append(txn)
+                grouped.setdefault(filing_id, []).append(txn)
+            for filing in member_filings:
+                filing_id = str(filing.get("id") or "").strip()
+                owned = grouped.get(filing_id, [])
+                owned.sort(key=lambda row: (row.get("line_index") is None, row.get("line_index") or 0))
+                if filing_id and filing_id in filings_by_id:
+                    existing = filings_by_id[filing_id]
+                    have = {
+                        (
+                            str(row.get("id") or ""),
+                            str(row.get("line_index")),
+                        )
+                        for row in existing.get("transactions") or []
+                    }
+                    for txn in owned:
+                        key = (str(txn.get("id") or ""), str(txn.get("line_index")))
+                        if key not in have:
+                            existing.setdefault("transactions", []).append(txn)
+                    continue
+                filing = dict(filing)
+                filing["transactions"] = owned
+                key = filing_id or str(filing.get("source_url") or len(filings_by_id))
+                filings_by_id[key] = filing
+        if disclosures_ok == 0:
+            raise DisclosureListError(
+                "GET /hcgi/api/members/{id}/disclosures did not return a filing list. "
+                "GET /hcgi/api/filings, /hcgi/api/disclosures/filings, and "
+                "/hcgi/api/transactions are not deployed."
+            )
+        filings = list(filings_by_id.values())
+        house = sum(1 for row in filings if str(row.get("chamber") or "").lower() == "house")
+        senate = sum(1 for row in filings if str(row.get("chamber") or "").lower() == "senate")
+        logger.info(
+            "Listed %d filings (%d House, %d Senate) and %d transactions "
+            "from %d members via /hcgi/api/members/{id}/disclosures",
+            len(filings),
+            house,
+            senate,
+            len(transactions),
+            disclosures_ok,
+        )
+        return filings, transactions
+
+    def _list_federal_members(self) -> list[dict]:
+        """Page GET /hcgi/api/members?jurisdiction=federal."""
+        out: list[dict] = []
+        page = 1
+        limit = 100
+        while page <= 30:
+            path = "/hcgi/api/members"
+            try:
+                resp = self._get_ok(
+                    path,
+                    {"page": page, "limit": limit, "jurisdiction": "federal"},
+                )
+            except requests.RequestException as exc:
+                raise DisclosureListError(
+                    f"GET {path} failed: {exc}"
+                ) from exc
+            if resp.status_code == 429:
+                raise DisclosureListError(
+                    f"GET {path} stayed rate-limited (HTTP 429)"
+                )
+            if resp.status_code == 404:
+                raise DisclosureListError(
+                    "GET /hcgi/api/members returned 404. "
+                    "Disclosure filings are not listed on /hcgi/api/filings, "
+                    "/hcgi/api/disclosures, or /hcgi/api/disclosures/filings."
+                )
+            if resp.status_code != 200:
+                raise DisclosureListError(
+                    f"GET {path} HTTP {resp.status_code}"
+                )
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise DisclosureListError(
+                    f"GET {path} did not return JSON"
+                ) from exc
+            rows = data.get("items") or data.get("members") or []
+            if not isinstance(rows, list):
+                raise DisclosureListError(f"GET {path} items were not a list")
+            out.extend(row for row in rows if isinstance(row, dict))
             if not rows:
                 break
-            out.extend(rows)
             total = data.get("total")
+            total_pages = data.get("totalPages")
             if total is not None and len(out) >= int(total):
                 break
-            if len(rows) < 100:
+            if total_pages is not None and page >= int(total_pages):
+                break
+            if total is None and total_pages is None and len(rows) < limit:
                 break
             page += 1
         return out
+
+    def _get_ok(self, path: str, params: dict | None = None, attempts: int = 8):
+        """GET, backing off on rate limits and transient gateway errors.
+
+        HTTP 429 waits for ``ratelimit-reset`` (applied on the next ``_get``)
+        instead of sending another request into the same window.
+        """
+        delay = 3.0
+        last = None
+        for attempt in range(attempts):
+            try:
+                last = self._get(path, params)
+            except Exception as exc:
+                if attempt == attempts - 1:
+                    raise
+                logger.warning("list %s error %s, retry in %ss", path, exc, delay)
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+                continue
+            if last.status_code not in _LIST_RETRY_STATUS:
+                return last
+            # A few full windows are enough. More retries would sit here for
+            # tens of minutes and still not be a complete catalog.
+            if last.status_code == 429 and attempt >= 3:
+                break
+            if attempt == attempts - 1:
+                break
+            if last.status_code == 429 and getattr(self, "_ratelimit_reset", None):
+                logger.warning("list %s HTTP 429, waiting for ratelimit-reset", path)
+                continue
+            logger.warning(
+                "list %s HTTP %s, retry in %ss", path, last.status_code, delay
+            )
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+        return last
 
     def lookup_member_by_name(
         self,
@@ -1273,6 +1625,9 @@ class HorizonsIngestClient:
                 )
                 rate_limited = True
                 return None
+            # Return the name hit even when its id is the bioguide.
+            # A follow-up bioguide query after a 429 dropped Boozman.
+            # Backfill omits a bioguide-shaped member_id before POST.
             return accept_name_hit(candidate, member)
 
         for candidate in lookup_names:
@@ -1374,18 +1729,20 @@ class HorizonsIngestClient:
                 )
                 time.sleep(delay)
                 continue
-            if resp.status_code != 429:
+            # 403 is a challenge page, not a definitive miss. 429 is the
+            # public rate limit. Both are retried; exhausting them raises.
+            if resp.status_code not in (403, 429):
                 break
             if attempt == LOOKUP_ATTEMPTS - 1:
                 body = (resp.text or "")[:200]
-                logger.warning("lookup HTTP 429: %s", body)
+                logger.warning("lookup HTTP %s: %s", resp.status_code, body)
                 raise LookupRateLimited(
-                    f"lookup HTTP 429 after {LOOKUP_ATTEMPTS} attempts: {body}"
+                    f"lookup HTTP {resp.status_code} after {LOOKUP_ATTEMPTS} attempts: {body}"
                 )
             delay = backoff_seconds(
                 attempt, resp, base=LOOKUP_BACKOFF_BASE, cap=LOOKUP_BACKOFF_CAP
             )
-            logger.warning("lookup HTTP 429, retry in %.1fs", delay)
+            logger.warning("lookup HTTP %s, retry in %.1fs", resp.status_code, delay)
             time.sleep(delay)
         if resp is None:
             return None
