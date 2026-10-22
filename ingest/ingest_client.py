@@ -1629,18 +1629,20 @@ class HorizonsIngestClient:
                 )
                 time.sleep(delay)
                 continue
-            if resp.status_code != 429:
+            # 403 is a challenge page, not a definitive miss. 429 is the
+            # public rate limit. Both are retried; exhausting them raises.
+            if resp.status_code not in (403, 429):
                 break
             if attempt == LOOKUP_ATTEMPTS - 1:
                 body = (resp.text or "")[:200]
-                logger.warning("lookup HTTP 429: %s", body)
+                logger.warning("lookup HTTP %s: %s", resp.status_code, body)
                 raise LookupRateLimited(
-                    f"lookup HTTP 429 after {LOOKUP_ATTEMPTS} attempts: {body}"
+                    f"lookup HTTP {resp.status_code} after {LOOKUP_ATTEMPTS} attempts: {body}"
                 )
             delay = backoff_seconds(
                 attempt, resp, base=LOOKUP_BACKOFF_BASE, cap=LOOKUP_BACKOFF_CAP
             )
-            logger.warning("lookup HTTP 429, retry in %.1fs", delay)
+            logger.warning("lookup HTTP %s, retry in %.1fs", resp.status_code, delay)
             time.sleep(delay)
         if resp is None:
             return None

@@ -458,3 +458,31 @@ def test_filing_500_retries_without_member_id(monkeypatch):
     )
     assert seen == ["G000583", None]
     assert result["filing_id"] == "abc"
+
+
+def test_lookup_retries_403_then_returns_the_member(monkeypatch):
+    hz = HorizonsIngestClient("https://example.test", "not-a-real-key")
+    monkeypatch.setattr("ingest.ingest_client.time.sleep", lambda _seconds: None)
+    calls = {"n": 0}
+
+    def fake_get(path, params=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _Resp(403, "<html>Just a moment")
+        return _Resp(
+            200,
+            {
+                "found": True,
+                "member": {
+                    "id": "j43grpn4xtl9mip",
+                    "bioguide_id": "T000490",
+                    "name": "David J. Taylor",
+                    "party": "R",
+                },
+            },
+        )
+
+    hz._get = fake_get
+    hit = hz._lookup_http(name="David Taylor", state="Ohio")
+    assert calls["n"] == 2
+    assert hit["id"] == "j43grpn4xtl9mip"
