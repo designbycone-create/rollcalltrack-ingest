@@ -21,6 +21,13 @@ import pdfplumber
 import requests
 
 from . import config
+from .house_ptr_ocr import (
+    _plausible_asset,
+    page_has_ptr_grid,
+    parse_ptr_date,
+    restore_asset_spacing,
+    transactions_from_ptr_image,
+)
 from .ingest_client import HorizonsIngestClient, get_client
 
 logger = logging.getLogger("rollcalltrack_ingest.house")
@@ -283,18 +290,53 @@ def _ocr_with_pdf2image(content: bytes) -> str:
         logger.warning("pdf2image failed: %s", e)
         return ""
     parts = []
+    table_rows: list[dict] = []
+    # LSTM, a single text block, and real spaces between words. Cell OCR
+    # uses its own psm; this is the fallback when the ruling lines are missing.
+    page_config = "--psm 6 -c preserve_interword_spaces=1"
     for image in images:
         try:
             image = _upright_page(image, pytesseract.image_to_osd)
             gray = ImageOps.autocontrast(image.convert("L"))
-            parts.append(pytesseract.image_to_string(gray, config="--psm 6") or "")
         except Exception as e:
             logger.warning("House PTR OCR failed: %s", e)
+            continue
+        rows: list[dict] = []
+        try:
+            rows = transactions_from_ptr_image(gray) or []
+        except Exception as e:
+            logger.warning("House PTR table OCR failed: %s", e)
+            rows = []
+        if rows:
+            table_rows.extend(rows)
+            continue
+        # The checkbox grid was found and every band was rejected (instructions,
+        # a blank continuation, or an unreadable date). Full-page text would
+        # turn those same lines into false trades.
+        try:
+            grid = page_has_ptr_grid(gray)
+        except Exception as e:
+            logger.warning("House PTR grid check failed: %s", e)
+            grid = False
+        if grid:
+            continue
+        try:
+            parts.append(pytesseract.image_to_string(gray, config=page_config) or "")
+        except Exception as e:
+            logger.warning("House PTR OCR failed: %s", e)
+    if table_rows:
+        fallback = _transactions_from_scanned_ptr("\n".join(parts))
+        return _encode_ptr_rows(table_rows + fallback)
     return "\n".join(parts)
 
 
+_PTR_MARK = "@@PTR@@"
 _SCAN_OWNER_RE = re.compile(r"\b(SP|JT|DC)\b", re.IGNORECASE)
-_SCAN_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+_SCAN_DATE_RE = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b")
+_SCAN_AMOUNT_RE = re.compile(
+    r"\$[\d,]+\s*-\s*\$[\d,]+|Over\s+\$[\d,]+",
+    re.IGNORECASE,
+)
 _SCAN_HEADER_SNIPS = (
     "FULL ASSET",
     "TICKER",
@@ -303,53 +345,107 @@ _SCAN_HEADER_SNIPS = (
     "AMOUNT OF TRANSACTION",
     "TYPE OF TRANSACTION",
     "CLERK OF THE",
+    "NOTHING TO REPORT",
+    "EXAMPLE MEGA",
+    "UNITED STATES HOUSE",
+    "PERIODIC TRANSACTION",
 )
 
 
 def _pad_scan_date(month: str, day: str, year: str) -> str | None:
-    try:
-        month_n = int(month)
-        day_n = int(day)
-    except ValueError:
-        return None
-    if not (1 <= month_n <= 12 and 1 <= day_n <= 31 and len(year) == 4):
-        return None
-    return f"{month_n:02d}/{day_n:02d}/{year}"
+    return parse_ptr_date(f"{month}/{day}/{year}")
+
+
+def _encode_ptr_rows(rows: list[dict]) -> str:
+    """Internal lines so checkbox rows keep an empty amount or owner."""
+    lines = []
+    for row in rows:
+        asset = (row.get("asset_name") or "").replace("\t", " ").replace("\n", " ")
+        fields = [
+            _PTR_MARK,
+            row.get("filer_relation") or "self",
+            row.get("transaction_type") or "other",
+            row.get("transaction_date") or "",
+            row.get("notification_date") or "",
+            row.get("amount_range_raw") or "",
+            asset,
+        ]
+        lines.append("\t".join(fields))
+    return "\n".join(lines)
+
+
+def _decode_ptr_rows(text: str) -> list[dict]:
+    rows = []
+    for line in (text or "").splitlines():
+        if not line.startswith(_PTR_MARK + "\t"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        asset = parts[6].strip()
+        txn_date = parts[3].strip()
+        if not asset or not txn_date:
+            continue
+        ticker, ticker_confidence = extract_ticker(asset)
+        row = {
+            "asset_name": asset,
+            "filer_relation": parts[1].strip() or "self",
+            "transaction_type": parts[2].strip() or "other",
+            "transaction_date": txn_date,
+            "amount_range_raw": parts[5].strip(),
+            "ticker": ticker,
+            "ticker_confidence": ticker_confidence,
+            "line_index": len(rows),
+        }
+        notify = parts[4].strip()
+        if notify:
+            row["notification_date"] = notify
+        rows.append(row)
+    return rows
 
 
 def _transactions_from_scanned_ptr(text: str) -> list[dict]:
     """Rows from a checkbox PTR scan.
 
-    The printed amount is a checked column, not ``$low - $high`` on the
-    asset line, so the normal row regex never matches. Keep the owner,
-    asset, and date. Leave the amount blank rather than invent a range.
+    Table OCR emits ``@@PTR@@`` lines with the checkbox amount filled in.
+    Plain OCR text still has to show an owner code, a second date, or a
+    printed dollar range before a line counts. A line that does not say
+    which amount box was checked keeps a blank amount.
     """
+    marked = _decode_ptr_rows(text or "")
+    if marked:
+        return marked
     transactions: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
     for raw in (text or "").splitlines():
         line = raw.strip()
         if len(line) < 12:
             continue
-        owner_m = _SCAN_OWNER_RE.search(line)
-        if not owner_m:
-            continue
-        date_m = _SCAN_DATE_RE.search(line, owner_m.end())
+        date_m = _SCAN_DATE_RE.search(line)
         if not date_m:
             continue
         txn_date = _pad_scan_date(*date_m.groups())
-        if not txn_date:
+        # 01/11/2010 is the revision date printed on the form.
+        if not txn_date or txn_date == "01/11/2010":
             continue
-        body = line[owner_m.end() : date_m.start()]
+        prefix = line[: date_m.start()]
+        owner_m = _SCAN_OWNER_RE.search(prefix)
+        owner = owner_m.group(1).upper() if owner_m else ""
+        body = prefix[owner_m.end() :] if owner_m else prefix
         cleaned = re.sub(r"[^A-Za-z0-9&.() ]+", " ", body)
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" .,&")
         type_in_body = re.search(r"(?:^|\s)([PSE])\s*$", cleaned)
         if type_in_body:
             cleaned = cleaned[: type_in_body.start()].strip(" .,&")
+        cleaned = restore_asset_spacing(cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
         letters = re.sub(r"[^A-Za-z]", "", cleaned)
         if len(letters) < 8:
             continue
         upper = cleaned.upper()
         if any(snip in upper for snip in _SCAN_HEADER_SNIPS):
+            continue
+        if not _plausible_asset(cleaned):
             continue
         tail = line[date_m.end() :]
         if type_in_body:
@@ -361,20 +457,25 @@ def _transactions_from_scanned_ptr(text: str) -> list[dict]:
             ttype = "sale_partial"
         else:
             ttype = _TYPE_MAP.get(type_token, "other")
-        owner = owner_m.group(1).upper()
+        notify = _SCAN_DATE_RE.search(tail)
+        notification = _pad_scan_date(*notify.groups()) if notify else None
+        amount_m = _SCAN_AMOUNT_RE.search(line)
+        amount = re.sub(r"\s+", " ", amount_m.group(0)).strip() if amount_m else ""
+        # Without an owner code, require a second date or a printed range
+        # so a header fragment with one date does not become a trade.
+        if not owner and not notification and not amount:
+            continue
         key = (upper, txn_date, owner)
         if key in seen:
             continue
         seen.add(key)
-        notify = _SCAN_DATE_RE.search(tail)
-        notification = _pad_scan_date(*notify.groups()) if notify else None
         ticker, ticker_confidence = extract_ticker(cleaned)
         row = {
             "asset_name": cleaned,
             "filer_relation": _OWNER_MAP.get(owner, "self"),
             "transaction_type": ttype,
             "transaction_date": txn_date,
-            "amount_range_raw": "",
+            "amount_range_raw": amount,
             "ticker": ticker,
             "ticker_confidence": ticker_confidence,
             "line_index": len(transactions),
