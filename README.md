@@ -1260,12 +1260,65 @@ call is still posted and `member_votes` is omitted.
 ```bash
 python -m ingest.main --source senate_votes --dry-run --max-records 5
 python -m ingest.main --source senate_votes --congress 119 --session 1 --dry-run
+python -m ingest.main --source senate_votes --senate-session 1 --dry-run
+python -m ingest.main --source senate_votes --senate-session all --live
 ```
 
-`--source all` (the daily workflow) always uses the current congress
-and session and ignores `--days-back`, so a disclosure window cannot
-drop older rolls in the same session. `--congress` and `--session` apply
-only with `--source senate_votes`.
+`--source all` (the daily workflow and `scripts/run_daily_ingest.ps1`)
+always uses the current congress and session and ignores `--days-back`,
+`--session`, and `--senate-session`, so a disclosure window cannot drop
+older rolls in the same session and a manual backfill flag cannot widen
+the cron. `--congress` and `--session` apply only with
+`--source senate_votes`.
+
+### Backfill session 1 (2025)
+
+The daily job only posts the current session. As of 2026-10-22 that is
+session 2 (`s-119-2026-N`, rolls 1–256 from `vote_menu_119_2.xml`).
+Session 1 (`vote_menu_119_1.xml`, about 650 rolls, ids `s-119-2025-N`)
+is a manual backfill. It uses the same parser: question, en-bloc
+results, Eastern Time offsets, and member positions.
+
+Actions → **Disclosure Ingest** → **Run workflow**:
+
+| Input | Values |
+|-------|--------|
+| `senate_session` | `current` (default; same as the cron), `1`, `2`, or `all` |
+| `dry_run` | `true` parses and does not POST. `false` posts. The cron ignores this and posts. |
+
+Run `senate_session=1` with `dry_run=true` first, then the same choice
+with `dry_run=false`. `all` posts session 1 and then session 2. A
+dispatch that is not `current` runs Senate roll calls only, so it does
+not also re-ingest House and Senate disclosures. Leave the inputs at
+`current` / `false` to repeat the daily job by hand.
+
+Vote POSTs go out in batches of 25 (one request each) with 3.1s between
+batches. That is the same gap as the public list reads. The origin
+budget is about 100 requests / 5 minutes (`ratelimit-policy: 100;w=300`).
+A refused POST still waits on `Retry-After` inside the existing ingest
+backoff. Re-runs send the same `s-119-2025-N` id and the same detail
+`source_url`, which is the upsert key.
+
+A menu of 650 rolls is 26 vote batches plus one ingestion log: **27**
+origin requests. Session 2's 256 stored rolls are 11 batches. Every
+further 25 rolls is one more POST. senate.gov and the legislator roster
+are not origin requests.
+
+| | Session 1 (~650 rolls) | `all` (~650 + 256 session-2 rolls) |
+|--|-----------|-----------------------------------------------|
+| senate.gov menu + detail GETs | 1 + ~650 | 2 + ~906 |
+| congress-legislators GET | 1 | 1 |
+| Origin POSTs | 26 batches + 1 log = **27** | 26 + 11 batches + 2 logs = **39** |
+| Share of 100 requests / 5 min | 27 | 39 |
+| Expected duration | about 15–30 min | about 25–40 min |
+
+Detail XML is the long pole: 0.5s between senate.gov fetches, plus
+response time. The origin calls themselves are about a minute and a
+half of pacing. A dry run does the same senate.gov fetches and zero
+origin POSTs. The job timeout is 90 minutes, which also covers a
+`Retry-After` wait. Do not overlap this with the 09:00 UTC scheduled
+ingest; they share the origin budget. A second live run repeats the
+same POSTs and updates rows in place.
 
 ## Judicial nominations (`judicial-nominations-sync`)
 

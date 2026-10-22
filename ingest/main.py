@@ -123,6 +123,17 @@ def main():
         help="LegiScan session_id, or Senate session 1 or 2 (senate_votes)",
     )
     parser.add_argument(
+        "--senate-session",
+        choices=["current", "1", "2", "all"],
+        default=None,
+        help=(
+            "Senate roll calls only (--source senate_votes). "
+            "current is today's session. 1 or 2 is that session of --congress "
+            "(default: the current congress). all is sessions 1 and 2. "
+            "Ignored for --source all, which always uses the current session."
+        ),
+    )
+    parser.add_argument(
         "--agency",
         default=None,
         help="Agency name/abbrev (usaspending or oversight)",
@@ -188,28 +199,52 @@ def main():
         if args.source in ("senate_votes", "all"):
             logger.info("=== Running Senate roll-call ingest ===")
             max_r = args.max_records
-            if args.dry_run and max_r is None:
-                max_r = 5
-            # --days-back / --congress / --session on --source all belong to
-            # the disclosure and LegiScan flags. The daily job posts the
-            # full current Senate session.
-            if args.source == "senate_votes":
-                vote_congress = args.congress
-                vote_session = args.session
-                vote_days = args.days_back
-            else:
-                vote_congress = None
-                vote_session = None
-                vote_days = None
-            results["senate_votes"] = senate_votes.run(
-                congress=vote_congress,
-                session=vote_session,
-                days_back=vote_days,
-                max_records=max_r,
-                dry_run=args.dry_run,
-                fetch_details=True,
-                client=client,
+            # A manual session backfill must report the whole menu. The
+            # casual --dry-run cap of 5 stays for the daily source and for
+            # --senate-session current.
+            explicit_backfill = args.source == "senate_votes" and args.senate_session not in (
+                None,
+                "current",
             )
+            if args.dry_run and max_r is None and not explicit_backfill:
+                max_r = 5
+            # --days-back / --congress / --session / --senate-session on
+            # --source all belong to the disclosure and LegiScan flags.
+            # The daily job posts the full current Senate session only.
+            if args.source == "senate_votes" and args.senate_session:
+                if args.session is not None:
+                    logger.warning(
+                        "--senate-session %s overrides --session %s",
+                        args.senate_session,
+                        args.session,
+                    )
+                results["senate_votes"] = senate_votes.run_sessions(
+                    senate_session=args.senate_session,
+                    congress=args.congress,
+                    days_back=args.days_back,
+                    max_records=max_r,
+                    dry_run=args.dry_run,
+                    fetch_details=True,
+                    client=client,
+                )
+            else:
+                if args.source == "senate_votes":
+                    vote_congress = args.congress
+                    vote_session = args.session
+                    vote_days = args.days_back
+                else:
+                    vote_congress = None
+                    vote_session = None
+                    vote_days = None
+                results["senate_votes"] = senate_votes.run(
+                    congress=vote_congress,
+                    session=vote_session,
+                    days_back=vote_days,
+                    max_records=max_r,
+                    dry_run=args.dry_run,
+                    fetch_details=True,
+                    client=client,
+                )
 
         if args.source in ("congress_enrich", "all"):
             logger.info("=== Running Congress.gov enrichment ===")

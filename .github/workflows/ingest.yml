@@ -3,12 +3,33 @@ name: Disclosure Ingest
 on:
   schedule:
     - cron: "0 9 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      senate_session:
+        description: "Senate rolls to post. current = today's session only. 1 = session 1 (119th Congress is 2025, ids s-119-2025-N). all = sessions 1 and 2. Scheduled runs ignore this."
+        required: false
+        type: choice
+        default: current
+        options:
+          - current
+          - "1"
+          - "2"
+          - all
+      dry_run:
+        description: "true = parse and do not POST. Scheduled runs ignore this and post. Set true before a session 1 or all backfill."
+        required: false
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Session 1 is 650+ detail XML fetches. The daily job is much shorter
+    # and still exits when it finishes.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -25,11 +46,42 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tesseract-ocr poppler-utils
 
       - name: Run ingest
-        # --source all is House/Senate disclosures plus Senate roll calls.
-        # senate.gov blocks the Hostinger IP, so this runner fetches LIS XML.
+        # Scheduled runs are House/Senate disclosures plus the current Senate
+        # session only. senate.gov blocks the Hostinger IP, so this runner
+        # fetches LIS XML. A dispatch with senate_session=1 or all backfills
+        # that session and does not re-run disclosures.
         env:
           # Horizons HTTP ingest API. Auth is X-Ingest-Key from INGEST_API_KEY.
           HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
           INGEST_LIVE: "1"
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
-        run: python -m ingest.main --source all --live
+        run: |
+          set -euo pipefail
+          # Scheduled runs stay on the current Senate session. Inputs are dispatch-only.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            python -m ingest.main --source all --live
+            exit 0
+          fi
+          SESSION="${{ inputs.senate_session }}"
+          SESSION="${SESSION:-current}"
+          DRY="${{ inputs.dry_run }}"
+          DRY="${DRY:-false}"
+          case "$SESSION" in
+            current|1|2|all) ;;
+            *)
+              echo "Invalid senate_session: $SESSION" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$SESSION" = "current" ]; then
+            CMD=(python -m ingest.main --source all)
+          else
+            CMD=(python -m ingest.main --source senate_votes --senate-session "$SESSION")
+          fi
+          if [ "$DRY" = "true" ]; then
+            CMD+=(--dry-run)
+          else
+            CMD+=(--live)
+          fi
+          echo "Running: ${CMD[*]}"
+          "${CMD[@]}"
