@@ -270,7 +270,9 @@ Content-Type: application/json
         "transaction_date": "07/24/2026",
         "notification_date": "08/01/2026",
         "amount_range_raw": "$15,001 - $50,000",
-        "ticker_confidence": "none"
+        "ticker": "BWXT",
+        "ticker_confidence": "medium",
+        "line_index": 0
       }
     ]
   }
@@ -278,6 +280,11 @@ Content-Type: application/json
 ```
 
 ---
+
+Transaction identity is `filing_id` + `line_index` (0-based position in the
+filing). A PTR can list the same asset, date, and amount twice; those are two
+rows. Persist `line_index`, `ticker`, and `ticker_confidence` from the
+payload. `ticker` may be an empty string when the form has no symbol.
 
 ## 4. Success criteria after you ship
 

@@ -23,8 +23,10 @@ Auth is a single header: `X-Ingest-Key`. No superuser password required.
      `https://<app-id>.app-preview.com`
    - `INGEST_API_KEY` — sent as `X-Ingest-Key` (from Horizons env vars)
 3. Test parse-only (no API): `python -m ingest.main --source house --dry-run`
-4. Test a real write once secrets are set (members must already exist in
-   Horizons for name matching to succeed).
+4. A real write requires `--live` or `INGEST_LIVE=1` in addition to the
+   secrets (members must already exist in Horizons for name matching to
+   succeed). Pytest never posts to that endpoint: tests stay dry-run even
+   if the variable is set in the environment.
 
 ## Running on a schedule (free options)
 
@@ -96,6 +98,24 @@ python -m ingest.main --source senate --dry-run
 # optional: widen window / raise cap
 python -m ingest.main --source house --dry-run --days-back 60 --max-filings 10
 ```
+
+### Re-ingest one House filing
+
+Each parsed transaction has a `line_index`: its 0-based position in that
+filing. Identical trades (same asset, date, and amount) stay separate rows.
+Stored rows that were collapsed before this, or that have a null ticker, can
+be re-posted by House DocID. `--filing-id` ignores `--days-back` and
+`--max-filings`. Pass `--year` when the DocID is not in the current year.
+The flag is only valid with `--source house`.
+
+```bash
+python -m ingest.main --source house --live --filing-id 20035588
+python -m ingest.main --source house --live --filing-id 20035588 --year 2026
+```
+
+Kevin Hern's PTR `20035588` is the case this fixes: 24 transaction lines,
+including two identical Lockheed Martin partial sales (source lines 47 and
+51), of which only 23 were stored.
 
 ### Member matching
 

@@ -2,11 +2,14 @@
   python -m ingest.main --source all
   python -m ingest.main --source house --dry-run
   python -m ingest.main --source senate --max-filings 1
+  python -m ingest.main --source house --filing-id 20035588
+  python -m ingest.main --source house --live
 """
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from contextlib import nullcontext
 
@@ -66,6 +69,14 @@ def main():
         help="Parse and log but don't write (no secrets required for house/senate)",
     )
     parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Post filings and transactions to the configured endpoint. "
+            "Required unless INGEST_LIVE=1. Tests cannot use this to reach production."
+        ),
+    )
+    parser.add_argument(
         "--full-refresh",
         action="store_true",
         help="Full directory refresh (fjc; this job has no incremental mode)",
@@ -78,6 +89,15 @@ def main():
     parser.add_argument("--year", type=int, default=None)
     parser.add_argument("--days-back", type=int, default=None)
     parser.add_argument("--max-filings", type=int, default=None)
+    parser.add_argument(
+        "--filing-id",
+        default=None,
+        help=(
+            "Re-ingest one House filing by DocID (for example 20035588). "
+            "Ignores --days-back and --max-filings. Use with --source house. "
+            "Pass --year when that DocID is not in the current calendar year."
+        ),
+    )
     parser.add_argument("--max-records", type=int, default=None)
     parser.add_argument("--fiscal-year", type=int, default=None)
     parser.add_argument(
@@ -109,6 +129,15 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.live:
+        os.environ["INGEST_LIVE"] = "1"
+
+    if args.filing_id and args.source != "house":
+        logger.error(
+            "--filing-id re-ingests one House filing; pass --source house"
+        )
+        sys.exit(1)
+
     try:
         config.require_config(dry_run=args.dry_run, source=args.source)
     except RuntimeError as e:
@@ -139,6 +168,7 @@ def main():
                 days_back=house_days,
                 max_filings=max_f,
                 client=client,
+                filing_id=args.filing_id,
             )
 
         if args.source in ("senate", "all"):

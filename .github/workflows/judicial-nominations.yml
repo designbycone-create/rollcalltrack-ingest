@@ -41,6 +41,7 @@ jobs:
       - name: Run judicial nomination linker
         env:
           HORIZONS_BASE_URL: ${{ secrets.HORIZONS_BASE_URL }}
+          INGEST_LIVE: "1"
           INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
           CONGRESS_GOV_API_KEY: ${{ secrets.CONGRESS_GOV_API_KEY }}
         run: |

@@ -18,6 +18,7 @@ from urllib.parse import urlencode
 import requests
 
 from . import config
+from .guards import assert_remote_post_allowed, skip_reason
 from .legislators import match_legislator
 from .names import (
     member_record_compatible,
@@ -74,12 +75,13 @@ def clean_transaction(txn: dict) -> dict:
         "transaction_type": _map_txn_type(txn.get("transaction_type")),
         "transaction_date": txn.get("transaction_date") or "",
         "amount_range_raw": txn.get("amount_range_raw") or "",
+        "ticker": (txn.get("ticker") or "").strip(),
         "ticker_confidence": _map_ticker_conf(txn.get("ticker_confidence")),
     }
+    if txn.get("line_index") is not None:
+        out["line_index"] = int(txn["line_index"])
     if txn.get("notification_date"):
         out["notification_date"] = txn["notification_date"]
-    if txn.get("ticker"):
-        out["ticker"] = txn["ticker"]
     if txn.get("asset_category"):
         out["asset_category"] = txn["asset_category"]
     if txn.get("amount_range_low") is not None:
@@ -123,6 +125,7 @@ class HorizonsIngestClient:
         return False
 
     def _post_ingest(self, body: dict, path: str = "/hcgi/api/ingest/disclosures") -> requests.Response:
+        assert_remote_post_allowed(self.base)
         delay = 5.0
         last = None
         for attempt in range(6):
@@ -1270,9 +1273,29 @@ class HorizonsIngestClient:
         """POST type=filing with nested payload. Returns API JSON body."""
         if not filing.get("source_url"):
             raise ValueError("source_url is required on every filing")
+        if skip_reason(filing, kind="filing", require_name=True):
+            return {
+                "ok": False,
+                "skipped": True,
+                "transactions_written": 0,
+            }
 
-        txns = [clean_transaction(t) for t in (transactions or [])]
-        filing_out = dict(filing)
+        prepared: list[dict] = []
+        for i, txn in enumerate(transactions or []):
+            row = dict(txn)
+            # Keep parser-assigned positions. Fill any gap so the writer
+            # can tell identical trades apart.
+            if row.get("line_index") is None:
+                row["line_index"] = i
+            if skip_reason(row, kind="transaction", require_name=False):
+                continue
+            prepared.append(row)
+        txns = [clean_transaction(t) for t in prepared]
+        filing_out = {
+            key: value
+            for key, value in filing.items()
+            if key not in ("member_id", "member_party") or str(value or "").strip()
+        }
         body = {
             "type": "filing",
             "payload": {

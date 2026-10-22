@@ -256,6 +256,7 @@ def parse_filing_detail(session: requests.Session, url: str) -> dict:
                 "amount_range_raw": amount,
                 "filer_relation": _normalize_owner(owner),
                 "asset_category": asset_type or None,
+                "line_index": len(transactions),
             }
         )
 
@@ -402,6 +403,8 @@ def run(
                 result = hz.submit_filing(
                     filing, transactions=detail["transactions"]
                 )
+                if result.get("skipped"):
+                    continue
                 logger.info(
                     "Senate submitted filing_id=%s txns=%s name=%r",
                     result.get("filing_id"),

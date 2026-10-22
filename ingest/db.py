@@ -16,6 +16,7 @@ from typing import Any
 import requests
 
 from . import config
+from .guards import assert_remote_post_allowed, skip_reason
 from .names import normalize_state, parse_filer_name, parse_state_district
 
 logger = logging.getLogger("rollcalltrack_ingest.db")
@@ -66,6 +67,7 @@ class PocketBase:
         return resp.json()
 
     def create(self, collection: str, body: dict) -> dict:
+        assert_remote_post_allowed(self.base)
         resp = self.session.post(
             self._url(collection),
             json=body,
@@ -80,6 +82,7 @@ class PocketBase:
         return resp.json()
 
     def update(self, collection: str, record_id: str, body: dict) -> dict:
+        assert_remote_post_allowed(self.base)
         resp = self.session.patch(
             self._url(collection, record_id),
             json=body,
@@ -190,9 +193,10 @@ def upsert_filing(conn: PocketBase, filing: dict) -> str:
     source_url = filing.get("source_url") or ""
     if not source_url:
         raise ValueError("source_url is required — refuse to store filing without origin link")
+    if skip_reason(filing, kind="filing", require_name=True):
+        return ""
 
     body = {
-        "member_id": filing.get("member_id") or "",
         "chamber": filing.get("chamber") if filing.get("chamber") in ("house", "senate") else None,
         "filing_type": _map_filing_type(filing.get("filing_type")),
         "filing_date": filing.get("filing_date") or "",
@@ -202,9 +206,16 @@ def upsert_filing(conn: PocketBase, filing: dict) -> str:
         "ingested_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "parse_status": _map_parse_status(filing.get("parse_status")),
         "member_name": filing.get("member_name") or "",
-        "member_party": filing.get("member_party") or "",
         "member_state": filing.get("member_state") or "",
     }
+    # Empty member fields must be absent. A blank string on update clears
+    # an id or party already stored from an earlier match.
+    member_id = str(filing.get("member_id") or "").strip()
+    if member_id:
+        body["member_id"] = member_id
+    member_party = str(filing.get("member_party") or "").strip()
+    if member_party:
+        body["member_party"] = member_party
     # drop Nones
     body = {k: v for k, v in body.items() if v is not None}
 
@@ -220,19 +231,32 @@ def upsert_filing(conn: PocketBase, filing: dict) -> str:
 
 
 def upsert_transaction(conn: PocketBase, txn: dict) -> None:
-    """Insert transaction if not already present (natural key)."""
+    """Insert a transaction once per filing line.
+
+    The same asset, date, and amount can occur twice in one PTR. Those are
+    different trades. Identity is filing_id plus line_index (the transaction's
+    0-based position in the filing), not the trade description.
+    """
     filing_id = txn.get("filing_id")
     if not filing_id:
         raise ValueError("filing_id required")
+    if skip_reason(txn, kind="transaction", require_name=False):
+        return
+    if txn.get("line_index") is None:
+        raise ValueError("line_index required")
+    try:
+        line_index = int(txn["line_index"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("line_index must be an integer") from exc
+
     asset = txn.get("asset_name") or ""
     tdate = txn.get("transaction_date") or ""
     amount = txn.get("amount_range_raw") or ""
+    ticker = (txn.get("ticker") or "").strip()
 
     filt = (
         f'filing_id = "{_escape_filter(str(filing_id))}"'
-        f' && asset_name = "{_escape_filter(asset)}"'
-        f' && transaction_date = "{_escape_filter(tdate)}"'
-        f' && amount_range_raw = "{_escape_filter(amount)}"'
+        f" && line_index = {line_index}"
     )
     existing = conn.find_one("transactions", filt)
     if existing:
@@ -240,10 +264,9 @@ def upsert_transaction(conn: PocketBase, txn: dict) -> None:
 
     body = {
         "filing_id": str(filing_id),
-        "member_id": txn.get("member_id") or "",
         "filer_relation": _map_filer_relation(txn.get("filer_relation")),
         "asset_name": asset,
-        "ticker": txn.get("ticker") or "",
+        "ticker": ticker,
         "ticker_confidence": _map_ticker_conf(txn.get("ticker_confidence")),
         "transaction_type": _map_txn_type(txn.get("transaction_type")),
         "transaction_date": tdate,
@@ -252,10 +275,18 @@ def upsert_transaction(conn: PocketBase, txn: dict) -> None:
         "amount_range_low": txn.get("amount_range_low"),
         "amount_range_high": txn.get("amount_range_high"),
         "asset_category": txn.get("asset_category") or "",
+        "line_index": line_index,
     }
     body = {k: v for k, v in body.items() if v is not None and v != ""}
-    # required filing_id always kept
+    # required keys always kept, including line 0
     body["filing_id"] = str(filing_id)
+    body["line_index"] = line_index
+    body["ticker_confidence"] = _map_ticker_conf(txn.get("ticker_confidence"))
+    if ticker:
+        body["ticker"] = ticker
+    member_id = str(txn.get("member_id") or "").strip()
+    if member_id:
+        body["member_id"] = member_id
     conn.create("transactions", body)
 
 
