@@ -20,6 +20,7 @@ from . import config
 from .guards import assert_remote_post_allowed, skip_reason
 from .http_retry import backoff_seconds, is_connection_error
 from .legislators import match_legislator
+from .member_audit import assert_state_member_record
 from .names import (
     is_bare_office_title,
     member_record_compatible,
@@ -696,8 +697,7 @@ class HorizonsIngestClient:
         for rec in records:
             if not rec.get("source_url"):
                 raise ValueError("source_url is required on every member")
-            if rec.get("jurisdiction") != "state":
-                raise ValueError("this worker only posts jurisdiction=state")
+            assert_state_member_record(rec)
             if rec.get("chamber") not in ("house", "senate", "unicameral"):
                 raise ValueError("invalid chamber")
             if rec.get("party") not in ("D", "R", "I", "N"):
